@@ -1,0 +1,8 @@
+[package]
+name = "ainl-core"
+description = "Lexer, parser, AST and tree-walking evaluator for the AI-Native Language (AINL). Zero dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

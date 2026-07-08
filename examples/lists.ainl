@@ -1,0 +1,18 @@
+; List primitives and higher-order style.
+(def xs (list 1 2 3 4 5))
+(print "xs =" xs)
+(print "len =" (len xs))
+(print "first =" (first xs))
+(print "rest =" (rest xs))
+(print "cons 0 =" (cons 0 xs))
+(print "nth 2 =" (nth xs 2))
+
+; map, implemented in AINL itself
+(def map (fn (f lst)
+  (if (= (len lst) 0) (list)
+    (cons (f (first lst)) (map f (rest lst))))))
+
+(print "doubled =" (map (fn (x) (* x 2)) xs))
+
+; quote keeps a list of symbols as data, not a call
+(print "symbols =" (quote (alpha beta gamma)))

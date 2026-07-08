@@ -1,0 +1,12 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Secrets (keep tokens/keys out of the repo)
+*.env
+config.env
+*.log
+
+# OS
+.DS_Store

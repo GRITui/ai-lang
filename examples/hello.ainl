@@ -1,0 +1,15 @@
+; The canonical first program.
+(print "hello, ai-native world")
+
+; bindings and a function
+(def sq (fn (x) (* x x)))
+(print "sq 12 =" (sq 12))
+
+; a variadic function
+(def sum (fn (& xs)
+  (def total 0)
+  (def go (fn (lst acc)
+    (if (= (len lst) 0) acc
+      (go (rest lst) (+ acc (first lst))))))
+  (go xs 0)))
+(print "sum 1..5 =" (sum 1 2 3 4 5))

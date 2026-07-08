@@ -1,0 +1,13 @@
+[package]
+name = "ainl-cli"
+description = "The `ainl` command-line runtime for the AI-Native Language."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ainl"
+path = "src/main.rs"
+
+[dependencies]
+ainl-core = { path = "../ainl-core" }

@@ -1,0 +1,67 @@
+# AI-Native Lang (AINL)
+
+A high-density, strictly-semantic programming language optimized for **Large Language Model context windows** — not human readability. Plus a multi-LLM **Prompt Auditor** that compiles vague natural language into perfect AINL schemas.
+
+> Humans read English. Machines read tokens. AINL is written in the second dialect.
+
+## Why
+
+Frontier models waste context on syntactic sugar, whitespace, and ambiguous phrasing. AINL is a **low-entropy, uniform-grammar** language that:
+
+- maximizes semantic density per token (S-expression core, no non-functional whitespace),
+- is trivial to generate under **grammar-constrained decoding** (a tiny, regular CFG),
+- maps **bidirectionally** to human-readable languages via AST + source maps, so version control and debugging stay human-friendly,
+- ships as a **zero-dependency static binary** that installs anywhere.
+
+## Repo layout
+
+```
+ai-native-lang/
+├── docs/
+│   ├── MASTER_PLAN.md    # full two-phase project plan
+│   ├── SYNTAX.md         # the AI-ingestion grammar guide (feed this to any model)
+│   └── ARCHITECTURE.md   # how the pieces fit together
+├── crates/
+│   ├── ainl-core/        # lexer + parser + AST + evaluator (Rust, zero deps)
+│   └── ainl-cli/         # the `ainl` binary: run / repl / fmt / ast
+├── examples/             # sample .ainl programs
+└── Cargo.toml            # Rust workspace
+```
+
+## Status
+
+**Phase 1 — the language (in progress).** A working tree-walking interpreter for the AINL core is implemented in Rust with zero external dependencies. See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar.
+
+## Quick start
+
+```sh
+# build (needs the Rust toolchain: https://rustup.rs)
+cargo build --release
+
+# run a program
+./target/release/ainl run examples/hello.ainl
+
+# start a REPL
+./target/release/ainl repl
+
+# inspect the parsed AST (useful for tooling / source maps)
+./target/release/ainl ast examples/fib.ainl
+```
+
+## The language in 10 seconds
+
+```lisp
+(def sq (fn (x) (* x x)))
+(print (sq 12))            ; 144
+
+(def fib (fn (n)
+  (if (< n 2) n
+    (+ (fib (- n 1)) (fib (- n 2))))))
+(print (fib 20))          ; 6765
+```
+
+Uniform `(op arg...)` structure, short keywords, no statement terminators, no significant whitespace. Every program is a single unambiguous parse tree.
+
+## License
+
+TBD.
