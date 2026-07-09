@@ -50,7 +50,7 @@
 |-----------|-------------|----------|
 | **M1** ✅ | Working AINL interpreter (lexer→parser→eval), CLI `run`/`repl`/`ast` | Language exists and executes |
 | M2 | `SYNTAX.md` + GBNF grammar export (`ainl grammar`) | Models can generate valid AINL |
-| M3 | AST ⇄ JSON serialization + source maps (`ainl ast --json`) | Foundation for interop & auditor schema |
+| **M3** ✅ | Stable JSON AST serialization + source-map loc (`ainl ast --json`) | Foundation for interop & auditor schema |
 | M4 | Python transpiler plugin (AINL → Python) | Phase 1.4 proof of concept |
 | M5 | musl static-binary release pipeline | Phase 1.2 portability |
 | M6 | Prompt Auditor GUI shell + local model router | Phase 2 skeleton |

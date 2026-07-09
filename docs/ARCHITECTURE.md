@@ -40,10 +40,25 @@ Value  (Nil|Bool|Int|Float|Str|Sym|List|Builtin|Closure)
 - **Regular grammar** (§1.3): the parser accepts exactly the grammar in
   `SYNTAX.md`, which is small enough to double as a constrained-decoding grammar.
 
+### AST JSON interchange (M3, implemented)
+
+`serialize::forms_to_json` (crate API `parse_to_json`, CLI `ainl ast --json`)
+emits a stable, pretty-printed JSON document:
+
+```json
+{ "version": "0.1", "source": "…",
+  "forms": [ { "t": "list", "span": [s,e], "loc": [line,col], "items": [ … ] } ] }
+```
+
+Every node carries both a byte `span` and a 1-based `loc` (line, char-column)
+computed by `serialize::LineIndex`. That `span`/`loc` pair is the source-map
+primitive: a projected human-readable line maps back to the exact AINL bytes.
+The serializer is hand-written (no serde) to preserve the zero-dependency
+guarantee. Deterministic field order makes the output diffable in VCS.
+
 ## Phase 1 roadmap hooks (not yet built)
 
-- `ainl ast --json` — stable JSON serialization of the AST (M3), the bridge to
-  interop and the auditor schema.
+- JSON → AST deserialization (round-trip) so tools can author/rewrite AST as JSON.
 - `ainl-transpile` crate — AINL AST → Python/JS/Ruby source with source maps (M4).
 - Release workflow targeting `*-unknown-linux-musl` for static binaries (M5).
 

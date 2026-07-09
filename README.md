@@ -46,6 +46,9 @@ cargo build --release
 
 # inspect the parsed AST (useful for tooling / source maps)
 ./target/release/ainl ast examples/fib.ainl
+
+# emit the AST as stable JSON with source-map loc (span + line/col per node)
+./target/release/ainl ast examples/fib.ainl --json
 ```
 
 ## The language in 10 seconds

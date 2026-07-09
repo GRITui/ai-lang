@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(args.get(1)),
         Some("eval") => cmd_eval(&args[1..].join(" ")),
-        Some("ast") => cmd_ast(args.get(1)),
+        Some("ast") => cmd_ast(&args[1..]),
         Some("repl") => cmd_repl(),
         Some("version") | Some("--version") | Some("-v") => {
             println!("ainl {VERSION}");
@@ -43,6 +43,7 @@ fn print_help() {
          ainl run <file.ainl>     evaluate a program file\n  \
          ainl eval <code>         evaluate a snippet\n  \
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
+         ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
          ainl repl                start an interactive REPL\n  \
          ainl version             print version\n"
     );
@@ -82,9 +83,21 @@ fn cmd_eval(code: &str) -> ExitCode {
     }
 }
 
-fn cmd_ast(path: Option<&String>) -> ExitCode {
+fn cmd_ast(rest: &[String]) -> ExitCode {
+    let mut path: Option<&String> = None;
+    let mut json = false;
+    for a in rest {
+        match a.as_str() {
+            "--json" => json = true,
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag '{flag}' (supported: --json)");
+                return ExitCode::FAILURE;
+            }
+            _ => path = Some(a),
+        }
+    }
     let Some(path) = path else {
-        eprintln!("usage: ainl ast <file.ainl>");
+        eprintln!("usage: ainl ast <file.ainl> [--json]");
         return ExitCode::FAILURE;
     };
     let src = match std::fs::read_to_string(path) {
@@ -96,8 +109,12 @@ fn cmd_ast(path: Option<&String>) -> ExitCode {
     };
     match ainl_core::parse(&src) {
         Ok(forms) => {
-            for form in &forms {
-                print_node(form, 0);
+            if json {
+                println!("{}", ainl_core::forms_to_json(&forms, &src, Some(path)));
+            } else {
+                for form in &forms {
+                    print_node(form, 0);
+                }
             }
             ExitCode::SUCCESS
         }
