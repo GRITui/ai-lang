@@ -2,7 +2,15 @@
 
 ## Phase 1 — Build an AI-Native Programming Language
 
-**Core objective:** a high-density, strictly-semantic language optimized for LLM context windows rather than human readability.
+**Core objective (as originally stated):** a high-density, strictly-semantic
+language optimized for LLM context windows rather than human readability.
+
+> **Reality check (measured):** the token-density goal is *not* met by the
+> current S-expression design — AINL uses ~2× the tokens of idiomatic Python
+> (see [BENCHMARK.md](BENCHMARK.md)). The delivered value is instead
+> *reliable, grammar-constrained generation* and *lossless interop*. Genuine
+> density would require a syntax redesign (see §1.3 note). This plan is kept
+> as the original vision; annotations mark where results diverged.
 
 ### 1.1 Cross-language framework integration
 - Bidirectional interop between AINL and traditional languages.
@@ -14,7 +22,7 @@
 - Compile with Rust's `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` targets (and native macOS/Windows) so it installs instantly on any machine, edge device, or container with no dependency chain.
 
 ### 1.3 AI-optimized syntax & markdown documentation
-- Rigid, low-entropy syntax (S-expression core) — no non-functional whitespace, no syntactic sugar — to maximize token efficiency.
+- Rigid, low-entropy syntax (S-expression core) — no non-functional whitespace, no syntactic sugar. _(Intended to maximize token efficiency; measured to be ~2× Python's token count instead — see [BENCHMARK.md](BENCHMARK.md). Density remains future work; the low-entropy grammar still pays off for constrained decoding.)_
 - A specialized [SYNTAX.md](SYNTAX.md) written **for AI ingestion**: any model can read it once and emit perfectly-formed AINL.
 - Grammar is a small regular CFG → directly usable as a GBNF / constrained-decoding grammar.
 

@@ -2,18 +2,22 @@
 
 [![CI](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml)
 
-A high-density, strictly-semantic programming language optimized for **Large Language Model context windows** — not human readability. Plus a multi-LLM **Prompt Auditor** that compiles vague natural language into perfect AINL schemas.
+A small, uniform programming language built to be **generated and verified by machines**. AINL's entire grammar is a tiny regular CFG, so an LLM can be *constrained* to emit only valid programs — and every program maps losslessly to and from human-readable Python, JavaScript, and Ruby. Plus a multi-LLM **Prompt Auditor** that compiles vague natural language into validated AINL schemas.
 
-> Humans read English. Machines read tokens. AINL is written in the second dialect.
+> A reliable **generation target** for LLMs: easy to generate under grammar constraints, trivial to validate, and portable to the languages people already use.
 
 ## Why
 
-Frontier models waste context on syntactic sugar, whitespace, and ambiguous phrasing. AINL is a **low-entropy, uniform-grammar** language that:
+Getting a model to emit correct code in a full language is unreliable — the grammar is huge and ambiguous. AINL inverts that:
 
-- maximizes semantic density per token (S-expression core, no non-functional whitespace),
-- is trivial to generate under **grammar-constrained decoding** (a tiny, regular CFG),
-- maps **bidirectionally** to human-readable languages via AST + source maps, so version control and debugging stay human-friendly,
-- ships as a **zero-dependency static binary** that installs anywhere.
+- **Tiny, regular grammar** — expressible as GBNF, so grammar-constrained decoding forces syntactically valid output every time.
+- **One unambiguous parse tree** — uniform `(op arg...)` structure with byte spans, trivial to validate, analyze, and map.
+- **Lossless interop** — the same AST projects to idiomatic Python/JS/Ruby (verified byte-equal), so AINL slots into existing codebases and debugging.
+- **Zero-dependency runtime** — installs anywhere as a small static binary.
+
+### A note on token efficiency
+
+An earlier design goal was raw token density. Measured with real tokenizers, that goal is **not** met: AINL currently uses **~2× the tokens of idiomatic Python** (and more than JS/Ruby too) — the S-expression delimiters cost more than the whitespace they remove. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for the numbers. AINL's actual advantage is *reliability and verifiability of machine generation*, not fewer tokens; making the surface syntax genuinely dense is tracked as future work.
 
 ## Repo layout
 
@@ -47,12 +51,29 @@ ai-native-lang/
 ./target/release/ainl audit "sum all numbers in a list" --stages
 ```
 
-See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the full roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar.
+See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the full roadmap, [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar, and [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for a hands-on walkthrough.
+
+## Install
+
+Needs the [Rust toolchain](https://rustup.rs) (`rustc`/`cargo`).
+
+```sh
+# from a checkout — installs the `ainl` binary to ~/.cargo/bin
+cargo install --path crates/ainl-cli
+
+# or straight from GitHub
+cargo install --git https://github.com/GRITui/ai-lang ainl-cli
+
+ainl version
+ainl eval '(* 6 7)'        # 42
+```
+
+Prebuilt binaries are attached to [GitHub releases](https://github.com/GRITui/ai-lang/releases). For a fully-static Linux binary, see [docs/RELEASE.md](docs/RELEASE.md).
 
 ## Quick start
 
 ```sh
-# build (needs the Rust toolchain: https://rustup.rs)
+# build from source (needs the Rust toolchain: https://rustup.rs)
 cargo build --release
 
 # run a program
