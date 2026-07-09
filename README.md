@@ -87,4 +87,7 @@ Uniform `(op arg...)` structure, short keywords, no statement terminators, no si
 
 ## License
 
-TBD.
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+project shall be dual-licensed as above, without any additional terms.
