@@ -52,8 +52,13 @@
 | M2 | `SYNTAX.md` + GBNF grammar export (`ainl grammar`) | Models can generate valid AINL |
 | **M3** ✅ | Stable JSON AST serialization + source-map loc (`ainl ast --json`) | Foundation for interop & auditor schema |
 | **M4** ✅ | Python transpiler plugin (AINL → Python), `ainl transpile` | Phase 1.4 proof of concept; output verified byte-equal to the interpreter |
-| M5 | musl static-binary release pipeline | Phase 1.2 portability |
+| **M5** ✅ | musl static-binary release pipeline (`scripts/build-release.sh`, `.cargo/config.toml`, `docs/RELEASE.md`) | Phase 1.2 portability; native binary verified system-only deps (393 KB) |
 | M6 | Prompt Auditor GUI shell + local model router | Phase 2 skeleton |
 | M7 | Full 5-model orchestration + constrained decoding | Phase 2 complete |
+
+**Phase 1 is complete.** The AINL language runs, serializes its AST with source
+maps, exports a constrained-decoding grammar, transpiles byte-equivalently to
+Python/JavaScript/Ruby, and ships as a zero-dependency binary. Phase 2 (the
+multi-SLM Prompt Auditor) is next.
 
 We build bottom-up: a language that runs, then tooling around its AST, then the auditor that targets it.

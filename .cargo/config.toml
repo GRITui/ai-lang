@@ -1,0 +1,18 @@
+# Cross-compilation config for producing zero-dependency static binaries (§1.2).
+#
+# Native builds (macOS/Linux/Windows) need nothing here. To produce a fully
+# static Linux binary that installs on any machine/edge device/container with no
+# dependency chain, use ONE of:
+#
+#   1. Docker:  cargo install cross && cross build --release --target <triple>
+#   2. A musl cross-toolchain providing the linkers below, then:
+#              cargo build --release --target <triple>
+#      (e.g. `brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl`)
+#
+# musl links statically by default in Rust, so the result has zero dynamic deps.
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"

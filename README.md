@@ -30,7 +30,15 @@ ai-native-lang/
 
 ## Status
 
-**Phase 1 — the language (in progress).** A working tree-walking interpreter for the AINL core is implemented in Rust with zero external dependencies. See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar.
+**Phase 1 — the language — is complete.** AINL is implemented in Rust with zero external dependencies and:
+
+- **runs** — tree-walking interpreter (`run`/`eval`/`repl`),
+- **serializes** its AST to stable JSON with source-map spans (`ast --json`),
+- **exports** a constrained-decoding grammar (`grammar`, GBNF/EBNF),
+- **transpiles** byte-equivalently to **Python, JavaScript, and Ruby** (`transpile --to`),
+- **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
+
+See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar. **Phase 2** — the multi-SLM Prompt Auditor — is next.
 
 ## Quick start
 
