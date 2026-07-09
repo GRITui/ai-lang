@@ -38,7 +38,10 @@ pub struct Auditor<'b> {
 
 impl<'b> Auditor<'b> {
     pub fn new(backend: &'b dyn Backend) -> Auditor<'b> {
-        Auditor { backend, providers: Vec::new() }
+        Auditor {
+            backend,
+            providers: Vec::new(),
+        }
     }
 
     pub fn with_context(mut self, provider: Box<dyn ContextProvider>) -> Self {
@@ -46,8 +49,20 @@ impl<'b> Auditor<'b> {
         self
     }
 
-    fn run_role(&self, role: Role, request: &str, prompt: &str, grammar: Option<&str>) -> Result<String> {
-        let req = GenRequest { role, system: role.system_prompt(), request, prompt, grammar };
+    fn run_role(
+        &self,
+        role: Role,
+        request: &str,
+        prompt: &str,
+        grammar: Option<&str>,
+    ) -> Result<String> {
+        let req = GenRequest {
+            role,
+            system: role.system_prompt(),
+            request,
+            prompt,
+            grammar,
+        };
         Ok(self.backend.generate(&req)?.trim().to_string())
     }
 
@@ -68,7 +83,11 @@ impl<'b> Auditor<'b> {
     pub fn run(&self, input: &str) -> Result<AuditReport> {
         let mut stages = Vec::new();
         let mut record = |role: Role, output: String| {
-            stages.push(StageOutput { role, model: role.model().to_string(), output });
+            stages.push(StageOutput {
+                role,
+                model: role.model().to_string(),
+                output,
+            });
         };
 
         // 1. Orchestrator — intent + route.
@@ -79,7 +98,11 @@ impl<'b> Auditor<'b> {
         let context = self.gather_context(input);
         let planner_prompt = format!(
             "Request:\n{input}\n\nOrchestrator analysis:\n{orchestration}\n{}",
-            if context.is_empty() { String::new() } else { format!("\nRelevant context:\n{context}") }
+            if context.is_empty() {
+                String::new()
+            } else {
+                format!("\nRelevant context:\n{context}")
+            }
         );
         let plan = self.run_role(Role::Planner, input, &planner_prompt, None)?;
         record(Role::Planner, plan.clone());
@@ -94,7 +117,12 @@ impl<'b> Auditor<'b> {
         };
 
         // 4. Code Engine — final dense AINL from the schema.
-        let code = self.run_role(Role::CodeEngine, input, &format!("AINL schema:\n{ainl}"), Some(ainl_core::GBNF))?;
+        let code = self.run_role(
+            Role::CodeEngine,
+            input,
+            &format!("AINL schema:\n{ainl}"),
+            Some(ainl_core::GBNF),
+        )?;
         record(Role::CodeEngine, code.clone());
 
         // 5. Generalist — friendly summary.
@@ -135,6 +163,10 @@ fn build_context_prompt(input: &str, plan: &str, ainl: &str, valid: bool) -> Str
          ## Task for the target model\n\
          Generate a correct, complete implementation that satisfies the AINL schema \
          above. Do not ask clarifying questions — the schema is the specification.\n",
-        if valid { " ✓ grammar-valid" } else { " ⚠ did not parse" }
+        if valid {
+            " ✓ grammar-valid"
+        } else {
+            " ⚠ did not parse"
+        }
     )
 }

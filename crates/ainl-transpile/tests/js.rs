@@ -40,7 +40,10 @@ fn while_and_let_braces() {
     let out = js("(def f (fn (n) (let ((i 0)) (while (< i n) (def i (+ i 1))) i)))");
     assert!(out.contains("var i = 0;"), "got:\n{out}");
     assert!(out.contains("while ((i < n)) {"), "got:\n{out}");
-    assert!(out.contains("i = (i + 1);") || out.contains("var i = (i + 1);"), "got:\n{out}");
+    assert!(
+        out.contains("i = (i + 1);") || out.contains("var i = (i + 1);"),
+        "got:\n{out}"
+    );
 }
 
 #[test]

@@ -52,18 +52,28 @@ impl Role {
     /// The role's specialized system prompt.
     pub fn system_prompt(self) -> &'static str {
         match self {
-            Role::Orchestrator => "You are the Orchestrator. Read the user's request, state its core \
+            Role::Orchestrator => {
+                "You are the Orchestrator. Read the user's request, state its core \
 intent in one line, and decide the execution path: `code` (needs logic/architecture) or \
-`text` (informational). Respond concisely.",
-            Role::Planner => "You are the Planner. Given the intent, lay out the logic as numbered \
-steps, list edge cases, and note required inputs/outputs. Be precise and exhaustive.",
-            Role::Auditor => "You are the Auditor / Syntax Enforcer. Emit ONLY a valid AINL program \
+`text` (informational). Respond concisely."
+            }
+            Role::Planner => {
+                "You are the Planner. Given the intent, lay out the logic as numbered \
+steps, list edge cases, and note required inputs/outputs. Be precise and exhaustive."
+            }
+            Role::Auditor => {
+                "You are the Auditor / Syntax Enforcer. Emit ONLY a valid AINL program \
 that encodes the plan. AINL is an S-expression language: (op arg...). Use def/fn/if/let/while and \
-builtins (+ - * / = < > print list len first rest cons). Output nothing but the AINL.",
-            Role::CodeEngine => "You are the Code Engine. Consume the AINL schema and produce the \
-final, dense AINL implementation. Keep it minimal and correct.",
-            Role::Generalist => "You are the Generalist. Summarize the technical result in a friendly, \
-plain-language paragraph for a non-expert. Do not include code.",
+builtins (+ - * / = < > print list len first rest cons). Output nothing but the AINL."
+            }
+            Role::CodeEngine => {
+                "You are the Code Engine. Consume the AINL schema and produce the \
+final, dense AINL implementation. Keep it minimal and correct."
+            }
+            Role::Generalist => {
+                "You are the Generalist. Summarize the technical result in a friendly, \
+plain-language paragraph for a non-expert. Do not include code."
+            }
         }
     }
 }

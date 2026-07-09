@@ -45,7 +45,10 @@ fn chained_comparison_and_names_sanitized() {
 #[test]
 fn only_used_runtime_is_emitted() {
     let out = py("(+ 1 2)");
-    assert!(!out.contains("def _print"), "runtime should be omitted:\n{out}");
+    assert!(
+        !out.contains("def _print"),
+        "runtime should be omitted:\n{out}"
+    );
     let out2 = py("(print 1)");
     assert!(out2.contains("def _print"), "got:\n{out2}");
     assert!(out2.contains("def _disp"), "display dep pulled in:\n{out2}");

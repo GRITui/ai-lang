@@ -12,10 +12,18 @@ pub enum Tok {
     LParen(usize),
     RParen(usize),
     /// A bare atom (number / symbol / bool / nil) with its source span.
-    Atom { text: String, start: usize, end: usize },
+    Atom {
+        text: String,
+        start: usize,
+        end: usize,
+    },
     /// A string literal (already unescaped) with the span of the full literal
     /// including quotes.
-    Str { text: String, start: usize, end: usize },
+    Str {
+        text: String,
+        start: usize,
+        end: usize,
+    },
 }
 
 impl Tok {
@@ -61,7 +69,11 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
             while let Some((j, ch)) = chars.next() {
                 match ch {
                     '"' => {
-                        toks.push(Tok::Str { text: std::mem::take(&mut text), start, end: j + 1 });
+                        toks.push(Tok::Str {
+                            text: std::mem::take(&mut text),
+                            start,
+                            end: j + 1,
+                        });
                         closed = true;
                         break;
                     }
@@ -72,13 +84,21 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                         Some((_, '\\')) => text.push('\\'),
                         Some((_, '"')) => text.push('"'),
                         Some((_, other)) => text.push(other),
-                        None => return Err(Error::Lex { msg: "unterminated escape".into(), at: j }),
+                        None => {
+                            return Err(Error::Lex {
+                                msg: "unterminated escape".into(),
+                                at: j,
+                            })
+                        }
                     },
                     _ => text.push(ch),
                 }
             }
             if !closed {
-                return Err(Error::Lex { msg: "unterminated string".into(), at: start });
+                return Err(Error::Lex {
+                    msg: "unterminated string".into(),
+                    at: start,
+                });
             }
         } else {
             // bare atom: read until a delimiter
@@ -92,7 +112,10 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 chars.next();
             }
             let text = std::str::from_utf8(&bytes[start..end])
-                .map_err(|_| Error::Lex { msg: "invalid utf-8".into(), at: start })?
+                .map_err(|_| Error::Lex {
+                    msg: "invalid utf-8".into(),
+                    at: start,
+                })?
                 .to_string();
             toks.push(Tok::Atom { text, start, end });
         }

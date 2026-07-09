@@ -29,7 +29,11 @@ pub fn transpile_python_src(src: &str) -> Result<String> {
 /// line comments.
 pub fn transpile_python(forms: &[Node], src: &str) -> Result<String> {
     let idx = LineIndex::new(src);
-    let mut py = Py { body: String::new(), indent: 0, needed: BTreeSet::new() };
+    let mut py = Py {
+        body: String::new(),
+        indent: 0,
+        needed: BTreeSet::new(),
+    };
     for form in forms {
         py.top_form(form, &idx)?;
     }
@@ -333,7 +337,12 @@ impl Py {
         nodes.iter().map(|n| self.expr(n)).collect()
     }
 
-    fn call_builtin(&mut self, py_name: &str, args: &[Node], need: Option<&'static str>) -> Result<String> {
+    fn call_builtin(
+        &mut self,
+        py_name: &str,
+        args: &[Node],
+        need: Option<&'static str>,
+    ) -> Result<String> {
         if let Some(n) = need {
             self.need(n);
         }
@@ -431,7 +440,11 @@ impl Py {
             vals.push(self.expr(v)?);
         }
         let b = self.expr(&body[0])?;
-        Ok(format!("(lambda {}: {b})({})", names.join(", "), vals.join(", ")))
+        Ok(format!(
+            "(lambda {}: {b})({})",
+            names.join(", "),
+            vals.join(", ")
+        ))
     }
 
     fn expr_do(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
@@ -553,10 +566,41 @@ fn sanitize(name: &str) -> String {
 fn is_python_keyword(s: &str) -> bool {
     matches!(
         s,
-        "False" | "None" | "True" | "and" | "as" | "assert" | "async" | "await" | "break"
-            | "class" | "continue" | "def" | "del" | "elif" | "else" | "except" | "finally"
-            | "for" | "from" | "global" | "if" | "import" | "in" | "is" | "lambda" | "nonlocal"
-            | "not" | "or" | "pass" | "raise" | "return" | "try" | "while" | "with" | "yield"
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
     )
 }
 

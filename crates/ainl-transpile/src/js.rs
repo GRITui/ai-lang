@@ -22,7 +22,11 @@ pub fn transpile_js_src(src: &str) -> Result<String> {
 
 pub fn transpile_js(forms: &[Node], src: &str) -> Result<String> {
     let idx = LineIndex::new(src);
-    let mut js = Js { body: String::new(), indent: 0, needed: BTreeSet::new() };
+    let mut js = Js {
+        body: String::new(),
+        indent: 0,
+        needed: BTreeSet::new(),
+    };
     for form in forms {
         js.top_form(form, &idx)?;
     }
@@ -82,7 +86,9 @@ impl Js {
 
     fn top_form(&mut self, form: &Node, idx: &LineIndex) -> Result<()> {
         if let Node::List(items, _) = form {
-            if let (Some(Node::Sym(op, _)), Some(Node::Sym(name, _))) = (items.first(), items.get(1)) {
+            if let (Some(Node::Sym(op, _)), Some(Node::Sym(name, _))) =
+                (items.first(), items.get(1))
+            {
                 if op == "def" {
                     let (line, _) = idx.locate(form.span().start);
                     self.line(&format!("// ainl:{line}  {name}"));
@@ -307,7 +313,12 @@ impl Js {
         nodes.iter().map(|n| self.expr(n)).collect()
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Node], need: Option<&'static str>) -> Result<String> {
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &[Node],
+        need: Option<&'static str>,
+    ) -> Result<String> {
         if let Some(n) = need {
             self.need(n);
         }
@@ -361,7 +372,10 @@ impl Js {
             return Ok("true".to_string());
         }
         let parts = self.expr_all(args)?;
-        let clauses: Vec<String> = parts.windows(2).map(|w| format!("{} {op} {}", w[0], w[1])).collect();
+        let clauses: Vec<String> = parts
+            .windows(2)
+            .map(|w| format!("{} {op} {}", w[0], w[1]))
+            .collect();
         Ok(format!("({})", clauses.join(" && ")))
     }
 
@@ -403,7 +417,11 @@ impl Js {
             vals.push(self.expr(v)?);
         }
         let b = self.expr(&body[0])?;
-        Ok(format!("(({}) => {b})({})", names.join(", "), vals.join(", ")))
+        Ok(format!(
+            "(({}) => {b})({})",
+            names.join(", "),
+            vals.join(", ")
+        ))
     }
 
     fn expr_do(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
@@ -520,11 +538,46 @@ fn sanitize(name: &str) -> String {
 fn is_js_reserved(s: &str) -> bool {
     matches!(
         s,
-        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default"
-            | "delete" | "do" | "else" | "export" | "extends" | "finally" | "for" | "function"
-            | "if" | "import" | "in" | "instanceof" | "new" | "return" | "super" | "switch"
-            | "this" | "throw" | "try" | "typeof" | "var" | "void" | "while" | "with" | "yield"
-            | "let" | "static" | "enum" | "await" | "null" | "true" | "false"
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "export"
+            | "extends"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+            | "let"
+            | "static"
+            | "enum"
+            | "await"
+            | "null"
+            | "true"
+            | "false"
     )
 }
 

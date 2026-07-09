@@ -1,5 +1,7 @@
 # AI-Native Lang (AINL)
 
+[![CI](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml)
+
 A high-density, strictly-semantic programming language optimized for **Large Language Model context windows** — not human readability. Plus a multi-LLM **Prompt Auditor** that compiles vague natural language into perfect AINL schemas.
 
 > Humans read English. Machines read tokens. AINL is written in the second dialect.

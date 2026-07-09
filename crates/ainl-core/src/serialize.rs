@@ -38,7 +38,9 @@ impl<'a> LineIndex<'a> {
             Err(i) => i - 1,
         };
         let line_start = self.line_starts[line];
-        let col = self.src[line_start..offset.min(self.src.len())].chars().count();
+        let col = self.src[line_start..offset.min(self.src.len())]
+            .chars()
+            .count();
         (line + 1, col + 1)
     }
 }
@@ -84,7 +86,10 @@ fn write_node(node: &Node, idx: &LineIndex, indent: usize, out: &mut String) {
             out.push_str(&format!("{{ \"t\": \"int\", \"v\": {i}, {trailer} }}"));
         }
         Node::Float(x, _) => {
-            out.push_str(&format!("{{ \"t\": \"float\", \"v\": {}, {trailer} }}", json_float(*x)));
+            out.push_str(&format!(
+                "{{ \"t\": \"float\", \"v\": {}, {trailer} }}",
+                json_float(*x)
+            ));
         }
         Node::Str(s, _) => {
             out.push_str("{ \"t\": \"str\", \"v\": ");

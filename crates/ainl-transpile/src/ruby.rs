@@ -23,7 +23,11 @@ pub fn transpile_ruby_src(src: &str) -> Result<String> {
 
 pub fn transpile_ruby(forms: &[Node], src: &str) -> Result<String> {
     let idx = LineIndex::new(src);
-    let mut rb = Rb { body: String::new(), indent: 0, needed: BTreeSet::new() };
+    let mut rb = Rb {
+        body: String::new(),
+        indent: 0,
+        needed: BTreeSet::new(),
+    };
     for form in forms {
         rb.top_form(form, &idx)?;
     }
@@ -80,7 +84,9 @@ impl Rb {
 
     fn top_form(&mut self, form: &Node, idx: &LineIndex) -> Result<()> {
         if let Node::List(items, _) = form {
-            if let (Some(Node::Sym(op, _)), Some(Node::Sym(name, _))) = (items.first(), items.get(1)) {
+            if let (Some(Node::Sym(op, _)), Some(Node::Sym(name, _))) =
+                (items.first(), items.get(1))
+            {
                 if op == "def" {
                     let (line, _) = idx.locate(form.span().start);
                     self.line(&format!("# ainl:{line}  {name}"));
@@ -289,7 +295,12 @@ impl Rb {
         nodes.iter().map(|n| self.expr(n)).collect()
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Node], need: Option<&'static str>) -> Result<String> {
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &[Node],
+        need: Option<&'static str>,
+    ) -> Result<String> {
         if let Some(n) = need {
             self.need(n);
         }
@@ -350,7 +361,10 @@ impl Rb {
             return Ok("true".to_string());
         }
         let parts = self.expr_all(args)?;
-        let clauses: Vec<String> = parts.windows(2).map(|w| format!("{} {op} {}", w[0], w[1])).collect();
+        let clauses: Vec<String> = parts
+            .windows(2)
+            .map(|w| format!("{} {op} {}", w[0], w[1]))
+            .collect();
         Ok(format!("({})", clauses.join(" && ")))
     }
 
@@ -392,8 +406,15 @@ impl Rb {
             vals.push(self.expr(v)?);
         }
         let b = self.expr(&body[0])?;
-        let params = if names.is_empty() { String::new() } else { format!("|{}|", names.join(", ")) };
-        Ok(format!("lambda {{ {params} {b} }}.call({})", vals.join(", ")))
+        let params = if names.is_empty() {
+            String::new()
+        } else {
+            format!("|{}|", names.join(", "))
+        };
+        Ok(format!(
+            "lambda {{ {params} {b} }}.call({})",
+            vals.join(", ")
+        ))
     }
 
     fn expr_do(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
@@ -508,11 +529,46 @@ fn sanitize(name: &str) -> String {
 fn is_ruby_keyword(s: &str) -> bool {
     matches!(
         s,
-        "BEGIN" | "END" | "alias" | "and" | "begin" | "break" | "case" | "class" | "def"
-            | "defined?" | "do" | "else" | "elsif" | "end" | "ensure" | "false" | "for" | "if"
-            | "in" | "module" | "next" | "nil" | "not" | "or" | "redo" | "rescue" | "retry"
-            | "return" | "self" | "super" | "then" | "true" | "undef" | "unless" | "until"
-            | "when" | "while" | "yield" | "lambda" | "proc"
+        "BEGIN"
+            | "END"
+            | "alias"
+            | "and"
+            | "begin"
+            | "break"
+            | "case"
+            | "class"
+            | "def"
+            | "defined?"
+            | "do"
+            | "else"
+            | "elsif"
+            | "end"
+            | "ensure"
+            | "false"
+            | "for"
+            | "if"
+            | "in"
+            | "module"
+            | "next"
+            | "nil"
+            | "not"
+            | "or"
+            | "redo"
+            | "rescue"
+            | "retry"
+            | "return"
+            | "self"
+            | "super"
+            | "then"
+            | "true"
+            | "undef"
+            | "unless"
+            | "until"
+            | "when"
+            | "while"
+            | "yield"
+            | "lambda"
+            | "proc"
     )
 }
 

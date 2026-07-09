@@ -75,7 +75,9 @@ pub struct HttpBackend {
 
 impl HttpBackend {
     pub fn new(endpoint: impl Into<String>) -> HttpBackend {
-        HttpBackend { endpoint: endpoint.into() }
+        HttpBackend {
+            endpoint: endpoint.into(),
+        }
     }
 
     pub fn ollama() -> HttpBackend {
@@ -102,7 +104,16 @@ impl Backend for HttpBackend {
         json.push('}');
 
         let out = Command::new("curl")
-            .args(["-s", "-X", "POST", &self.endpoint, "-H", "Content-Type: application/json", "-d", &json])
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                &self.endpoint,
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &json,
+            ])
             .output()
             .map_err(|e| Error::runtime(format!("failed to run curl: {e}")))?;
         if !out.status.success() {
@@ -122,7 +133,11 @@ impl Backend for HttpBackend {
 // ---- helpers ---------------------------------------------------------------
 
 fn one_line(s: &str) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = s
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     let line = line.trim_start_matches("intent:").trim();
     if line.len() > 120 {
         format!("{}…", &line[..120])
@@ -133,7 +148,9 @@ fn one_line(s: &str) -> String {
 
 /// Escape a string for embedding inside an AINL `"..."` literal.
 fn ainl_string_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
 }
 
 fn json_string(s: &str) -> String {

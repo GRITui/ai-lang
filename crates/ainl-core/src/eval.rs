@@ -19,11 +19,17 @@ struct Scope {
 
 impl Env {
     pub fn new() -> Env {
-        Env(Rc::new(Scope { vars: RefCell::new(HashMap::new()), parent: None }))
+        Env(Rc::new(Scope {
+            vars: RefCell::new(HashMap::new()),
+            parent: None,
+        }))
     }
 
     pub fn child(&self) -> Env {
-        Env(Rc::new(Scope { vars: RefCell::new(HashMap::new()), parent: Some(self.clone()) }))
+        Env(Rc::new(Scope {
+            vars: RefCell::new(HashMap::new()),
+            parent: Some(self.clone()),
+        }))
     }
 
     pub fn define(&self, name: impl Into<String>, val: Value) {
@@ -131,7 +137,10 @@ pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
             }
             Ok(last)
         }
-        other => Err(Error::runtime(format!("cannot call a {}", other.type_name()))),
+        other => Err(Error::runtime(format!(
+            "cannot call a {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -294,8 +303,20 @@ fn install_prelude(env: &Env) {
         };
     }
 
-    b!("+", |a| numeric_fold(a, 0.0, 0, |x, y| x + y, |x, y| x.checked_add(y)));
-    b!("*", |a| numeric_fold(a, 1.0, 1, |x, y| x * y, |x, y| x.checked_mul(y)));
+    b!("+", |a| numeric_fold(
+        a,
+        0.0,
+        0,
+        |x, y| x + y,
+        |x, y| x.checked_add(y)
+    ));
+    b!("*", |a| numeric_fold(
+        a,
+        1.0,
+        1,
+        |x, y| x * y,
+        |x, y| x.checked_mul(y)
+    ));
     b!("-", builtin_sub);
     b!("/", builtin_div);
     b!("=", |a| Ok(Value::Bool(a.windows(2).all(|w| w[0] == w[1]))));
@@ -324,19 +345,26 @@ fn install_prelude(env: &Env) {
     b!("cons", builtin_cons);
     b!("push", builtin_push);
     b!("error", |a| Err(Error::runtime(
-        a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+        a.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     )));
 }
 
 fn arg1(a: &[Value]) -> Result<&Value> {
-    a.first().ok_or_else(|| Error::runtime("expected 1 argument"))
+    a.first()
+        .ok_or_else(|| Error::runtime("expected 1 argument"))
 }
 
 fn as_f64(v: &Value) -> Result<f64> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(x) => Ok(*x),
-        other => Err(Error::runtime(format!("expected a number, got {}", other.type_name()))),
+        other => Err(Error::runtime(format!(
+            "expected a number, got {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -387,7 +415,10 @@ fn builtin_sub(args: &[Value]) -> Result<Value> {
         [one] => match one {
             Value::Int(i) => Ok(Value::Int(-*i)),
             Value::Float(x) => Ok(Value::Float(-*x)),
-            other => Err(Error::runtime(format!("- expected number, got {}", other.type_name()))),
+            other => Err(Error::runtime(format!(
+                "- expected number, got {}",
+                other.type_name()
+            ))),
         },
         [first, rest @ ..] => {
             let mut all_int = matches!(first, Value::Int(_));
@@ -395,7 +426,11 @@ fn builtin_sub(args: &[Value]) -> Result<Value> {
                 all_int &= matches!(v, Value::Int(_));
             }
             if all_int {
-                let mut acc = if let Value::Int(i) = first { *i } else { unreachable!() };
+                let mut acc = if let Value::Int(i) = first {
+                    *i
+                } else {
+                    unreachable!()
+                };
                 for v in rest {
                     if let Value::Int(i) = v {
                         match acc.checked_sub(*i) {
@@ -452,7 +487,9 @@ fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> Result<Value
     for w in args.windows(2) {
         let a = as_f64(&w[0])?;
         let b = as_f64(&w[1])?;
-        let ord = a.partial_cmp(&b).ok_or_else(|| Error::runtime("cannot compare NaN"))?;
+        let ord = a
+            .partial_cmp(&b)
+            .ok_or_else(|| Error::runtime("cannot compare NaN"))?;
         if !keep(ord) {
             return Ok(Value::Bool(false));
         }
@@ -464,14 +501,20 @@ fn builtin_len(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
         Value::List(l) => Ok(Value::Int(l.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-        other => Err(Error::runtime(format!("len expects list or str, got {}", other.type_name()))),
+        other => Err(Error::runtime(format!(
+            "len expects list or str, got {}",
+            other.type_name()
+        ))),
     }
 }
 
 fn builtin_first(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
         Value::List(l) => Ok(l.first().cloned().unwrap_or(Value::Nil)),
-        other => Err(Error::runtime(format!("first expects list, got {}", other.type_name()))),
+        other => Err(Error::runtime(format!(
+            "first expects list, got {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -481,7 +524,10 @@ fn builtin_rest(args: &[Value]) -> Result<Value> {
             let rest: Vec<Value> = l.iter().skip(1).cloned().collect();
             Ok(Value::List(Rc::new(rest)))
         }
-        other => Err(Error::runtime(format!("rest expects list, got {}", other.type_name()))),
+        other => Err(Error::runtime(format!(
+            "rest expects list, got {}",
+            other.type_name()
+        ))),
     }
 }
 

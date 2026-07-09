@@ -5,12 +5,12 @@
 //! packaged as a static, zero-dependency binary (see docs/MASTER_PLAN.md §1.2).
 
 pub mod error;
+pub mod eval;
 pub mod grammar;
 pub mod lexer;
 pub mod parser;
 pub mod serialize;
 pub mod value;
-pub mod eval;
 
 pub use error::{Error, Result};
 pub use eval::Env;

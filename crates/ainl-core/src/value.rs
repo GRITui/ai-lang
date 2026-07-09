@@ -28,7 +28,10 @@ pub enum Value {
     /// A quoted symbol (from `(quote x)`), distinct from a variable reference.
     Sym(Rc<String>),
     List(Rc<Vec<Value>>),
-    Builtin { name: &'static str, f: BuiltinFn },
+    Builtin {
+        name: &'static str,
+        f: BuiltinFn,
+    },
     Closure(Rc<Closure>),
 }
 
@@ -65,7 +68,9 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => (*a as f64) == *b,
+            (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
+                (*a as f64) == *b
+            }
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Sym(a), Value::Sym(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,

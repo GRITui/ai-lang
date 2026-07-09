@@ -36,7 +36,11 @@ pub enum Node {
 impl Node {
     pub fn span(&self) -> Span {
         match self {
-            Node::Int(_, s) | Node::Float(_, s) | Node::Str(_, s) | Node::Sym(_, s) | Node::List(_, s) => *s,
+            Node::Int(_, s)
+            | Node::Float(_, s)
+            | Node::Str(_, s)
+            | Node::Sym(_, s)
+            | Node::List(_, s) => *s,
         }
     }
 }
@@ -59,7 +63,12 @@ fn parse_form(toks: &[Tok], pos: &mut usize) -> Result<Node> {
             let mut items = Vec::new();
             loop {
                 match toks.get(*pos) {
-                    None => return Err(Error::Parse { msg: "unclosed '('".into(), at: start }),
+                    None => {
+                        return Err(Error::Parse {
+                            msg: "unclosed '('".into(),
+                            at: start,
+                        })
+                    }
                     Some(Tok::RParen(end)) => {
                         let end = *end + 1;
                         *pos += 1;
@@ -69,7 +78,10 @@ fn parse_form(toks: &[Tok], pos: &mut usize) -> Result<Node> {
                 }
             }
         }
-        Tok::RParen(at) => Err(Error::Parse { msg: "unexpected ')'".into(), at: *at }),
+        Tok::RParen(at) => Err(Error::Parse {
+            msg: "unexpected ')'".into(),
+            at: *at,
+        }),
         Tok::Str { text, start, end } => {
             *pos += 1;
             Ok(Node::Str(text.clone(), Span::new(*start, *end)))

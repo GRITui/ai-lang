@@ -12,8 +12,14 @@ fn runs_all_five_stages_in_order() {
 #[test]
 fn auditor_output_is_valid_ainl() {
     let backend = MockBackend;
-    let report = Auditor::new(&backend).run("greet the user by name").unwrap();
-    assert!(report.ainl_valid, "auditor AINL failed to parse: {:?}", report.ainl_error);
+    let report = Auditor::new(&backend)
+        .run("greet the user by name")
+        .unwrap();
+    assert!(
+        report.ainl_valid,
+        "auditor AINL failed to parse: {:?}",
+        report.ainl_error
+    );
     // and it really parses with the core parser
     assert!(ainl_core::parse(&report.ainl).is_ok());
 }
@@ -22,9 +28,17 @@ fn auditor_output_is_valid_ainl() {
 fn each_stage_uses_its_assigned_model() {
     let backend = MockBackend;
     let report = Auditor::new(&backend).run("do a thing").unwrap();
-    let auditor_stage = report.stages.iter().find(|s| s.role == Role::Auditor).unwrap();
+    let auditor_stage = report
+        .stages
+        .iter()
+        .find(|s| s.role == Role::Auditor)
+        .unwrap();
     assert_eq!(auditor_stage.model, "phi-4-mini:3.8b");
-    let orch = report.stages.iter().find(|s| s.role == Role::Orchestrator).unwrap();
+    let orch = report
+        .stages
+        .iter()
+        .find(|s| s.role == Role::Orchestrator)
+        .unwrap();
     assert_eq!(orch.model, "qwen3.5:9b");
 }
 
