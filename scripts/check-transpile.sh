@@ -30,7 +30,12 @@ for ex in examples/*.ainl; do
     if ! command -v "$runner" >/dev/null 2>&1; then
       echo "skip $name/$target ($runner not installed)"; continue
     fi
-    out=$("$BIN" transpile "$ex" --to "$target" | "$runner" /dev/stdin 2>&1)
+    # Write to a temp file and run that — portable. (Piping via `runner
+    # /dev/stdin` breaks on Linux Node, which can't readFileSync a pipe.)
+    tmp=$(mktemp)
+    "$BIN" transpile "$ex" --to "$target" > "$tmp"
+    out=$("$runner" "$tmp" 2>&1)
+    rm -f "$tmp"
     if [ "$out" == "$expected" ]; then
       echo "ok   $name/$target"
     else
