@@ -35,8 +35,8 @@ Value  (Nil|Bool|Int|Float|Str|Sym|List|Builtin|Closure)
   target produces a fully static binary with no libc dependency chain.
 - **AST + spans** (§1.1): the `Span` on every `Node` is the hook for AST mapping
   / source-map projection between AINL and human-readable languages. `ainl ast`
-  already emits the tree with spans — the serialization surface a transpiler or
-  the Phase 2 auditor schema will consume.
+  already emits the tree with spans — the serialization surface transpilers and
+  other downstream tooling consume.
 - **Regular grammar** (§1.3): the parser accepts exactly the grammar in
   `SYNTAX.md`, which is small enough to double as a constrained-decoding grammar.
 

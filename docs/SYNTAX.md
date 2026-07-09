@@ -108,5 +108,5 @@ symbol  ::= [a-zA-Z0-9+\-*/<>=!?._-]+
 ws      ::= [ \t\n]*
 ```
 
-Phase 2's **Auditor / Syntax Enforcer** (Phi-4-mini) uses exactly this to
-guarantee every emitted program parses.
+A grammar-constrained decoder using this grammar can only produce AINL that
+parses — which is what makes the language a reliable generation target.

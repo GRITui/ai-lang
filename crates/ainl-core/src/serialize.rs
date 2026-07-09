@@ -1,11 +1,10 @@
 //! Stable JSON serialization of the AST, with source-map location info.
 //!
-//! This is the interchange format the master plan (§1.1) builds interop on: a
-//! deterministic, diffable JSON tree where every node carries both its byte
-//! `span` and a 1-based `loc` (line, char-column). A transpiler or the Phase 2
-//! auditor consumes this instead of re-parsing text, and the `loc`/`span` pair
-//! is exactly what a source map needs to trace projected human-readable code
-//! back to the original AINL bytes.
+//! This is the interchange format for AST tooling: a deterministic, diffable
+//! JSON tree where every node carries both its byte `span` and a 1-based `loc`
+//! (line, char-column). Downstream tools consume this instead of re-parsing
+//! text, and the `loc`/`span` pair is exactly what a source map needs to trace
+//! projected human-readable code back to the original AINL bytes.
 //!
 //! Hand-written (no serde) so `ainl-core` stays dependency-free and the runtime
 //! compiles to a zero-dependency static binary.

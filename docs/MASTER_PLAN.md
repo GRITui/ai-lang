@@ -1,6 +1,6 @@
-# Master Plan: AI-Native Language & Orchestrated Prompt Auditor
+# Master Plan: AI-Native Language
 
-## Phase 1 — Build an AI-Native Programming Language
+## Build an AI-Native Programming Language
 
 **Core objective (as originally stated):** a high-density, strictly-semantic
 language optimized for LLM context windows rather than human readability.
@@ -31,30 +31,13 @@ language optimized for LLM context windows rather than human readability.
 - Rollout order: **Python, JavaScript, Ruby** first; modular architecture lets the community add more.
 - Each plugin = an AST transpiler (AINL AST ⇄ target-language AST) + a runtime FFI shim.
 
-## Phase 2 — Multi-LLM Orchestrated Prompt Auditor
+## A natural-language front end (separate project)
 
-> **Moved out (2026-07-09).** Phase 2 has been forked into its own repository —
-> **[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)** — so this
-> project stays focused on the language + toolchain. The auditor depends on
-> `ainl-core` as a crate. The plan below is retained for context; active auditor
-> work now lives in that repo.
-
-**Core objective:** a GUI app that intercepts vague human language and uses a swarm of local SLMs to audit, plan, and compile the request into a perfect AINL schema.
-
-### 2.1 Agentic orchestration flow (sub-10B local models)
-1. **Orchestrator** (Qwen3.5-9B) — ingests the request, analyzes intent, picks the execution path.
-2. **Planner** (DeepSeek-R1-Distill-Qwen-7B) — maps logic, edge cases, step-by-step reasoning for complex work.
-3. **Auditor / Syntax Enforcer** (Phi-4-mini 3.8B) — grammar-constrained decoding turns the plan into a mathematically strict AINL JSON/markdown schema.
-4. **Code Engine** (IBM Granite 4.1 8B) — consumes the schema to generate final logic / dense AINL code.
-5. **Generalist** (Llama 3.1 8B Instruct) — summarizes technical output into a friendly, human-readable result for the GUI.
-
-### 2.2 Natural language → LLM-context translation
-- The GUI is an **intent compiler**: users prompt conversationally; the swarm audits and rewrites into optimized, constraint-based LLM-context markdown.
-- Output is copy-pasteable into any frontier model to get one-shot, correct generation without multi-turn correction.
-
-### 2.3 Extensible router & server wiring
-- Wire to Model Context Protocol (MCP) servers and third-party LLM routers.
-- Pull real-time context from the local filesystem or enterprise databases before compiling the final prompt.
+The original plan had a second phase — a tool to compile natural language into
+AINL. That has been built and **spun out into its own repository**:
+[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor). It consumes this
+project (`ainl-core`) as a crate and is developed independently. This plan now
+covers the language + toolchain only.
 
 ---
 
@@ -63,29 +46,17 @@ language optimized for LLM context windows rather than human readability.
 | Milestone | Deliverable | Verifies |
 |-----------|-------------|----------|
 | **M1** ✅ | Working AINL interpreter (lexer→parser→eval), CLI `run`/`repl`/`ast` | Language exists and executes |
-| M2 | `SYNTAX.md` + GBNF grammar export (`ainl grammar`) | Models can generate valid AINL |
-| **M3** ✅ | Stable JSON AST serialization + source-map loc (`ainl ast --json`) | Foundation for interop & auditor schema |
-| **M4** ✅ | Python transpiler plugin (AINL → Python), `ainl transpile` | Phase 1.4 proof of concept; output verified byte-equal to the interpreter |
-| **M5** ✅ | musl static-binary release pipeline (`scripts/build-release.sh`, `.cargo/config.toml`, `docs/RELEASE.md`) | Phase 1.2 portability; native binary verified system-only deps (393 KB) |
-| **M6** ✅ | Prompt Auditor pipeline + local model router (`ainl-auditor`, `ainl audit`) | Phase 2 skeleton runs end-to-end (mock backend); Auditor output grammar-validated + executable |
-| M7 | Real 5-model wiring (Ollama/llama.cpp) + retry-on-invalid loop + GUI shell | Phase 2 complete |
+| **M2** ✅ | `SYNTAX.md` + GBNF grammar export (`ainl grammar`) | Models can generate valid AINL |
+| **M3** ✅ | Stable JSON AST serialization + source-map loc (`ainl ast --json`) | Foundation for interop & tooling |
+| **M4** ✅ | Python transpiler plugin (AINL → Python), `ainl transpile` | §1.4 proof of concept; output verified byte-equal to the interpreter |
+| **M5** ✅ | musl static-binary release pipeline (`scripts/build-release.sh`, `.cargo/config.toml`, `docs/RELEASE.md`) | §1.2 portability; native binary verified system-only deps (393 KB) |
+
+Plus the §1.4 rollout completed the JavaScript and Ruby transpilers (full 3×3
+byte-equal matrix), and **v0.1.0 shipped**.
 
 **Phase 1 is complete.** The AINL language runs, serializes its AST with source
 maps, exports a constrained-decoding grammar, transpiles byte-equivalently to
-Python/JavaScript/Ruby, and ships as a zero-dependency binary.
+Python/JavaScript/Ruby, and ships as a zero-dependency binary. See
+[BACKLOG.md](BACKLOG.md) for what's next.
 
-**Phase 2 has started (M6).** The `ainl-auditor` crate runs the five-role
-pipeline (`ainl audit`). The Auditor stage emits AINL under the exported GBNF and
-validates it in-process with the real parser — verified that its output both
-parses and executes. A deterministic mock backend makes the whole pipeline
-runnable and testable with no models present; the HTTP backend targets local
-Ollama/llama.cpp servers for M7.
-
-### Phase 2 remaining (M7)
-- Wire real models via the HTTP backend (Ollama/llama.cpp), one per role.
-- Retry-on-invalid loop: if the Auditor's AINL fails to parse, re-prompt with the
-  parser error until valid (the grammar makes this rare but the loop guarantees it).
-- GUI shell over the pipeline (Tauri wrapping the Rust core, or a thin web UI).
-- Live MCP `ContextProvider` implementations (§2.3).
-
-We build bottom-up: a language that runs, then tooling around its AST, then the auditor that targets it.
+We build bottom-up: a language that runs, then tooling around its AST.

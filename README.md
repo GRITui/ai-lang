@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/GRITui/ai-lang/actions/workflows/ci.yml)
 
-A small, uniform programming language built to be **generated and verified by machines**. AINL's entire grammar is a tiny regular CFG, so an LLM can be *constrained* to emit only valid programs — and every program maps losslessly to and from human-readable Python, JavaScript, and Ruby. Plus a multi-LLM **Prompt Auditor** that compiles vague natural language into validated AINL schemas.
+A small, uniform programming language built to be **generated and verified by machines**. AINL's entire grammar is a tiny regular CFG, so an LLM can be *constrained* to emit only valid programs — and every program maps losslessly to and from human-readable Python, JavaScript, and Ruby.
 
 > A reliable **generation target** for LLMs: easy to generate under grammar constraints, trivial to validate, and portable to the languages people already use.
 
@@ -43,14 +43,6 @@ ai-native-lang/
 - **exports** a constrained-decoding grammar (`grammar`, GBNF/EBNF),
 - **transpiles** byte-equivalently to **Python, JavaScript, and Ruby** (`transpile --to`),
 - **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
-
-## Related project — the Prompt Auditor
-
-The experimental tool that *generates* AINL from natural language (a multi-model
-"Prompt Auditor") has been split into its own repository:
-**[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)**. It depends on
-`ainl-core` from this repo as a crate. This repository is the **language and
-toolchain**; the auditor is a separate, optional consumer of it.
 
 See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap, [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar, and [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for a hands-on walkthrough.
 

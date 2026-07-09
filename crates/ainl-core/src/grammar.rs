@@ -1,10 +1,9 @@
 //! The canonical AINL grammar, in machine-consumable forms.
 //!
-//! Master plan §1.3 / M2: the same low-entropy grammar the parser accepts,
-//! exported for **grammar-constrained decoding** so a model (notably Phase 2's
-//! Auditor / Syntax Enforcer) can only emit programs that parse. `SYNTAX.md`
-//! documents this grammar for humans/models; these constants are the mechanical
-//! version.
+//! The same low-entropy grammar the parser accepts, exported for
+//! **grammar-constrained decoding** so a model can be forced to emit only
+//! programs that parse. `SYNTAX.md` documents this grammar for humans/models;
+//! these constants are the mechanical version.
 
 /// GBNF grammar (llama.cpp / `grammars` format). Feed to a constrained decoder
 /// to force valid AINL output.
