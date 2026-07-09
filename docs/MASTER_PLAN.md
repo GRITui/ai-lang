@@ -53,12 +53,25 @@
 | **M3** ✅ | Stable JSON AST serialization + source-map loc (`ainl ast --json`) | Foundation for interop & auditor schema |
 | **M4** ✅ | Python transpiler plugin (AINL → Python), `ainl transpile` | Phase 1.4 proof of concept; output verified byte-equal to the interpreter |
 | **M5** ✅ | musl static-binary release pipeline (`scripts/build-release.sh`, `.cargo/config.toml`, `docs/RELEASE.md`) | Phase 1.2 portability; native binary verified system-only deps (393 KB) |
-| M6 | Prompt Auditor GUI shell + local model router | Phase 2 skeleton |
-| M7 | Full 5-model orchestration + constrained decoding | Phase 2 complete |
+| **M6** ✅ | Prompt Auditor pipeline + local model router (`ainl-auditor`, `ainl audit`) | Phase 2 skeleton runs end-to-end (mock backend); Auditor output grammar-validated + executable |
+| M7 | Real 5-model wiring (Ollama/llama.cpp) + retry-on-invalid loop + GUI shell | Phase 2 complete |
 
 **Phase 1 is complete.** The AINL language runs, serializes its AST with source
 maps, exports a constrained-decoding grammar, transpiles byte-equivalently to
-Python/JavaScript/Ruby, and ships as a zero-dependency binary. Phase 2 (the
-multi-SLM Prompt Auditor) is next.
+Python/JavaScript/Ruby, and ships as a zero-dependency binary.
+
+**Phase 2 has started (M6).** The `ainl-auditor` crate runs the five-role
+pipeline (`ainl audit`). The Auditor stage emits AINL under the exported GBNF and
+validates it in-process with the real parser — verified that its output both
+parses and executes. A deterministic mock backend makes the whole pipeline
+runnable and testable with no models present; the HTTP backend targets local
+Ollama/llama.cpp servers for M7.
+
+### Phase 2 remaining (M7)
+- Wire real models via the HTTP backend (Ollama/llama.cpp), one per role.
+- Retry-on-invalid loop: if the Auditor's AINL fails to parse, re-prompt with the
+  parser error until valid (the grammar makes this rare but the loop guarantees it).
+- GUI shell over the pipeline (Tauri wrapping the Rust core, or a thin web UI).
+- Live MCP `ContextProvider` implementations (§2.3).
 
 We build bottom-up: a language that runs, then tooling around its AST, then the auditor that targets it.

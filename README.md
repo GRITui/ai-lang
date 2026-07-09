@@ -38,7 +38,14 @@ ai-native-lang/
 - **transpiles** byte-equivalently to **Python, JavaScript, and Ruby** (`transpile --to`),
 - **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
 
-See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar. **Phase 2** — the multi-SLM Prompt Auditor — is next.
+**Phase 2 — the multi-SLM Prompt Auditor — has started.** The `ainl-auditor` crate runs a five-role pipeline (Orchestrator → Planner → Auditor → Code Engine → Generalist) that compiles vague natural language into a validated AINL schema. The Auditor stage emits AINL under the exported grammar and validates it with the real parser. A deterministic mock backend runs the whole flow offline today; an HTTP backend targets local Ollama/llama.cpp servers.
+
+```sh
+# compile a request into an audited, grammar-valid AINL prompt (offline mock)
+./target/release/ainl audit "sum all numbers in a list" --stages
+```
+
+See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the full roadmap and [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar.
 
 ## Quick start
 
