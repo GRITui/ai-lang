@@ -83,10 +83,10 @@ follow the same `Node`→`String` shape.
 - JavaScript + Ruby transpiler targets (§1.4 rollout).
 - Release workflow targeting `*-unknown-linux-musl` for static binaries (M5).
 
-## Phase 2 — Prompt Auditor (planned)
+## Prompt Auditor — separate project
 
-A GUI shell drives a local model router that pipelines five sub-10B SLMs
-(Orchestrator → Planner → Auditor → Code Engine → Generalist). The Auditor stage
-emits AINL under the grammar in `SYNTAX.md` via constrained decoding, so its
-output is guaranteed to parse with `ainl-core`. External context arrives through
-MCP servers and third-party routers. See `MASTER_PLAN.md` §2.
+The multi-model Prompt Auditor that generates AINL from natural language now
+lives in its own repository: **[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)**.
+It consumes this project — the Auditor stage emits AINL under the exported GBNF
+grammar and validates it with `ainl-core`'s parser — but is developed and
+released independently. Nothing in `ai-lang` depends on it.

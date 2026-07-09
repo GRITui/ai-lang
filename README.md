@@ -44,14 +44,15 @@ ai-native-lang/
 - **transpiles** byte-equivalently to **Python, JavaScript, and Ruby** (`transpile --to`),
 - **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
 
-**Phase 2 — the multi-SLM Prompt Auditor — has started.** The `ainl-auditor` crate runs a five-role pipeline (Orchestrator → Planner → Auditor → Code Engine → Generalist) that compiles vague natural language into a validated AINL schema. The Auditor stage emits AINL under the exported grammar and validates it with the real parser. A deterministic mock backend runs the whole flow offline today; an HTTP backend targets local Ollama/llama.cpp servers.
+## Related project — the Prompt Auditor
 
-```sh
-# compile a request into an audited, grammar-valid AINL prompt (offline mock)
-./target/release/ainl audit "sum all numbers in a list" --stages
-```
+The experimental tool that *generates* AINL from natural language (a multi-model
+"Prompt Auditor") has been split into its own repository:
+**[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)**. It depends on
+`ainl-core` from this repo as a crate. This repository is the **language and
+toolchain**; the auditor is a separate, optional consumer of it.
 
-See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the full roadmap, [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar, and [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for a hands-on walkthrough.
+See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap, [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar, and [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for a hands-on walkthrough.
 
 ## Install
 

@@ -33,6 +33,12 @@ language optimized for LLM context windows rather than human readability.
 
 ## Phase 2 — Multi-LLM Orchestrated Prompt Auditor
 
+> **Moved out (2026-07-09).** Phase 2 has been forked into its own repository —
+> **[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)** — so this
+> project stays focused on the language + toolchain. The auditor depends on
+> `ainl-core` as a crate. The plan below is retained for context; active auditor
+> work now lives in that repo.
+
 **Core objective:** a GUI app that intercepts vague human language and uses a swarm of local SLMs to audit, plan, and compile the request into a perfect AINL schema.
 
 ### 2.1 Agentic orchestration flow (sub-10B local models)

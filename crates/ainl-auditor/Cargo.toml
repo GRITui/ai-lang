@@ -1,9 +1,0 @@
-[package]
-name = "ainl-auditor"
-description = "Phase 2: multi-SLM orchestrated Prompt Auditor. Compiles vague natural language into a strict, grammar-validated AINL schema via a 5-stage local-model pipeline."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-ainl-core = { path = "../ainl-core" }

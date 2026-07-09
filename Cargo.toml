@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/ainl-core",
     "crates/ainl-transpile",
-    "crates/ainl-auditor",
     "crates/ainl-cli",
 ]
 

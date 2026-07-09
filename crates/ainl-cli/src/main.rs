@@ -21,7 +21,6 @@ fn main() -> ExitCode {
         Some("ast") => cmd_ast(&args[1..]),
         Some("transpile") => cmd_transpile(&args[1..]),
         Some("grammar") => cmd_grammar(&args[1..]),
-        Some("audit") => cmd_audit(&args[1..]),
         Some("repl") => cmd_repl(),
         Some("version") | Some("--version") | Some("-v") => {
             println!("ainl {VERSION}");
@@ -49,7 +48,6 @@ fn print_help() {
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
-         ainl audit <text>        compile natural language into a validated AINL prompt\n  \
          ainl repl                start an interactive REPL\n  \
          ainl version             print version\n"
     );
@@ -198,104 +196,6 @@ fn cmd_transpile(rest: &[String]) -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
-    }
-}
-
-fn cmd_audit(rest: &[String]) -> ExitCode {
-    use ainl_auditor::{Auditor, Backend, FsContextProvider, HttpBackend, MockBackend};
-
-    let mut backend_kind = "mock".to_string();
-    let mut endpoint = "http://localhost:11434/api/generate".to_string();
-    let mut context_dir: Option<String> = None;
-    let mut show_stages = false;
-    let mut text_parts: Vec<String> = Vec::new();
-
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--backend" => {
-                let Some(v) = rest.get(i + 1) else {
-                    eprintln!("--backend needs mock|http");
-                    return ExitCode::FAILURE;
-                };
-                backend_kind = v.clone();
-                i += 2;
-            }
-            "--endpoint" => {
-                let Some(v) = rest.get(i + 1) else {
-                    eprintln!("--endpoint needs a URL");
-                    return ExitCode::FAILURE;
-                };
-                endpoint = v.clone();
-                i += 2;
-            }
-            "--context-dir" => {
-                let Some(v) = rest.get(i + 1) else {
-                    eprintln!("--context-dir needs a path");
-                    return ExitCode::FAILURE;
-                };
-                context_dir = Some(v.clone());
-                i += 2;
-            }
-            "--stages" => {
-                show_stages = true;
-                i += 1;
-            }
-            other => {
-                text_parts.push(other.to_string());
-                i += 1;
-            }
-        }
-    }
-
-    let input = text_parts.join(" ");
-    if input.trim().is_empty() {
-        eprintln!("usage: ainl audit <natural language> [--backend mock|http] [--endpoint URL] [--context-dir DIR] [--stages]");
-        return ExitCode::FAILURE;
-    }
-
-    let backend: Box<dyn Backend> = match backend_kind.as_str() {
-        "mock" => Box::new(MockBackend),
-        "http" => Box::new(HttpBackend::new(endpoint)),
-        other => {
-            eprintln!("unknown backend '{other}' (supported: mock, http)");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let mut auditor = Auditor::new(backend.as_ref());
-    if let Some(dir) = context_dir {
-        auditor = auditor.with_context(Box::new(FsContextProvider::new(dir)));
-    }
-
-    let report = match auditor.run(&input) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("audit failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    eprintln!("# backend: {}", report.backend);
-    if show_stages {
-        for stage in &report.stages {
-            eprintln!("\n── {} ({}) ──", stage.role.title(), stage.model);
-            eprintln!("{}", stage.output);
-        }
-        eprintln!();
-    }
-    if !report.ainl_valid {
-        eprintln!(
-            "! auditor output did NOT parse as AINL: {}",
-            report.ainl_error.as_deref().unwrap_or("unknown")
-        );
-    }
-    // The audited prompt goes to stdout so it can be piped / copied.
-    print!("{}", report.context_prompt);
-    if report.ainl_valid {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
