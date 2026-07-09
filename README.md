@@ -49,6 +49,9 @@ cargo build --release
 
 # emit the AST as stable JSON with source-map loc (span + line/col per node)
 ./target/release/ainl ast examples/fib.ainl --json
+
+# project AINL into runnable, readable Python (bidirectional interop, §1.4)
+./target/release/ainl transpile examples/fib.ainl --to python
 ```
 
 ## The language in 10 seconds

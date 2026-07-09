@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(args.get(1)),
         Some("eval") => cmd_eval(&args[1..].join(" ")),
         Some("ast") => cmd_ast(&args[1..]),
+        Some("transpile") => cmd_transpile(&args[1..]),
         Some("repl") => cmd_repl(),
         Some("version") | Some("--version") | Some("-v") => {
             println!("ainl {VERSION}");
@@ -44,6 +45,7 @@ fn print_help() {
          ainl eval <code>         evaluate a snippet\n  \
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
+         ainl transpile <file>    project AINL to another language (--to python)\n  \
          ainl repl                start an interactive REPL\n  \
          ainl version             print version\n"
     );
@@ -140,6 +142,57 @@ fn print_node(node: &Node, depth: usize) {
             for it in items {
                 print_node(it, depth + 1);
             }
+        }
+    }
+}
+
+fn cmd_transpile(rest: &[String]) -> ExitCode {
+    let mut path: Option<&String> = None;
+    let mut target = "python".to_string();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--to" => {
+                let Some(t) = rest.get(i + 1) else {
+                    eprintln!("--to needs a language (e.g. --to python)");
+                    return ExitCode::FAILURE;
+                };
+                target = t.clone();
+                i += 2;
+            }
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag '{flag}' (supported: --to <lang>)");
+                return ExitCode::FAILURE;
+            }
+            _ => {
+                path = Some(&rest[i]);
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: ainl transpile <file.ainl> [--to python]");
+        return ExitCode::FAILURE;
+    };
+    if ainl_transpile::Target::from_name(&target).is_none() {
+        eprintln!("unsupported target '{target}' (supported: python)");
+        return ExitCode::FAILURE;
+    }
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match ainl_transpile::transpile_python_src(&src) {
+        Ok(py) => {
+            print!("{py}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
         }
     }
 }

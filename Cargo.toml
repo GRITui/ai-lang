@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ainl-core", "crates/ainl-cli"]
+members = ["crates/ainl-core", "crates/ainl-transpile", "crates/ainl-cli"]
 
 [workspace.package]
 version = "0.1.0"

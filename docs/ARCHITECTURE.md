@@ -56,10 +56,31 @@ primitive: a projected human-readable line maps back to the exact AINL bytes.
 The serializer is hand-written (no serde) to preserve the zero-dependency
 guarantee. Deterministic field order makes the output diffable in VCS.
 
+### Transpiler plugins (M4, Python implemented)
+
+`ainl-transpile` projects the AST into traditional languages (master plan §1.4).
+The **Python** target (`ainl transpile <file> --to python`, API
+`transpile_python`) lowers AINL's expression-oriented forms into idiomatic
+Python using two emission contexts:
+
+- **expression context** — forms with a natural Python expression: `if`→`a if c
+  else b`, chained comparisons (`(< 1 2 3)`→`(1 < 2 < 3)`), `fn`→`lambda`,
+  single-body `let`→IIFE, `quote`→data literals.
+- **statement context** — bodies and the module top level, where `def`/`while`/
+  `let`/`do`/multi-branch `if` become real statements and a function's tail form
+  is `return`ed. Forms with no expression form (e.g. `while`) error in
+  expression position with the offending source span.
+
+Only the runtime helpers a program actually uses are emitted (a small `_disp`/
+`_print`/list-op shim), and a `# ainl:<line>` source-map comment precedes each
+top-level definition. **Verified**: `hello`/`fib`/`lists` transpile to Python
+whose stdout is byte-identical to the AINL interpreter. New targets (JS, Ruby)
+follow the same `Node`→`String` shape.
+
 ## Phase 1 roadmap hooks (not yet built)
 
 - JSON → AST deserialization (round-trip) so tools can author/rewrite AST as JSON.
-- `ainl-transpile` crate — AINL AST → Python/JS/Ruby source with source maps (M4).
+- JavaScript + Ruby transpiler targets (§1.4 rollout).
 - Release workflow targeting `*-unknown-linux-musl` for static binaries (M5).
 
 ## Phase 2 — Prompt Auditor (planned)

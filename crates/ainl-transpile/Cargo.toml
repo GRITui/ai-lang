@@ -1,0 +1,9 @@
+[package]
+name = "ainl-transpile"
+description = "Transpiler plugins that project the AINL AST into traditional languages (Phase 1 §1.4). Python target implemented."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ainl-core = { path = "../ainl-core" }
