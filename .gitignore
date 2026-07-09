@@ -3,6 +3,9 @@
 **/*.rs.bk
 Cargo.lock
 
+# Release packaging output
+/dist
+
 # Secrets (keep tokens/keys out of the repo)
 *.env
 config.env
