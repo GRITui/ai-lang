@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         Some("eval") => cmd_eval(&args[1..].join(" ")),
         Some("ast") => cmd_ast(&args[1..]),
         Some("transpile") => cmd_transpile(&args[1..]),
+        Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(),
         Some("version") | Some("--version") | Some("-v") => {
             println!("ainl {VERSION}");
@@ -45,7 +46,8 @@ fn print_help() {
          ainl eval <code>         evaluate a snippet\n  \
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
-         ainl transpile <file>    project AINL to another language (--to python)\n  \
+         ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
+         ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                start an interactive REPL\n  \
          ainl version             print version\n"
     );
@@ -195,6 +197,19 @@ fn cmd_transpile(rest: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_grammar(rest: &[String]) -> ExitCode {
+    let dialect = match rest.first().map(String::as_str) {
+        None | Some("--gbnf") => ainl_core::Dialect::Gbnf,
+        Some("--ebnf") => ainl_core::Dialect::Ebnf,
+        Some(other) => {
+            eprintln!("unknown flag '{other}' (supported: --gbnf, --ebnf)");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", ainl_core::grammar::grammar(dialect));
+    ExitCode::SUCCESS
 }
 
 fn cmd_repl() -> ExitCode {

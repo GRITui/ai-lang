@@ -5,6 +5,7 @@
 //! packaged as a static, zero-dependency binary (see docs/MASTER_PLAN.md §1.2).
 
 pub mod error;
+pub mod grammar;
 pub mod lexer;
 pub mod parser;
 pub mod serialize;
@@ -13,6 +14,7 @@ pub mod eval;
 
 pub use error::{Error, Result};
 pub use eval::Env;
+pub use grammar::{Dialect, GBNF};
 pub use parser::{Node, Span};
 pub use serialize::{forms_to_json, LineIndex};
 pub use value::Value;
