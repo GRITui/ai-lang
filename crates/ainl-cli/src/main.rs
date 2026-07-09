@@ -173,13 +173,13 @@ fn cmd_transpile(rest: &[String]) -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: ainl transpile <file.ainl> [--to python]");
+        eprintln!("usage: ainl transpile <file.ainl> [--to python|js|ruby]");
         return ExitCode::FAILURE;
     };
-    if ainl_transpile::Target::from_name(&target).is_none() {
-        eprintln!("unsupported target '{target}' (supported: python)");
+    let Some(target) = ainl_transpile::Target::from_name(&target) else {
+        eprintln!("unsupported target '{target}' (supported: python, js, ruby)");
         return ExitCode::FAILURE;
-    }
+    };
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -187,9 +187,9 @@ fn cmd_transpile(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match ainl_transpile::transpile_python_src(&src) {
-        Ok(py) => {
-            print!("{py}");
+    match ainl_transpile::transpile_src(target, &src) {
+        Ok(code) => {
+            print!("{code}");
             ExitCode::SUCCESS
         }
         Err(e) => {
