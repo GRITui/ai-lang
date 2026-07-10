@@ -61,7 +61,7 @@ impl Js {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
-        if disp_used || self.needed.contains("_sym") {
+        if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
         let mut out = String::new();
@@ -267,7 +267,7 @@ impl Js {
                 "*" => return self.infix(args, "*", "1"),
                 "-" => return self.infix_sub(args),
                 "/" => return self.infix_div(args),
-                "=" => return self.cmp(args, "==="),
+                "=" => return self.eq_chain(args),
                 "<" => return self.cmp(args, "<"),
                 ">" => return self.cmp(args, ">"),
                 "<=" => return self.cmp(args, "<="),
@@ -364,6 +364,23 @@ impl Js {
             return Err(Error::runtime("expects 1 argument"));
         };
         Ok(format!("({op}{})", self.expr(a)?))
+    }
+
+    /// `=` needs structural equality (AINL lists compare element-wise, and a
+    /// quoted symbol compares by name), unlike `===` which is JS reference
+    /// identity for arrays and `_Sym` instances. Expand chained `(= a b c)`
+    /// to `(_eq(a, b) && _eq(b, c))`, matching `cmp`'s chaining shape.
+    fn eq_chain(&mut self, args: &[Node]) -> Result<String> {
+        if args.len() < 2 {
+            return Ok("true".to_string());
+        }
+        self.need("_eq");
+        let parts = self.expr_all(args)?;
+        let clauses: Vec<String> = parts
+            .windows(2)
+            .map(|w| format!("_eq({}, {})", w[0], w[1]))
+            .collect();
+        Ok(format!("({})", clauses.join(" && ")))
     }
 
     /// JS has no chained comparison, so expand `(< a b c)` to `(a < b && b < c)`.
@@ -618,6 +635,10 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_repr",
         "function _repr(x) {\n  return typeof x === \"string\" ? '\"' + x + '\"' : _disp(x);\n}",
+    ),
+    (
+        "_eq",
+        "function _eq(a, b) {\n  if (Array.isArray(a) && Array.isArray(b)) {\n    if (a.length !== b.length) return false;\n    for (let i = 0; i < a.length; i++) { if (!_eq(a[i], b[i])) return false; }\n    return true;\n  }\n  if (a instanceof _Sym && b instanceof _Sym) return a.name === b.name;\n  return a === b;\n}",
     ),
     ("_print", "function _print(...xs) { console.log(xs.map(_disp).join(\" \")); }"),
     ("_str", "function _str(...xs) { return xs.map(_disp).join(\"\"); }"),

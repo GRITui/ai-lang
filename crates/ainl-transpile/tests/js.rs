@@ -15,7 +15,23 @@ fn function_becomes_declaration() {
 fn chained_comparison_expands_to_and() {
     // JS has no chained comparison — must expand.
     assert!(js("(< 1 2 3)").contains("(1 < 2 && 2 < 3)"));
-    assert!(js("(= 2 2)").contains("(2 === 2)"));
+    assert!(js("(= 2 2)").contains("(_eq(2, 2))"));
+}
+
+#[test]
+fn equality_uses_structural_eq_not_reference_identity() {
+    // `===` on JS arrays is reference identity, diverging from the
+    // interpreter's (and Python/Ruby's) structural list equality. `=` must
+    // go through the `_eq` runtime helper instead of a bare `===`.
+    let out = js("(= (list 1 2) (list 1 2))");
+    assert!(out.contains("_eq([1, 2], [1, 2])"), "got:\n{out}");
+    assert!(out.contains("function _eq("), "got:\n{out}");
+}
+
+#[test]
+fn eq_helper_omitted_when_equality_unused() {
+    let out = js("(+ 1 2)");
+    assert!(!out.contains("function _eq("), "got:\n{out}");
 }
 
 #[test]

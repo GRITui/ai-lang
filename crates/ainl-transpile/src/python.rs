@@ -72,7 +72,7 @@ impl Py {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
-        if disp_used || self.needed.contains("_sym") {
+        if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
         let mut out = String::new();
@@ -288,7 +288,7 @@ impl Py {
                 "*" => return self.infix(args, "*", Some("1")),
                 "-" => return self.infix_sub(args),
                 "/" => return self.infix_div(args),
-                "=" => return self.chain(args, "=="),
+                "=" => return self.eq_chain(args),
                 "<" => return self.chain(args, "<"),
                 ">" => return self.chain(args, ">"),
                 "<=" => return self.chain(args, "<="),
@@ -388,6 +388,24 @@ impl Py {
             return Err(Error::runtime("expects 1 argument"));
         };
         Ok(format!("({op}{})", self.expr(a)?))
+    }
+
+    /// `=` needs the `_eq` runtime helper rather than native `==`: `_Sym` is
+    /// implemented as a `str` subclass (so quoted-symbol values print bare),
+    /// which makes bare `==` say `_Sym("a") == "a"` — wrongly conflating a
+    /// quoted symbol with an equal-content string. `_eq` also recurses into
+    /// lists so a symbol nested inside one gets the same treatment.
+    fn eq_chain(&mut self, args: &[Node]) -> Result<String> {
+        if args.len() < 2 {
+            return Ok("True".to_string());
+        }
+        self.need("_eq");
+        let parts = self.expr_all(args)?;
+        let clauses: Vec<String> = parts
+            .windows(2)
+            .map(|w| format!("_eq({}, {})", w[0], w[1]))
+            .collect();
+        Ok(format!("({})", clauses.join(" and ")))
     }
 
     /// Chained comparison — Python supports `a < b < c` natively, matching AINL.
@@ -643,6 +661,10 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_repr",
         "def _repr(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    return '\"' + x + '\"' if isinstance(x, str) else _disp(x)",
+    ),
+    (
+        "_eq",
+        "def _eq(a, b):\n    if isinstance(a, list) and isinstance(b, list):\n        return len(a) == len(b) and all(_eq(x, y) for x, y in zip(a, b))\n    if isinstance(a, _Sym) != isinstance(b, _Sym):\n        return False\n    if isinstance(a, bool) != isinstance(b, bool):\n        return False\n    return a == b",
     ),
     ("_print", "def _print(*xs):\n    print(' '.join(_disp(x) for x in xs))"),
     ("_str", "def _str(*xs):\n    return ''.join(_disp(x) for x in xs)"),
