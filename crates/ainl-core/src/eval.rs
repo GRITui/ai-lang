@@ -87,8 +87,24 @@ struct Scope {
     parent: Option<Env>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of currently-live `Scope` allocations, for whiteboxing the
+    /// cycle-breaking fix below — see `tests::self_referential_closure_does_not_leak`.
+    static LIVE_SCOPES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for Scope {
+    fn drop(&mut self) {
+        LIVE_SCOPES.with(|c| c.set(c.get() - 1));
+    }
+}
+
 impl Env {
     pub fn new() -> Env {
+        #[cfg(test)]
+        LIVE_SCOPES.with(|c| c.set(c.get() + 1));
         Env(Rc::new(Scope {
             vars: RefCell::new(HashMap::new()),
             parent: None,
@@ -96,6 +112,8 @@ impl Env {
     }
 
     pub fn child(&self) -> Env {
+        #[cfg(test)]
+        LIVE_SCOPES.with(|c| c.set(c.get() + 1));
         Env(Rc::new(Scope {
             vars: RefCell::new(HashMap::new()),
             parent: Some(self.clone()),
@@ -118,6 +136,46 @@ impl Env {
         let env = Env::new();
         crate::eval::install_prelude(&env);
         env
+    }
+
+    /// True if `self` is `other` or one of `other`'s ancestors — i.e.
+    /// something reachable through `other`'s parent chain still needs
+    /// `self`'s bindings.
+    fn is_ancestor_of(&self, other: &Env) -> bool {
+        let mut cur = other.clone();
+        loop {
+            if Rc::ptr_eq(&self.0, &cur.0) {
+                return true;
+            }
+            match cur.0.parent.clone() {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// Drop all bindings in this scope, breaking any `Rc` cycle rooted here.
+    ///
+    /// A closure that re-`def`s itself into its own call scope (the common
+    /// named-recursive-function pattern) makes that scope's `vars` map hold
+    /// a `Closure` whose `env` points right back at the scope — an `Rc`
+    /// cycle that never frees on its own. Called only once a call/`let`
+    /// scope's body has finished evaluating and nothing in its result still
+    /// needs it (see `apply` and `sf_let`), so this never removes bindings a
+    /// live closure could still look up.
+    fn clear(&self) {
+        self.0.vars.borrow_mut().clear();
+    }
+}
+
+/// True if some closure reachable from `val` (directly, or nested inside a
+/// list) was defined in `env` or in a scope that has `env` as an ancestor —
+/// i.e. `env`'s bindings are still needed by something the caller now holds.
+fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
+    match val {
+        Value::Closure(c) => env.is_ancestor_of(&c.env),
+        Value::List(items) => items.iter().any(|v| value_keeps_env_alive(v, env)),
+        _ => false,
     }
 }
 
@@ -204,10 +262,26 @@ pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
                 call_env.define(rest.clone(), Value::List(Rc::new(extra)));
             }
             let mut last = Value::Nil;
+            let mut err = None;
             for form in &clos.body {
-                last = eval(form, &call_env)?;
+                match eval(form, &call_env) {
+                    Ok(v) => last = v,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
             }
-            Ok(last)
+            // Break a self-referential-def cycle rooted in this call's own
+            // scope, unless the result still needs it (a closure escaped
+            // that was defined in — or under — call_env).
+            if err.is_some() || !value_keeps_env_alive(&last, &call_env) {
+                call_env.clear();
+            }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(last),
+            }
         }
         other => Err(Error::runtime(format!(
             "cannot call a {}",
@@ -298,6 +372,22 @@ fn sf_let(args: &[Node], env: &Env) -> Result<Value> {
         return Err(Error::runtime("let bindings must be a list"));
     };
     let scope = env.child();
+    let result = sf_let_body(binds, body, &scope);
+    // Break a self-referential-def cycle rooted in this let's own scope
+    // (e.g. `(let () (def loop (fn () (loop))) ...)`), unless the result
+    // still needs it (a closure escaped that was defined in — or under —
+    // scope).
+    let last = match &result {
+        Ok(v) => v,
+        Err(_) => &Value::Nil,
+    };
+    if result.is_err() || !value_keeps_env_alive(last, &scope) {
+        scope.clear();
+    }
+    result
+}
+
+fn sf_let_body(binds: &[Node], body: &[Node], scope: &Env) -> Result<Value> {
     for b in binds {
         let Node::List(pair, _) = b else {
             return Err(Error::runtime("each let binding must be (name value)"));
@@ -305,12 +395,12 @@ fn sf_let(args: &[Node], env: &Env) -> Result<Value> {
         let [Node::Sym(name, _), val_node] = &pair[..] else {
             return Err(Error::runtime("each let binding must be (name value)"));
         };
-        let val = eval(val_node, &scope)?;
+        let val = eval(val_node, scope)?;
         scope.define(name.clone(), val);
     }
     let mut last = Value::Nil;
     for form in body {
-        last = eval(form, &scope)?;
+        last = eval(form, scope)?;
     }
     Ok(last)
 }
@@ -643,4 +733,51 @@ fn builtin_push(args: &[Value]) -> Result<Value> {
     let mut out: Vec<Value> = l.iter().cloned().collect();
     out.extend(tail.iter().cloned());
     Ok(Value::List(Rc::new(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_scopes() -> usize {
+        LIVE_SCOPES.with(|c| c.get())
+    }
+
+    #[test]
+    fn self_referential_closure_does_not_leak_its_call_scope() {
+        LIVE_SCOPES.with(|c| c.set(0));
+        let env = Env::with_prelude();
+        // `helper` re-defines itself into make_counter's own call scope —
+        // exactly the Rc-cycle-forming pattern. Called many times in a loop:
+        // without the cycle-breaking fix in `apply`, each call leaks its own
+        // call scope and never frees it.
+        let src = "\
+            (def make_counter (fn ()
+              (def helper (fn (x) (if (= x 0) 0 (helper (- x 1)))))
+              (helper 3)))
+            (def i 0)
+            (while (< i 500) (make_counter) (def i (+ i 1)))
+            ";
+        crate::run_in(src, &env).unwrap();
+        let live = live_scopes();
+        // Only long-lived scopes should remain (the global env + a couple
+        // still referenced by `env`/`make_counter`'s own defining scope) —
+        // nowhere near the 500+ this would be if every call scope leaked.
+        assert!(live < 20, "expected a bounded live-scope count, got {live}");
+    }
+
+    #[test]
+    fn escaping_closure_keeps_its_captured_scope_alive() {
+        LIVE_SCOPES.with(|c| c.set(0));
+        let env = Env::with_prelude();
+        let src = "\
+            (def make_adder (fn (n) (fn (x) (+ x n))))
+            (def add5 (make_adder 5))
+            ";
+        crate::run_in(src, &env).unwrap();
+        // `add5`'s captured scope (holding `n = 5`) must still be alive and
+        // correct — this is the correctness counterpart to the leak test
+        // above: the fix must not clear a scope a live closure still needs.
+        assert_eq!(crate::run_in("(add5 10)", &env).unwrap(), Value::Int(15));
+    }
 }
