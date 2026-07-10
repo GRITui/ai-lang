@@ -1,0 +1,16 @@
+; Maps: build, look up, and non-mutating update.
+(def user (hash "name" "Ada" "age" 36))
+(print "user =" user)
+(print "name =" (get user "name"))
+(print "email =" (get user "email"))
+(print "has age? =" (has user "age"))
+(print "has email? =" (has user "email"))
+(print "keys =" (keys user))
+(print "vals =" (vals user))
+
+; assoc returns a new map; the original is untouched.
+(def user2 (assoc user "age" 37))
+(print "user age =" (get user "age"))
+(print "user2 age =" (get user2 "age"))
+
+(print "size =" (len user))

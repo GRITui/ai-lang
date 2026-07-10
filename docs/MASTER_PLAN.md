@@ -52,7 +52,9 @@ covers the language + toolchain only.
 | **M5** ✅ | musl static-binary release pipeline (`scripts/build-release.sh`, `.cargo/config.toml`, `docs/RELEASE.md`) | §1.2 portability; native binary verified system-only deps (393 KB) |
 
 Plus the §1.4 rollout completed the JavaScript and Ruby transpilers (full 3×3
-byte-equal matrix), and **v0.1.0 shipped**.
+byte-equal matrix for the example programs — see [NUMERIC_MODEL.md](NUMERIC_MODEL.md)
+for the integer-overflow boundary where the four runtimes diverge by design),
+and **v0.1.0 shipped**.
 
 **Phase 1 is complete.** The AINL language runs, serializes its AST with source
 maps, exports a constrained-decoding grammar, transpiles byte-equivalently to

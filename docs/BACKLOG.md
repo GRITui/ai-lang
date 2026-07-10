@@ -34,18 +34,30 @@ later, **Blockers** = needs an external resource or decision.
   the surface syntax needs redesign — a parenless/layout-based form, or the
   "stack-based bytecode" option from the plan. Re-run `bench/bench.py` to prove
   any change helps.
-- **AINL stdlib**: promote `map`/`filter`/`fold`, string ops, and hash/map values
-  into the core so common programs are shorter (and closes some of the token gap).
+- **AINL stdlib**: promote `map`/`filter`/`fold` and string ops into the core so
+  common programs are shorter (and closes some of the token gap). Hash/map
+  values landed — `hash`/`get`/`assoc`/`has`/`keys`/`vals`, see SYNTAX.md §3.
 - **Tail-call handling / stack safety** for deep recursion in the tree-walking
   evaluator (or a bytecode VM).
 - **More transpiler targets**: Go, Rust; and a *reverse* path (Python/JS → AINL).
 - **Editor tooling**: syntax highlighting + an LSP built on the AST + source spans.
 - **JS int/float fidelity note**: JS has one number type, so AINL float division
   that yields a whole number prints without `.0` (documented limitation).
+- **Numeric model unification**: integer overflow behavior diverges across all
+  four runtimes today — see [NUMERIC_MODEL.md](NUMERIC_MODEL.md). Closing this
+  means either an arbitrary-precision integer type in the (zero-dependency)
+  interpreter, or `BigInt`-based codegen for the JS target; currently the
+  divergence is documented and pinned by tests rather than fixed.
 
 ## Recently completed
 
 v0.1.0 shipped · M1 interpreter · M2 grammar export · M3 JSON AST + source maps ·
 M4 Python transpiler · §1.4 JavaScript + Ruby transpilers (3×3 byte-equal) · M5
 zero-dep release pipeline · dual license · token-density benchmark · **forked the
-Prompt Auditor to its own repo**.
+Prompt Auditor to its own repo** · a four-lens multi-agent review (design,
+LLM-generation ergonomics, Rust implementation, safety) followed by fixes for
+every finding: resource limits + panic fixes, cross-target equality bugs,
+`def`/scope semantics documented, numeric-overflow divergence documented and
+pinned, transpiler backends de-duplicated, an `Rc` cycle leak fixed, and a
+map/record type (`hash`/`get`/`assoc`/`has`/`keys`/`vals`) added across the
+interpreter and all three transpilers.

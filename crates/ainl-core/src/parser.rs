@@ -45,20 +45,31 @@ impl Node {
     }
 }
 
+/// Max `(` nesting depth. Parsing recurses per level of nesting; this bound
+/// keeps a maliciously/accidentally deep-nested source (e.g. thousands of
+/// unmatched `(`) from overflowing the native stack before eval even runs.
+const MAX_NEST_DEPTH: usize = 512;
+
 pub fn parse(toks: &[Tok]) -> Result<Vec<Node>> {
     let mut pos = 0;
     let mut forms = Vec::new();
     while pos < toks.len() {
-        forms.push(parse_form(toks, &mut pos)?);
+        forms.push(parse_form(toks, &mut pos, 0)?);
     }
     Ok(forms)
 }
 
-fn parse_form(toks: &[Tok], pos: &mut usize) -> Result<Node> {
+fn parse_form(toks: &[Tok], pos: &mut usize, depth: usize) -> Result<Node> {
     let tok = &toks[*pos];
     match tok {
         Tok::LParen(start) => {
             let start = *start;
+            if depth >= MAX_NEST_DEPTH {
+                return Err(Error::Parse {
+                    msg: format!("nesting too deep (max {MAX_NEST_DEPTH} levels)"),
+                    at: start,
+                });
+            }
             *pos += 1;
             let mut items = Vec::new();
             loop {
@@ -74,7 +85,7 @@ fn parse_form(toks: &[Tok], pos: &mut usize) -> Result<Node> {
                         *pos += 1;
                         return Ok(Node::List(items, Span::new(start, end)));
                     }
-                    Some(_) => items.push(parse_form(toks, pos)?),
+                    Some(_) => items.push(parse_form(toks, pos, depth + 1)?),
                 }
             }
         }

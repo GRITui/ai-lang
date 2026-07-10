@@ -42,3 +42,20 @@ fn variadic_uses_splat() {
 fn if_expression_is_ternary() {
     assert!(rb("(print (if (< n 2) n 0))").contains("((n < 2) ? n : 0)"));
 }
+
+#[test]
+fn hash_builtins_dispatch_to_runtime_helpers() {
+    let out = rb(r#"(get (assoc (hash "a" 1) "b" 2) "a")"#);
+    assert!(out.contains("_get(_assoc(_hash("), "got:\n{out}");
+    assert!(out.contains("def _hash("), "got:\n{out}");
+    assert!(out.contains("def _get("), "got:\n{out}");
+    assert!(out.contains("def _assoc("), "got:\n{out}");
+    assert!(out.contains("class AHash < Array"), "got:\n{out}");
+}
+
+#[test]
+fn hash_runtime_omitted_when_unused() {
+    let out = rb("(+ 1 2)");
+    assert!(!out.contains("AHash"), "got:\n{out}");
+    assert!(!out.contains("def _hash("), "got:\n{out}");
+}

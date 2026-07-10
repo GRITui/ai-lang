@@ -3,9 +3,79 @@
 use crate::error::{Error, Result};
 use crate::parser::Node;
 use crate::value::{Closure, Value};
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+// ---- resource limits --------------------------------------------------------
+//
+// The tree-walking evaluator recurses through native Rust call frames with no
+// inherent bound, and `while` has no iteration cap. Both are reachable from a
+// single AINL source form (deep recursion, deeply nested calls, `(while true
+// ...)`), and a Rust stack overflow is not a catchable `Result` — it aborts
+// the process outright. These two thread-local counters turn both failure
+// modes into a clean `Error::Runtime` instead.
+
+thread_local! {
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+    static STEPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Max live `eval` call frames (recursion + nested-expression depth combined).
+/// Kept well below where a native stack overflow could occur even on a
+/// constrained thread stack (e.g. `cargo test`'s worker threads default to a
+/// couple MiB, smaller than a typical main-thread stack).
+const MAX_DEPTH: usize = 512;
+/// Max total `eval` invocations per top-level `run_str`/`run_in` call — bounds
+/// unbounded loops (`while true`) and runaway iteration generally.
+const MAX_STEPS: u64 = 2_000_000;
+
+/// Reset the step budget for a fresh top-level run. Depth is guaranteed back
+/// at 0 between runs (the RAII guard below always decrements on the way out,
+/// success or error), so only steps need an explicit reset.
+pub(crate) fn reset_limits() {
+    STEPS.with(|s| s.set(0));
+}
+
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<DepthGuard> {
+        let exceeded = DEPTH.with(|d| {
+            let v = d.get() + 1;
+            d.set(v);
+            v > MAX_DEPTH
+        });
+        if exceeded {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            return Err(Error::runtime(format!(
+                "recursion limit exceeded (max depth {MAX_DEPTH})"
+            )));
+        }
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+fn tick() -> Result<()> {
+    let exceeded = STEPS.with(|s| {
+        let v = s.get() + 1;
+        s.set(v);
+        v > MAX_STEPS
+    });
+    if exceeded {
+        return Err(Error::runtime(format!(
+            "step limit exceeded (max {MAX_STEPS} evaluation steps) — likely an infinite loop or runaway recursion"
+        )));
+    }
+    Ok(())
+}
 
 /// A lexical scope with an optional parent. `Env` is a cheap `Rc` handle so
 /// closures can share and outlive the scope that created them.
@@ -17,8 +87,24 @@ struct Scope {
     parent: Option<Env>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of currently-live `Scope` allocations, for whiteboxing the
+    /// cycle-breaking fix below — see `tests::self_referential_closure_does_not_leak`.
+    static LIVE_SCOPES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for Scope {
+    fn drop(&mut self) {
+        LIVE_SCOPES.with(|c| c.set(c.get() - 1));
+    }
+}
+
 impl Env {
     pub fn new() -> Env {
+        #[cfg(test)]
+        LIVE_SCOPES.with(|c| c.set(c.get() + 1));
         Env(Rc::new(Scope {
             vars: RefCell::new(HashMap::new()),
             parent: None,
@@ -26,6 +112,8 @@ impl Env {
     }
 
     pub fn child(&self) -> Env {
+        #[cfg(test)]
+        LIVE_SCOPES.with(|c| c.set(c.get() + 1));
         Env(Rc::new(Scope {
             vars: RefCell::new(HashMap::new()),
             parent: Some(self.clone()),
@@ -49,6 +137,49 @@ impl Env {
         crate::eval::install_prelude(&env);
         env
     }
+
+    /// True if `self` is `other` or one of `other`'s ancestors — i.e.
+    /// something reachable through `other`'s parent chain still needs
+    /// `self`'s bindings.
+    fn is_ancestor_of(&self, other: &Env) -> bool {
+        let mut cur = other.clone();
+        loop {
+            if Rc::ptr_eq(&self.0, &cur.0) {
+                return true;
+            }
+            match cur.0.parent.clone() {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// Drop all bindings in this scope, breaking any `Rc` cycle rooted here.
+    ///
+    /// A closure that re-`def`s itself into its own call scope (the common
+    /// named-recursive-function pattern) makes that scope's `vars` map hold
+    /// a `Closure` whose `env` points right back at the scope — an `Rc`
+    /// cycle that never frees on its own. Called only once a call/`let`
+    /// scope's body has finished evaluating and nothing in its result still
+    /// needs it (see `apply` and `sf_let`), so this never removes bindings a
+    /// live closure could still look up.
+    fn clear(&self) {
+        self.0.vars.borrow_mut().clear();
+    }
+}
+
+/// True if some closure reachable from `val` (directly, or nested inside a
+/// list) was defined in `env` or in a scope that has `env` as an ancestor —
+/// i.e. `env`'s bindings are still needed by something the caller now holds.
+fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
+    match val {
+        Value::Closure(c) => env.is_ancestor_of(&c.env),
+        Value::List(items) => items.iter().any(|v| value_keeps_env_alive(v, env)),
+        Value::Map(pairs) => pairs
+            .iter()
+            .any(|(k, v)| value_keeps_env_alive(k, env) || value_keeps_env_alive(v, env)),
+        _ => false,
+    }
 }
 
 impl Default for Env {
@@ -58,6 +189,8 @@ impl Default for Env {
 }
 
 pub fn eval(node: &Node, env: &Env) -> Result<Value> {
+    let _guard = DepthGuard::enter()?;
+    tick()?;
     match node {
         Node::Int(i, _) => Ok(Value::Int(*i)),
         Node::Float(x, _) => Ok(Value::Float(*x)),
@@ -132,10 +265,26 @@ pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
                 call_env.define(rest.clone(), Value::List(Rc::new(extra)));
             }
             let mut last = Value::Nil;
+            let mut err = None;
             for form in &clos.body {
-                last = eval(form, &call_env)?;
+                match eval(form, &call_env) {
+                    Ok(v) => last = v,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
             }
-            Ok(last)
+            // Break a self-referential-def cycle rooted in this call's own
+            // scope, unless the result still needs it (a closure escaped
+            // that was defined in — or under — call_env).
+            if err.is_some() || !value_keeps_env_alive(&last, &call_env) {
+                call_env.clear();
+            }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(last),
+            }
         }
         other => Err(Error::runtime(format!(
             "cannot call a {}",
@@ -226,6 +375,22 @@ fn sf_let(args: &[Node], env: &Env) -> Result<Value> {
         return Err(Error::runtime("let bindings must be a list"));
     };
     let scope = env.child();
+    let result = sf_let_body(binds, body, &scope);
+    // Break a self-referential-def cycle rooted in this let's own scope
+    // (e.g. `(let () (def loop (fn () (loop))) ...)`), unless the result
+    // still needs it (a closure escaped that was defined in — or under —
+    // scope).
+    let last = match &result {
+        Ok(v) => v,
+        Err(_) => &Value::Nil,
+    };
+    if result.is_err() || !value_keeps_env_alive(last, &scope) {
+        scope.clear();
+    }
+    result
+}
+
+fn sf_let_body(binds: &[Node], body: &[Node], scope: &Env) -> Result<Value> {
     for b in binds {
         let Node::List(pair, _) = b else {
             return Err(Error::runtime("each let binding must be (name value)"));
@@ -233,12 +398,12 @@ fn sf_let(args: &[Node], env: &Env) -> Result<Value> {
         let [Node::Sym(name, _), val_node] = &pair[..] else {
             return Err(Error::runtime("each let binding must be (name value)"));
         };
-        let val = eval(val_node, &scope)?;
+        let val = eval(val_node, scope)?;
         scope.define(name.clone(), val);
     }
     let mut last = Value::Nil;
     for form in body {
-        last = eval(form, &scope)?;
+        last = eval(form, scope)?;
     }
     Ok(last)
 }
@@ -344,6 +509,14 @@ fn install_prelude(env: &Env) {
     b!("nth", builtin_nth);
     b!("cons", builtin_cons);
     b!("push", builtin_push);
+
+    b!("hash", builtin_hash);
+    b!("get", builtin_get);
+    b!("assoc", builtin_assoc);
+    b!("has", builtin_has);
+    b!("keys", builtin_keys);
+    b!("vals", builtin_vals);
+
     b!("error", |a| Err(Error::runtime(
         a.iter()
             .map(|v| v.to_string())
@@ -413,7 +586,14 @@ fn builtin_sub(args: &[Value]) -> Result<Value> {
     match args {
         [] => Err(Error::runtime("- expects at least 1 argument")),
         [one] => match one {
-            Value::Int(i) => Ok(Value::Int(-*i)),
+            // i64::MIN has no positive i64 counterpart; checked_neg catches
+            // that (rather than silently wrapping in release builds) and we
+            // promote to float, matching every other arithmetic op's overflow
+            // behavior.
+            Value::Int(i) => match i.checked_neg() {
+                Some(r) => Ok(Value::Int(r)),
+                None => Ok(Value::Float(-(*i as f64))),
+            },
             Value::Float(x) => Ok(Value::Float(-*x)),
             other => Err(Error::runtime(format!(
                 "- expected number, got {}",
@@ -480,6 +660,12 @@ fn builtin_mod(args: &[Value]) -> Result<Value> {
     if *b == 0 {
         return Err(Error::runtime("mod by zero"));
     }
+    // `i64::MIN.rem_euclid(-1)` panics: the *quotient* (i64::MAX + 1) doesn't
+    // fit in i64, even though the mathematical remainder of dividing by ±1 is
+    // always 0. Special-case it rather than letting the overflow through.
+    if *b == -1 {
+        return Ok(Value::Int(0));
+    }
     Ok(Value::Int(a.rem_euclid(*b)))
 }
 
@@ -501,11 +687,94 @@ fn builtin_len(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
         Value::List(l) => Ok(Value::Int(l.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+        Value::Map(m) => Ok(Value::Int(m.len() as i64)),
         other => Err(Error::runtime(format!(
-            "len expects list or str, got {}",
+            "len expects list, str, or hash, got {}",
             other.type_name()
         ))),
     }
+}
+
+/// `(hash k v k v ...)` — build a map from variadic key/value pairs. A
+/// repeated key keeps its *last* value and its *first* position, matching
+/// the everyday "later assignment wins" expectation.
+fn builtin_hash(args: &[Value]) -> Result<Value> {
+    if !args.len().is_multiple_of(2) {
+        return Err(Error::runtime(format!(
+            "hash expects an even number of key/value arguments, got {}",
+            args.len()
+        )));
+    }
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(args.len() / 2);
+    for kv in args.chunks_exact(2) {
+        let (k, v) = (kv[0].clone(), kv[1].clone());
+        match pairs.iter_mut().find(|(ek, _)| *ek == k) {
+            Some((_, ev)) => *ev = v,
+            None => pairs.push((k, v)),
+        }
+    }
+    Ok(Value::Map(Rc::new(pairs)))
+}
+
+fn as_map<'a>(v: &'a Value, who: &str) -> Result<&'a Rc<Vec<(Value, Value)>>> {
+    match v {
+        Value::Map(m) => Ok(m),
+        other => Err(Error::runtime(format!(
+            "{who} expects a hash, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(get h k)` — look up a key; `nil` if absent, matching `nth`'s
+/// out-of-range convention.
+fn builtin_get(args: &[Value]) -> Result<Value> {
+    let [h, k] = args else {
+        return Err(Error::runtime("get expects (get hash key)"));
+    };
+    let m = as_map(h, "get")?;
+    Ok(m.iter()
+        .find(|(ek, _)| ek == k)
+        .map(|(_, v)| v.clone())
+        .unwrap_or(Value::Nil))
+}
+
+/// `(assoc h k v)` — a *new* map with `k` bound to `v`, like `cons`/`push`
+/// leaving the original untouched. Updates in place (keeps position) if `k`
+/// already exists, else appends.
+fn builtin_assoc(args: &[Value]) -> Result<Value> {
+    let [h, k, v] = args else {
+        return Err(Error::runtime("assoc expects (assoc hash key value)"));
+    };
+    let m = as_map(h, "assoc")?;
+    let mut pairs = (**m).clone();
+    match pairs.iter_mut().find(|(ek, _)| ek == k) {
+        Some((_, ev)) => *ev = v.clone(),
+        None => pairs.push((k.clone(), v.clone())),
+    }
+    Ok(Value::Map(Rc::new(pairs)))
+}
+
+fn builtin_has(args: &[Value]) -> Result<Value> {
+    let [h, k] = args else {
+        return Err(Error::runtime("has expects (has hash key)"));
+    };
+    let m = as_map(h, "has")?;
+    Ok(Value::Bool(m.iter().any(|(ek, _)| ek == k)))
+}
+
+fn builtin_keys(args: &[Value]) -> Result<Value> {
+    let m = as_map(arg1(args)?, "keys")?;
+    Ok(Value::List(Rc::new(
+        m.iter().map(|(k, _)| k.clone()).collect(),
+    )))
+}
+
+fn builtin_vals(args: &[Value]) -> Result<Value> {
+    let m = as_map(arg1(args)?, "vals")?;
+    Ok(Value::List(Rc::new(
+        m.iter().map(|(_, v)| v.clone()).collect(),
+    )))
 }
 
 fn builtin_first(args: &[Value]) -> Result<Value> {
@@ -558,4 +827,51 @@ fn builtin_push(args: &[Value]) -> Result<Value> {
     let mut out: Vec<Value> = l.iter().cloned().collect();
     out.extend(tail.iter().cloned());
     Ok(Value::List(Rc::new(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_scopes() -> usize {
+        LIVE_SCOPES.with(|c| c.get())
+    }
+
+    #[test]
+    fn self_referential_closure_does_not_leak_its_call_scope() {
+        LIVE_SCOPES.with(|c| c.set(0));
+        let env = Env::with_prelude();
+        // `helper` re-defines itself into make_counter's own call scope —
+        // exactly the Rc-cycle-forming pattern. Called many times in a loop:
+        // without the cycle-breaking fix in `apply`, each call leaks its own
+        // call scope and never frees it.
+        let src = "\
+            (def make_counter (fn ()
+              (def helper (fn (x) (if (= x 0) 0 (helper (- x 1)))))
+              (helper 3)))
+            (def i 0)
+            (while (< i 500) (make_counter) (def i (+ i 1)))
+            ";
+        crate::run_in(src, &env).unwrap();
+        let live = live_scopes();
+        // Only long-lived scopes should remain (the global env + a couple
+        // still referenced by `env`/`make_counter`'s own defining scope) —
+        // nowhere near the 500+ this would be if every call scope leaked.
+        assert!(live < 20, "expected a bounded live-scope count, got {live}");
+    }
+
+    #[test]
+    fn escaping_closure_keeps_its_captured_scope_alive() {
+        LIVE_SCOPES.with(|c| c.set(0));
+        let env = Env::with_prelude();
+        let src = "\
+            (def make_adder (fn (n) (fn (x) (+ x n))))
+            (def add5 (make_adder 5))
+            ";
+        crate::run_in(src, &env).unwrap();
+        // `add5`'s captured scope (holding `n = 5`) must still be alive and
+        // correct — this is the correctness counterpart to the leak test
+        // above: the fix must not clear a scope a live closure still needs.
+        assert_eq!(crate::run_in("(add5 10)", &env).unwrap(), Value::Int(15));
+    }
 }

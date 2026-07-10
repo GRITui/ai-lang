@@ -14,6 +14,7 @@
 //! Only the runtime helpers actually used are emitted, keeping the output
 //! readable. A small source-map comment precedes each top-level definition.
 
+use crate::shared::{self, ExprEmit};
 use ainl_core::parser::Node;
 use ainl_core::serialize::LineIndex;
 use ainl_core::{Error, Result};
@@ -72,7 +73,19 @@ impl Py {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
-        if disp_used || self.needed.contains("_sym") {
+        // Key comparison for hash lookups needs structural equality.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_hash" | "_get" | "_assoc" | "_has"))
+        {
+            self.needed.insert("_eq");
+        }
+        // `_disp` branches on `isinstance(x, _Hash)`; `_hash`/`_assoc` construct one.
+        if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
+            self.needed.insert("_Hash");
+        }
+        if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
         let mut out = String::new();
@@ -220,7 +233,7 @@ impl Py {
         let Some((binds_node, body)) = args.split_first() else {
             return Err(Error::runtime("let expects (let ((n v)...) body...)"));
         };
-        for (name, val) in let_bindings(binds_node)? {
+        for (name, val) in shared::let_bindings(binds_node)? {
             let e = self.expr(val)?;
             self.line(&format!("{} = {e}", sanitize(name)));
         }
@@ -262,21 +275,6 @@ impl Py {
 
     // -- expression context --------------------------------------------------
 
-    fn expr(&mut self, node: &Node) -> Result<String> {
-        match node {
-            Node::Int(i, _) => Ok(i.to_string()),
-            Node::Float(x, _) => Ok(python_float(*x)),
-            Node::Str(s, _) => Ok(python_str(s)),
-            Node::Sym(name, _) => Ok(match name.as_str() {
-                "true" => "True".to_string(),
-                "false" => "False".to_string(),
-                "nil" => "None".to_string(),
-                other => sanitize(other),
-            }),
-            Node::List(items, _) => self.expr_list(items, node.span()),
-        }
-    }
-
     fn expr_list(&mut self, items: &[Node], span: ainl_core::Span) -> Result<String> {
         let Some(head) = items.first() else {
             return Ok("None".to_string()); // empty list evaluates to nil
@@ -284,19 +282,19 @@ impl Py {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return self.infix(args, "+", Some("0")),
-                "*" => return self.infix(args, "*", Some("1")),
-                "-" => return self.infix_sub(args),
+                "+" => return shared::infix(self, args, "+", "0"),
+                "*" => return shared::infix(self, args, "*", "1"),
+                "-" => return shared::infix_sub(self, args),
                 "/" => return self.infix_div(args),
-                "=" => return self.chain(args, "=="),
+                "=" => return self.eq_chain(args),
                 "<" => return self.chain(args, "<"),
                 ">" => return self.chain(args, ">"),
                 "<=" => return self.chain(args, "<="),
                 ">=" => return self.chain(args, ">="),
                 "and" => return self.chain_logic(args, "and"),
                 "or" => return self.chain_logic(args, "or"),
-                "not" => return self.unary(args, "not "),
-                "mod" => return self.binary(args, "%"),
+                "not" => return shared::unary(self, args, "not "),
+                "mod" => return shared::binary(self, args, "%"),
                 "if" => return self.expr_if(args),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
@@ -323,6 +321,12 @@ impl Py {
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
                 "cons" => return self.call_builtin("_cons", args, Some("_cons")),
                 "push" => return self.call_builtin("_push", args, Some("_push")),
+                "hash" => return self.call_builtin("_hash", args, Some("_hash")),
+                "get" => return self.call_builtin("_get", args, Some("_get")),
+                "assoc" => return self.call_builtin("_assoc", args, Some("_assoc")),
+                "has" => return self.call_builtin("_has", args, Some("_has")),
+                "keys" => return self.call_builtin("_keys", args, Some("_keys")),
+                "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
                 _ => {}
             }
@@ -331,10 +335,6 @@ impl Py {
         let callee = self.expr(head)?;
         let parts = self.expr_all(args)?;
         Ok(format!("{callee}({})", parts.join(", ")))
-    }
-
-    fn expr_all(&mut self, nodes: &[Node]) -> Result<Vec<String>> {
-        nodes.iter().map(|n| self.expr(n)).collect()
     }
 
     fn call_builtin(
@@ -349,24 +349,6 @@ impl Py {
         Ok(format!("{py_name}({})", self.expr_all(args)?.join(", ")))
     }
 
-    fn infix(&mut self, args: &[Node], op: &str, identity: Option<&str>) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Ok(identity.unwrap_or("None").to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
-        }
-    }
-
-    fn infix_sub(&mut self, args: &[Node]) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("- expects at least 1 argument")),
-            1 => Ok(format!("(-{})", parts[0])),
-            _ => Ok(format!("({})", parts.join(" - "))),
-        }
-    }
-
     fn infix_div(&mut self, args: &[Node]) -> Result<String> {
         let parts = self.expr_all(args)?;
         match parts.len() {
@@ -376,18 +358,22 @@ impl Py {
         }
     }
 
-    fn binary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a, b] = args else {
-            return Err(Error::runtime(format!("'{op}' expects 2 arguments")));
-        };
-        Ok(format!("({} {op} {})", self.expr(a)?, self.expr(b)?))
-    }
-
-    fn unary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a] = args else {
-            return Err(Error::runtime("expects 1 argument"));
-        };
-        Ok(format!("({op}{})", self.expr(a)?))
+    /// `=` needs the `_eq` runtime helper rather than native `==`: `_Sym` is
+    /// implemented as a `str` subclass (so quoted-symbol values print bare),
+    /// which makes bare `==` say `_Sym("a") == "a"` — wrongly conflating a
+    /// quoted symbol with an equal-content string. `_eq` also recurses into
+    /// lists so a symbol nested inside one gets the same treatment.
+    fn eq_chain(&mut self, args: &[Node]) -> Result<String> {
+        if args.len() < 2 {
+            return Ok("True".to_string());
+        }
+        self.need("_eq");
+        let parts = self.expr_all(args)?;
+        let clauses: Vec<String> = parts
+            .windows(2)
+            .map(|w| format!("_eq({}, {})", w[0], w[1]))
+            .collect();
+        Ok(format!("({})", clauses.join(" and ")))
     }
 
     /// Chained comparison — Python supports `a < b < c` natively, matching AINL.
@@ -432,7 +418,7 @@ impl Py {
         if body.len() != 1 {
             return Err(self.no_expr("multi-statement let", span));
         }
-        let binds = let_bindings(binds_node)?;
+        let binds = shared::let_bindings(binds_node)?;
         let mut names = Vec::new();
         let mut vals = Vec::new();
         for (n, v) in binds {
@@ -502,46 +488,27 @@ impl Py {
     }
 }
 
+impl ExprEmit for Py {
+    fn expr(&mut self, node: &Node) -> Result<String> {
+        match node {
+            Node::Int(i, _) => Ok(i.to_string()),
+            Node::Float(x, _) => Ok(python_float(*x)),
+            Node::Str(s, _) => Ok(python_str(s)),
+            Node::Sym(name, _) => Ok(match name.as_str() {
+                "true" => "True".to_string(),
+                "false" => "False".to_string(),
+                "nil" => "None".to_string(),
+                other => sanitize(other),
+            }),
+            Node::List(items, _) => self.expr_list(items, node.span()),
+        }
+    }
+}
+
 // ---- shared helpers --------------------------------------------------------
 
 fn python_params(params_node: &Node) -> Result<String> {
-    let Node::List(param_nodes, _) = params_node else {
-        return Err(Error::runtime("fn params must be a list"));
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < param_nodes.len() {
-        let Node::Sym(p, _) = &param_nodes[i] else {
-            return Err(Error::runtime("fn params must be symbols"));
-        };
-        if p == "&" {
-            let Some(Node::Sym(rest, _)) = param_nodes.get(i + 1) else {
-                return Err(Error::runtime("'&' must be followed by a rest parameter"));
-            };
-            out.push(format!("*{}", sanitize(rest)));
-            break;
-        }
-        out.push(sanitize(p));
-        i += 1;
-    }
-    Ok(out.join(", "))
-}
-
-fn let_bindings(binds_node: &Node) -> Result<Vec<(&str, &Node)>> {
-    let Node::List(binds, _) = binds_node else {
-        return Err(Error::runtime("let bindings must be a list"));
-    };
-    let mut out = Vec::new();
-    for b in binds {
-        let Node::List(pair, _) = b else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        let [Node::Sym(name, _), val] = &pair[..] else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        out.push((name.as_str(), val));
-    }
-    Ok(out)
+    Ok(shared::parse_params(params_node, "*", sanitize)?.join(", "))
 }
 
 /// Turn an AINL symbol into a valid Python identifier.
@@ -636,13 +603,21 @@ fn python_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym(str):\n    pass"),
     ("_sym", "def _sym(s):\n    return _Sym(s)"),
+    // A map is a list of [k, v] pairs; this subclass exists only so `_disp`
+    // can tell a hash apart from a plain list at print time (a print call
+    // can't otherwise know a variable's AINL-level type).
+    ("_Hash", "class _Hash(list):\n    pass"),
     (
         "_disp",
-        "def _disp(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    if x is True: return 'true'\n    if x is False: return 'false'\n    if x is None: return 'nil'\n    if isinstance(x, list): return '(' + ' '.join(_repr(e) for e in x) + ')'\n    if isinstance(x, float): return ('%.1f' % x) if x.is_integer() else repr(x)\n    return str(x)",
+        "def _disp(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    if x is True: return 'true'\n    if x is False: return 'false'\n    if x is None: return 'nil'\n    if isinstance(x, _Hash): return '{' + ' '.join(_repr(p[0]) + ' ' + _repr(p[1]) for p in x) + '}'\n    if isinstance(x, list): return '(' + ' '.join(_repr(e) for e in x) + ')'\n    if isinstance(x, float): return ('%.1f' % x) if x.is_integer() else repr(x)\n    return str(x)",
     ),
     (
         "_repr",
         "def _repr(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    return '\"' + x + '\"' if isinstance(x, str) else _disp(x)",
+    ),
+    (
+        "_eq",
+        "def _eq(a, b):\n    if isinstance(a, list) and isinstance(b, list):\n        return len(a) == len(b) and all(_eq(x, y) for x, y in zip(a, b))\n    if isinstance(a, _Sym) != isinstance(b, _Sym):\n        return False\n    if isinstance(a, bool) != isinstance(b, bool):\n        return False\n    return a == b",
     ),
     ("_print", "def _print(*xs):\n    print(' '.join(_disp(x) for x in xs))"),
     ("_str", "def _str(*xs):\n    return ''.join(_disp(x) for x in xs)"),
@@ -651,5 +626,20 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_nth", "def _nth(x, i):\n    return x[i] if 0 <= i < len(x) else None"),
     ("_cons", "def _cons(h, t):\n    return [h] + list(t)"),
     ("_push", "def _push(t, *xs):\n    return list(t) + list(xs)"),
+    (
+        "_hash",
+        "def _hash(*kvs):\n    out = _Hash()\n    for i in range(0, len(kvs), 2):\n        k, v = kvs[i], kvs[i + 1]\n        for pair in out:\n            if _eq(pair[0], k):\n                pair[1] = v\n                break\n        else:\n            out.append([k, v])\n    return out",
+    ),
+    (
+        "_get",
+        "def _get(h, k):\n    for pair in h:\n        if _eq(pair[0], k): return pair[1]\n    return None",
+    ),
+    (
+        "_assoc",
+        "def _assoc(h, k, v):\n    out = _Hash(list(p) for p in h)\n    for pair in out:\n        if _eq(pair[0], k):\n            pair[1] = v\n            return out\n    out.append([k, v])\n    return out",
+    ),
+    ("_has", "def _has(h, k):\n    return any(_eq(pair[0], k) for pair in h)"),
+    ("_keys", "def _keys(h):\n    return [pair[0] for pair in h]"),
+    ("_vals", "def _vals(h):\n    return [pair[1] for pair in h]"),
     ("_error", "def _error(*xs):\n    raise RuntimeError(' '.join(_disp(x) for x in xs))"),
 ];

@@ -35,7 +35,7 @@ comment   ::= ";" ... end-of-line          ; ignored
 
 | Form | Shape | Meaning |
 |------|-------|---------|
-| `def` | `(def name value)` | Bind `name` in the current scope; returns the name. Re-`def` overwrites (this is how you mutate). |
+| `def` | `(def name value)` | Bind `name` in the current scope; returns the name. Re-`def` in the *same* scope overwrites (this is how you mutate) — see §2a for exactly which forms share a scope vs. open a new one. |
 | `fn` | `(fn (p1 p2 ... [& rest]) body...)` | Anonymous function (closure). `& rest` collects extra args into a list. Returns the last body form. |
 | `if` | `(if cond then [else])` | Evaluate `then` or `else` by truthiness. No `else` → `nil`. |
 | `do` | `(do form...)` | Evaluate forms in order; return the last. |
@@ -44,6 +44,54 @@ comment   ::= ";" ... end-of-line          ; ignored
 | `quote` | `(quote form)` | Return `form` as data (symbols/lists) without evaluating. |
 | `and` | `(and a b ...)` | Short-circuit; returns first falsey or the last value. |
 | `or` | `(or a b ...)` | Short-circuit; returns first truthy or `false`. |
+
+## 2a. Scoping: which forms open a new environment
+
+`def` always writes into the **nearest enclosing scope** — but "nearest
+enclosing scope" means the nearest enclosing form that actually opens one, not
+just the nearest enclosing form of any kind. Only two forms open a new scope;
+every other form evaluates its sub-forms directly in the scope it was itself
+evaluated in:
+
+| Form | Opens a new scope? |
+|------|---|
+| `fn` (a fresh one per call) | **Yes** |
+| `let` | **Yes** |
+| `if`, `do`, `while`, `and`, `or` | No — they share the caller's scope |
+
+The consequence: `def` inside `if`/`do`/`while`/`and`/`or` **mutates** whatever
+scope contains *them* (typically an enclosing `let` or `fn` body, or the
+top-level scope). `def` inside `fn` or `let` only ever writes into that fresh
+scope, which is discarded when the call/`let` returns — it can never reach out
+and mutate an outer scope. This is also why re-`def`ing a name only shadows
+(rather than mutating) once you cross a `let`/`fn` boundary: `def` never
+searches parent scopes, it always writes into the scope it's evaluated in.
+
+```lisp
+; MUTATES — `while` doesn't open a scope, so `def i` writes into the
+; enclosing `let`'s own scope; each iteration overwrites the same binding.
+(let ((i 0))
+  (while (< i 5) (def i (+ i 1)))
+  i)                                       ; => 5
+
+; SHADOWS, does not mutate — the inner `let` opens its own scope, so
+; `def i` there creates a new local `i` that disappears when the inner
+; `let` returns; the outer `i` is untouched.
+(let ((i 0))
+  (let () (def i 99))
+  i)                                       ; => 0 (not 99)
+
+; SHADOWS, does not mutate — `fn` opens a fresh scope per call, so `def`
+; inside a closure body can never write back to the defining scope.
+(def counter 0)
+(def bump (fn () (def counter (+ counter 1)) counter))
+(bump)                                     ; => 1
+(bump)                                     ; => 1  (not 2 — outer `counter` never changed)
+counter                                    ; => 0
+
+; MUTATES — `if` doesn't open a scope either.
+(let ((x 1)) (if true (def x 2) nil) x)    ; => 2
+```
 
 ## 3. Builtin functions (ordinary calls, args evaluated left-to-right)
 
@@ -54,7 +102,9 @@ comment   ::= ";" ... end-of-line          ; ignored
 
 **Strings / IO**: `(print v...)` space-joins and prints a line, returns `nil`. `(str v...)` concatenates to one string.
 
-**Lists**: `(list v...)` build. `(len list|str)`. `(first list)`. `(rest list)`. `(nth list i)` (0-based, out-of-range → `nil`). `(cons v list)` prepend. `(push list v...)` append.
+**Lists**: `(list v...)` build. `(len list|str|hash)`. `(first list)`. `(rest list)`. `(nth list i)` (0-based, out-of-range → `nil`). `(cons v list)` prepend. `(push list v...)` append.
+
+**Maps**: `(hash k v k v ...)` build from key/value pairs — a repeated key keeps its *last* value at its *first* position. `(get h k)` look up, `nil` if absent. `(assoc h k v)` a *new* map with `k` bound to `v` (like `cons`/`push`, the original is untouched). `(has h k)` bool. `(keys h)` / `(vals h)` lists in insertion order. Any value can be a key — key comparison is the same `=` used everywhere else, so a quoted symbol and an equal-content string are different keys, same as they're different values. **Equality is insertion-order-sensitive**, exactly like `List` — `(= (hash "a" 1 "b" 2) (hash "b" 2 "a" 1))` is `false`. This is a deliberate simplification (not "real" set-of-pairs equality) that keeps a map's behavior — construction, lookup, equality — identical across the interpreter and all three transpiler targets, the same way it already is for lists.
 
 **Control**: `(error msg...)` abort with a runtime error.
 
@@ -82,6 +132,14 @@ comment   ::= ";" ... end-of-line          ; ignored
   (if (= (len xs) 0) (list)
     (cons (f (first xs)) (map f (rest xs))))))
 (map (fn (x) (* x 2)) (list 1 2 3))      ; => (2 4 6)
+
+; maps: build, look up, and non-mutating update
+(def user (hash "name" "Ada" "age" 36))
+(get user "name")                        ; => "Ada"
+(get user "email")                       ; => nil
+(def user2 (assoc user "age" 37))
+(get user "age")                         ; => 36  (unchanged)
+(get user2 "age")                        ; => 37
 ```
 
 ## 5. Rules for generating AINL correctly
@@ -90,7 +148,9 @@ comment   ::= ";" ... end-of-line          ; ignored
 2. Prefix notation only: `(+ 1 2)`, never `1 + 2`.
 3. `if`/`fn`/`let`/`def` are special forms — do not quote their keyword or add commas.
 4. No commas, no semicolons-as-terminators (`;` is a comment), no significant indentation.
-5. To "reassign", `def` the same name again in the same scope.
+5. To "reassign", `def` the same name again in the same scope — but `fn` and
+   `let` open a *new* scope (§2a), so `def` inside one of those never mutates
+   an outer binding, even one of the same name; it always shadows instead.
 6. Prefer the shortest correct form — density is the point.
 
 ## 6. Constrained decoding

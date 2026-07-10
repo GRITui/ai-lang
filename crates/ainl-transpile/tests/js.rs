@@ -15,7 +15,23 @@ fn function_becomes_declaration() {
 fn chained_comparison_expands_to_and() {
     // JS has no chained comparison — must expand.
     assert!(js("(< 1 2 3)").contains("(1 < 2 && 2 < 3)"));
-    assert!(js("(= 2 2)").contains("(2 === 2)"));
+    assert!(js("(= 2 2)").contains("(_eq(2, 2))"));
+}
+
+#[test]
+fn equality_uses_structural_eq_not_reference_identity() {
+    // `===` on JS arrays is reference identity, diverging from the
+    // interpreter's (and Python/Ruby's) structural list equality. `=` must
+    // go through the `_eq` runtime helper instead of a bare `===`.
+    let out = js("(= (list 1 2) (list 1 2))");
+    assert!(out.contains("_eq([1, 2], [1, 2])"), "got:\n{out}");
+    assert!(out.contains("function _eq("), "got:\n{out}");
+}
+
+#[test]
+fn eq_helper_omitted_when_equality_unused() {
+    let out = js("(+ 1 2)");
+    assert!(!out.contains("function _eq("), "got:\n{out}");
 }
 
 #[test]
@@ -50,4 +66,33 @@ fn while_and_let_braces() {
 fn only_used_runtime_is_emitted() {
     assert!(!js("(+ 1 2)").contains("function _print"));
     assert!(js("(print 1)").contains("function _print"));
+}
+
+#[test]
+fn hash_builtins_dispatch_to_runtime_helpers() {
+    let out = js(r#"(get (assoc (hash "a" 1) "b" 2) "a")"#);
+    assert!(out.contains("_get(_assoc(_hash("), "got:\n{out}");
+    assert!(out.contains("function _hash("), "got:\n{out}");
+    assert!(out.contains("function _get("), "got:\n{out}");
+    assert!(out.contains("function _assoc("), "got:\n{out}");
+    assert!(out.contains("class _Hash extends Array"), "got:\n{out}");
+}
+
+#[test]
+fn keys_and_vals_return_plain_arrays_not_hashes() {
+    // Regression: Array.prototype.map on a _Hash instance returns another
+    // _Hash (Symbol.species), which would make `_disp` wrongly render a
+    // plain key/value list as a "{...}" hash. _keys/_vals must use
+    // Array.from to force a plain array.
+    let out = js("(keys h)");
+    assert!(out.contains("Array.from(h, p => p[0])"), "got:\n{out}");
+    let out2 = js("(vals h)");
+    assert!(out2.contains("Array.from(h, p => p[1])"), "got:\n{out2}");
+}
+
+#[test]
+fn hash_runtime_omitted_when_unused() {
+    let out = js("(+ 1 2)");
+    assert!(!out.contains("_Hash"), "got:\n{out}");
+    assert!(!out.contains("function _hash("), "got:\n{out}");
 }

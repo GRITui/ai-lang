@@ -50,7 +50,9 @@ measured strengths are:
   can be *forced* to emit only valid programs (grammar-constrained decoding).
   This is about **reliability of generation**, not token count.
 - **Uniform, unambiguous structure** → one parse tree, easy to validate, easy to
-  map to/from other languages (verified byte-equal transpile to Python/JS/Ruby).
+  map to/from other languages (verified byte-equal transpile to Python/JS/Ruby
+  within `i64`/float-safe integer range — see [NUMERIC_MODEL.md](NUMERIC_MODEL.md)
+  for where that range ends and the targets diverge).
 - **Zero-dependency, portable runtime.**
 
 These are genuine advantages for the Phase 2 auditor use case. But they are a

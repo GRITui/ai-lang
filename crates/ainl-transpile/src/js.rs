@@ -10,6 +10,7 @@
 //!   division that yields a whole number prints without a trailing `.0`. The
 //!   sample programs avoid that case and verify byte-identical.
 
+use crate::shared::{self, ExprEmit};
 use ainl_core::parser::Node;
 use ainl_core::serialize::LineIndex;
 use ainl_core::{Error, Result};
@@ -61,7 +62,19 @@ impl Js {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
-        if disp_used || self.needed.contains("_sym") {
+        // Key comparison for hash lookups needs structural equality.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_hash" | "_get" | "_assoc" | "_has"))
+        {
+            self.needed.insert("_eq");
+        }
+        // `_disp` branches on `instanceof _Hash`; `_hash`/`_assoc` construct one.
+        if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
+            self.needed.insert("_Hash");
+        }
+        if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
         let mut out = String::new();
@@ -198,7 +211,7 @@ impl Js {
         let Some((binds_node, body)) = args.split_first() else {
             return Err(Error::runtime("let expects (let ((n v)...) body...)"));
         };
-        for (name, val) in let_bindings(binds_node)? {
+        for (name, val) in shared::let_bindings(binds_node)? {
             let e = self.expr(val)?;
             self.line(&format!("var {} = {e};", sanitize(name)));
         }
@@ -241,21 +254,6 @@ impl Js {
 
     // -- expressions ---------------------------------------------------------
 
-    fn expr(&mut self, node: &Node) -> Result<String> {
-        match node {
-            Node::Int(i, _) => Ok(i.to_string()),
-            Node::Float(x, _) => Ok(js_float(*x)),
-            Node::Str(s, _) => Ok(js_str(s)),
-            Node::Sym(name, _) => Ok(match name.as_str() {
-                "true" => "true".to_string(),
-                "false" => "false".to_string(),
-                "nil" => "null".to_string(),
-                other => sanitize(other),
-            }),
-            Node::List(items, _) => self.expr_list(items, node.span()),
-        }
-    }
-
     fn expr_list(&mut self, items: &[Node], span: ainl_core::Span) -> Result<String> {
         let Some(head) = items.first() else {
             return Ok("null".to_string());
@@ -263,19 +261,19 @@ impl Js {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return self.infix(args, "+", "0"),
-                "*" => return self.infix(args, "*", "1"),
-                "-" => return self.infix_sub(args),
+                "+" => return shared::infix(self, args, "+", "0"),
+                "*" => return shared::infix(self, args, "*", "1"),
+                "-" => return shared::infix_sub(self, args),
                 "/" => return self.infix_div(args),
-                "=" => return self.cmp(args, "==="),
-                "<" => return self.cmp(args, "<"),
-                ">" => return self.cmp(args, ">"),
-                "<=" => return self.cmp(args, "<="),
-                ">=" => return self.cmp(args, ">="),
-                "and" => return self.logic(args, "&&", "true"),
-                "or" => return self.logic(args, "||", "false"),
-                "not" => return self.unary(args, "!"),
-                "mod" => return self.binary(args, "%"),
+                "=" => return self.eq_chain(args),
+                "<" => return shared::cmp(self, args, "<"),
+                ">" => return shared::cmp(self, args, ">"),
+                "<=" => return shared::cmp(self, args, "<="),
+                ">=" => return shared::cmp(self, args, ">="),
+                "and" => return shared::infix(self, args, "&&", "true"),
+                "or" => return shared::infix(self, args, "||", "false"),
+                "not" => return shared::unary(self, args, "!"),
+                "mod" => return shared::binary(self, args, "%"),
                 "if" => return self.expr_if(args),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
@@ -300,6 +298,12 @@ impl Js {
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
                 "cons" => return self.call_builtin("_cons", args, Some("_cons")),
                 "push" => return self.call_builtin("_push", args, Some("_push")),
+                "hash" => return self.call_builtin("_hash", args, Some("_hash")),
+                "get" => return self.call_builtin("_get", args, Some("_get")),
+                "assoc" => return self.call_builtin("_assoc", args, Some("_assoc")),
+                "has" => return self.call_builtin("_has", args, Some("_has")),
+                "keys" => return self.call_builtin("_keys", args, Some("_keys")),
+                "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
                 _ => {}
             }
@@ -307,10 +311,6 @@ impl Js {
         let callee = self.expr(head)?;
         let parts = self.expr_all(args)?;
         Ok(format!("{callee}({})", parts.join(", ")))
-    }
-
-    fn expr_all(&mut self, nodes: &[Node]) -> Result<Vec<String>> {
-        nodes.iter().map(|n| self.expr(n)).collect()
     }
 
     fn call_builtin(
@@ -325,24 +325,6 @@ impl Js {
         Ok(format!("{name}({})", self.expr_all(args)?.join(", ")))
     }
 
-    fn infix(&mut self, args: &[Node], op: &str, identity: &str) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Ok(identity.to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
-        }
-    }
-
-    fn infix_sub(&mut self, args: &[Node]) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("- expects at least 1 argument")),
-            1 => Ok(format!("(-{})", parts[0])),
-            _ => Ok(format!("({})", parts.join(" - "))),
-        }
-    }
-
     fn infix_div(&mut self, args: &[Node]) -> Result<String> {
         let parts = self.expr_all(args)?;
         match parts.len() {
@@ -352,40 +334,21 @@ impl Js {
         }
     }
 
-    fn binary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a, b] = args else {
-            return Err(Error::runtime(format!("'{op}' expects 2 arguments")));
-        };
-        Ok(format!("({} {op} {})", self.expr(a)?, self.expr(b)?))
-    }
-
-    fn unary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a] = args else {
-            return Err(Error::runtime("expects 1 argument"));
-        };
-        Ok(format!("({op}{})", self.expr(a)?))
-    }
-
-    /// JS has no chained comparison, so expand `(< a b c)` to `(a < b && b < c)`.
-    fn cmp(&mut self, args: &[Node], op: &str) -> Result<String> {
+    /// `=` needs structural equality (AINL lists compare element-wise, and a
+    /// quoted symbol compares by name), unlike `===` which is JS reference
+    /// identity for arrays and `_Sym` instances. Expand chained `(= a b c)`
+    /// to `(_eq(a, b) && _eq(b, c))`, matching `shared::cmp`'s chaining shape.
+    fn eq_chain(&mut self, args: &[Node]) -> Result<String> {
         if args.len() < 2 {
             return Ok("true".to_string());
         }
+        self.need("_eq");
         let parts = self.expr_all(args)?;
         let clauses: Vec<String> = parts
             .windows(2)
-            .map(|w| format!("{} {op} {}", w[0], w[1]))
+            .map(|w| format!("_eq({}, {})", w[0], w[1]))
             .collect();
         Ok(format!("({})", clauses.join(" && ")))
-    }
-
-    fn logic(&mut self, args: &[Node], op: &str, identity: &str) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Ok(identity.to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
-        }
     }
 
     fn expr_if(&mut self, args: &[Node]) -> Result<String> {
@@ -412,7 +375,7 @@ impl Js {
         }
         let mut names = Vec::new();
         let mut vals = Vec::new();
-        for (n, v) in let_bindings(binds_node)? {
+        for (n, v) in shared::let_bindings(binds_node)? {
             names.push(sanitize(n));
             vals.push(self.expr(v)?);
         }
@@ -445,7 +408,26 @@ impl Js {
         let b = self.expr(&body[0])?;
         Ok(format!("(({params}) => {b})"))
     }
+}
 
+impl ExprEmit for Js {
+    fn expr(&mut self, node: &Node) -> Result<String> {
+        match node {
+            Node::Int(i, _) => Ok(i.to_string()),
+            Node::Float(x, _) => Ok(js_float(*x)),
+            Node::Str(s, _) => Ok(js_str(s)),
+            Node::Sym(name, _) => Ok(match name.as_str() {
+                "true" => "true".to_string(),
+                "false" => "false".to_string(),
+                "nil" => "null".to_string(),
+                other => sanitize(other),
+            }),
+            Node::List(items, _) => self.expr_list(items, node.span()),
+        }
+    }
+}
+
+impl Js {
     fn expr_quote(&mut self, args: &[Node]) -> Result<String> {
         let [node] = args else {
             return Err(Error::runtime("quote expects one form"));
@@ -478,43 +460,7 @@ impl Js {
 }
 
 fn js_params(params_node: &Node) -> Result<String> {
-    let Node::List(param_nodes, _) = params_node else {
-        return Err(Error::runtime("fn params must be a list"));
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < param_nodes.len() {
-        let Node::Sym(p, _) = &param_nodes[i] else {
-            return Err(Error::runtime("fn params must be symbols"));
-        };
-        if p == "&" {
-            let Some(Node::Sym(rest, _)) = param_nodes.get(i + 1) else {
-                return Err(Error::runtime("'&' must be followed by a rest parameter"));
-            };
-            out.push(format!("...{}", sanitize(rest)));
-            break;
-        }
-        out.push(sanitize(p));
-        i += 1;
-    }
-    Ok(out.join(", "))
-}
-
-fn let_bindings(binds_node: &Node) -> Result<Vec<(&str, &Node)>> {
-    let Node::List(binds, _) = binds_node else {
-        return Err(Error::runtime("let bindings must be a list"));
-    };
-    let mut out = Vec::new();
-    for b in binds {
-        let Node::List(pair, _) = b else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        let [Node::Sym(name, _), val] = &pair[..] else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        out.push((name.as_str(), val));
-    }
-    Ok(out)
+    Ok(shared::parse_params(params_node, "...", sanitize)?.join(", "))
 }
 
 fn sanitize(name: &str) -> String {
@@ -611,13 +557,21 @@ fn js_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym { constructor(name) { this.name = name; } }"),
     ("_sym", "function _sym(s) { return new _Sym(s); }"),
+    // A map is an array of [k, v] pairs; this subclass exists only so
+    // `_disp` can tell a hash apart from a plain list at print time (a
+    // print call can't otherwise know a variable's AINL-level type).
+    ("_Hash", "class _Hash extends Array {}"),
     (
         "_disp",
-        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
+        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (x instanceof _Hash) return \"{\" + x.map(p => _repr(p[0]) + \" \" + _repr(p[1])).join(\" \") + \"}\";\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
     ),
     (
         "_repr",
         "function _repr(x) {\n  return typeof x === \"string\" ? '\"' + x + '\"' : _disp(x);\n}",
+    ),
+    (
+        "_eq",
+        "function _eq(a, b) {\n  if (Array.isArray(a) && Array.isArray(b)) {\n    if (a.length !== b.length) return false;\n    for (let i = 0; i < a.length; i++) { if (!_eq(a[i], b[i])) return false; }\n    return true;\n  }\n  if (a instanceof _Sym && b instanceof _Sym) return a.name === b.name;\n  return a === b;\n}",
     ),
     ("_print", "function _print(...xs) { console.log(xs.map(_disp).join(\" \")); }"),
     ("_str", "function _str(...xs) { return xs.map(_disp).join(\"\"); }"),
@@ -627,5 +581,25 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_nth", "function _nth(x, i) { return (0 <= i && i < x.length) ? x[i] : null; }"),
     ("_cons", "function _cons(h, t) { return [h].concat(t); }"),
     ("_push", "function _push(t, ...xs) { return t.concat(xs); }"),
+    (
+        "_hash",
+        "function _hash(...kvs) {\n  const out = new _Hash();\n  for (let i = 0; i < kvs.length; i += 2) {\n    const k = kvs[i], v = kvs[i + 1];\n    const pair = out.find(p => _eq(p[0], k));\n    if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  }\n  return out;\n}",
+    ),
+    (
+        "_get",
+        "function _get(h, k) {\n  const pair = h.find(p => _eq(p[0], k));\n  return pair ? pair[1] : null;\n}",
+    ),
+    (
+        "_assoc",
+        "function _assoc(h, k, v) {\n  const out = _Hash.from(h, p => p.slice());\n  const pair = out.find(p => _eq(p[0], k));\n  if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  return out;\n}",
+    ),
+    (
+        "_has",
+        "function _has(h, k) { return h.some(p => _eq(p[0], k)); }",
+    ),
+    // `Array.from` (not `h.map`, which inherits _Hash via Symbol.species) —
+    // keys/vals return plain lists, not hashes.
+    ("_keys", "function _keys(h) { return Array.from(h, p => p[0]); }"),
+    ("_vals", "function _vals(h) { return Array.from(h, p => p[1]); }"),
     ("_error", "function _error(...xs) { throw new Error(xs.map(_disp).join(\" \")); }"),
 ];

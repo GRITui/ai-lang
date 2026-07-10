@@ -59,3 +59,36 @@ fn while_in_expression_position_errors() {
     // `while` has no Python expression form; using it as a value must error.
     assert!(transpile_python_src("(+ 1 (while true 1))").is_err());
 }
+
+#[test]
+fn equality_uses_eq_helper_not_bare_python_equals() {
+    // Bare `==` is wrong for `=`: `_Sym` is a `str` subclass (so
+    // `_sym("a") == "a"` is wrongly `True`) and Python `bool` is an `int`
+    // subclass (so `True == 1` is wrongly `True`). `_eq` must be used instead.
+    let out = py("(= (quote a) 1)");
+    assert!(out.contains("_eq(_sym(\"a\"), 1)"), "got:\n{out}");
+    assert!(out.contains("def _eq("), "got:\n{out}");
+}
+
+#[test]
+fn eq_helper_omitted_when_equality_unused() {
+    let out = py("(+ 1 2)");
+    assert!(!out.contains("def _eq("), "got:\n{out}");
+}
+
+#[test]
+fn hash_builtins_dispatch_to_runtime_helpers() {
+    let out = py(r#"(get (assoc (hash "a" 1) "b" 2) "a")"#);
+    assert!(out.contains("_get(_assoc(_hash("), "got:\n{out}");
+    assert!(out.contains("def _hash("), "got:\n{out}");
+    assert!(out.contains("def _get("), "got:\n{out}");
+    assert!(out.contains("def _assoc("), "got:\n{out}");
+    assert!(out.contains("class _Hash(list)"), "got:\n{out}");
+}
+
+#[test]
+fn hash_runtime_omitted_when_unused() {
+    let out = py("(+ 1 2)");
+    assert!(!out.contains("_Hash"), "got:\n{out}");
+    assert!(!out.contains("def _hash("), "got:\n{out}");
+}

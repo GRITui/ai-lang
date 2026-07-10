@@ -51,9 +51,101 @@ fn variadic_and_lists() {
 }
 
 #[test]
+fn hash_basics() {
+    assert_eq!(eval(r#"(get (hash "a" 1 "b" 2) "a")"#), Value::Int(1));
+    assert_eq!(eval(r#"(get (hash "a" 1) "missing")"#), Value::Nil);
+    assert_eq!(eval(r#"(has (hash "a" 1) "a")"#), Value::Bool(true));
+    assert_eq!(eval(r#"(has (hash "a" 1) "z")"#), Value::Bool(false));
+    assert_eq!(eval(r#"(len (hash "a" 1 "b" 2))"#), Value::Int(2));
+}
+
+#[test]
+fn hash_assoc_does_not_mutate_the_original() {
+    let src = r#"
+        (def h (hash "a" 1))
+        (def h2 (assoc h "a" 99))
+        (list (get h "a") (get h2 "a"))
+    "#;
+    assert_eq!(
+        eval(src),
+        Value::List(std::rc::Rc::new(vec![Value::Int(1), Value::Int(99)]))
+    );
+}
+
+#[test]
+fn hash_construction_lets_a_repeated_key_keep_its_last_value() {
+    // Last value wins, but only one entry — not two.
+    assert_eq!(eval(r#"(len (hash "a" 1 "a" 2))"#), Value::Int(1));
+    assert_eq!(eval(r#"(get (hash "a" 1 "a" 2) "a")"#), Value::Int(2));
+}
+
+#[test]
+fn hash_keys_and_vals_preserve_insertion_order() {
+    let src = r#"(keys (hash "a" 1 "b" 2 "c" 3))"#;
+    assert_eq!(
+        eval(src),
+        Value::List(std::rc::Rc::new(vec![
+            Value::str("a"),
+            Value::str("b"),
+            Value::str("c"),
+        ]))
+    );
+}
+
+#[test]
+fn hash_equality_is_order_sensitive_like_list() {
+    // A deliberate simplification (docs/SYNTAX.md §3 "Maps") that keeps
+    // equality identical to List's across all four runtimes.
+    assert_eq!(
+        eval(r#"(= (hash "a" 1 "b" 2) (hash "a" 1 "b" 2))"#),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(r#"(= (hash "a" 1 "b" 2) (hash "b" 2 "a" 1))"#),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn hash_key_equality_distinguishes_symbol_from_string() {
+    // A quoted symbol and an equal-content string are different keys, same
+    // as they're different values everywhere else in the language — this
+    // works "for free" because `get`/`has` reuse Value's own PartialEq.
+    assert_eq!(
+        eval(r#"(= (hash (quote a) 1) (hash "a" 1))"#),
+        Value::Bool(false)
+    );
+    assert_eq!(eval(r#"(get (hash (quote a) 1) "a")"#), Value::Nil);
+}
+
+#[test]
 fn while_loop_mutation() {
     let src = "(let ((i 0)) (while (< i 5) (def i (+ i 1))) i)";
     assert_eq!(eval(src), Value::Int(5));
+}
+
+// Scoping (docs/SYNTAX.md §2a): `let` and `fn` each open a fresh scope; `def`
+// inside them can only shadow, never mutate an outer binding. `if`/`do`/
+// `while`/`and`/`or` share the caller's scope, so `def` inside them mutates.
+
+#[test]
+fn nested_let_shadows_rather_than_mutates() {
+    let src = "(let ((i 0)) (let () (def i 99)) i)";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn fn_body_shadows_rather_than_mutates_the_defining_scope() {
+    let src = "(def counter 0) \
+               (def bump (fn () (def counter (+ counter 1)) counter)) \
+               (bump) (bump) counter";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn if_does_not_open_a_new_scope_so_def_mutates() {
+    let src = "(let ((x 1)) (if true (def x 2) nil) x)";
+    assert_eq!(eval(src), Value::Int(2));
 }
 
 #[test]
@@ -67,6 +159,60 @@ fn errors_surface() {
     assert!(run_str("(+ 1 nope)").is_err()); // unbound symbol
     assert!(run_str("(/ 1 0)").is_err()); // division by zero
     assert!(run_str("(1 2 3)").is_err()); // calling a non-fn
+}
+
+#[test]
+fn unbounded_recursion_errors_cleanly_instead_of_overflowing_the_stack() {
+    // No base case: this must hit the depth guard and return `Err`, not
+    // crash the process with a native stack overflow.
+    let src = "(def loop (fn (n) (+ 1 (loop n)))) (loop 0)";
+    let err = run_str(src).unwrap_err().to_string();
+    assert!(err.contains("recursion limit"), "got: {err}");
+}
+
+#[test]
+fn infinite_loop_errors_cleanly_instead_of_hanging() {
+    let err = run_str("(while true 0)").unwrap_err().to_string();
+    assert!(err.contains("step limit"), "got: {err}");
+}
+
+#[test]
+fn each_run_in_call_gets_a_fresh_step_budget() {
+    // A prior run that burns its whole step budget must not starve the next
+    // call sharing the same `Env` (as the REPL does line-by-line).
+    let env = ainl_core::Env::with_prelude();
+    assert!(ainl_core::run_in("(while true 0)", &env).is_err());
+    assert_eq!(ainl_core::run_in("(+ 1 2)", &env).unwrap(), Value::Int(3));
+}
+
+#[test]
+fn mod_min_by_neg_one_does_not_panic() {
+    // i64::MIN.rem_euclid(-1) panics in std (the quotient overflows even
+    // though the true remainder is 0); AINL's `mod` must not crash.
+    assert_eq!(eval("(mod -9223372036854775808 -1)"), Value::Int(0));
+}
+
+#[test]
+fn overflow_promotes_to_float_matching_documented_numeric_model() {
+    // Pins the interpreter's half of the divergence documented in
+    // docs/NUMERIC_MODEL.md: i64 overflow promotes to f64 here, while the
+    // Python/Ruby targets have arbitrary-precision integers and never
+    // overflow, and the JS target is f64 throughout with no promotion step.
+    // A change to this value should come with an update to that doc.
+    assert_eq!(
+        eval("(* 9223372036854775807 2)"),
+        Value::Float(18446744073709551616.0)
+    );
+}
+
+#[test]
+fn unary_negate_promotes_to_float_on_i64_min_overflow() {
+    // -i64::MIN has no i64 representation; must promote to float like every
+    // other arithmetic op's overflow path, not silently wrap or panic.
+    assert_eq!(
+        eval("(- -9223372036854775808)"),
+        Value::Float(9223372036854775808.0)
+    );
 }
 
 #[test]
