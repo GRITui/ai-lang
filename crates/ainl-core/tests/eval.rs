@@ -56,6 +56,30 @@ fn while_loop_mutation() {
     assert_eq!(eval(src), Value::Int(5));
 }
 
+// Scoping (docs/SYNTAX.md §2a): `let` and `fn` each open a fresh scope; `def`
+// inside them can only shadow, never mutate an outer binding. `if`/`do`/
+// `while`/`and`/`or` share the caller's scope, so `def` inside them mutates.
+
+#[test]
+fn nested_let_shadows_rather_than_mutates() {
+    let src = "(let ((i 0)) (let () (def i 99)) i)";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn fn_body_shadows_rather_than_mutates_the_defining_scope() {
+    let src = "(def counter 0) \
+               (def bump (fn () (def counter (+ counter 1)) counter)) \
+               (bump) (bump) counter";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn if_does_not_open_a_new_scope_so_def_mutates() {
+    let src = "(let ((x 1)) (if true (def x 2) nil) x)";
+    assert_eq!(eval(src), Value::Int(2));
+}
+
 #[test]
 fn quote_makes_data() {
     // a quoted list of symbols is data, not a function call
