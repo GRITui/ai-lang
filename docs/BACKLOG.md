@@ -42,6 +42,11 @@ later, **Blockers** = needs an external resource or decision.
 - **Editor tooling**: syntax highlighting + an LSP built on the AST + source spans.
 - **JS int/float fidelity note**: JS has one number type, so AINL float division
   that yields a whole number prints without `.0` (documented limitation).
+- **Numeric model unification**: integer overflow behavior diverges across all
+  four runtimes today — see [NUMERIC_MODEL.md](NUMERIC_MODEL.md). Closing this
+  means either an arbitrary-precision integer type in the (zero-dependency)
+  interpreter, or `BigInt`-based codegen for the JS target; currently the
+  divergence is documented and pinned by tests rather than fixed.
 
 ## Recently completed
 

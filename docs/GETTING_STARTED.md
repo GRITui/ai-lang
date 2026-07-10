@@ -97,7 +97,8 @@ Full reference: [SYNTAX.md](SYNTAX.md).
 ## 5. Transpile to a language you know
 
 The same program projects losslessly to idiomatic-ish Python, JavaScript, or
-Ruby — verified to produce identical output.
+Ruby — verified to produce identical output, for values within `i64`/float-safe
+range (see [NUMERIC_MODEL.md](NUMERIC_MODEL.md) for what happens past that).
 
 ```sh
 ainl transpile hello.ainl --to python

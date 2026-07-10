@@ -12,7 +12,7 @@ Getting a model to emit correct code in a full language is unreliable — the gr
 
 - **Tiny, regular grammar** — expressible as GBNF, so grammar-constrained decoding forces syntactically valid output every time.
 - **One unambiguous parse tree** — uniform `(op arg...)` structure with byte spans, trivial to validate, analyze, and map.
-- **Lossless interop** — the same AST projects to idiomatic Python/JS/Ruby (verified byte-equal), so AINL slots into existing codebases and debugging.
+- **Lossless interop** — the same AST projects to idiomatic Python/JS/Ruby (verified byte-equal for the example programs), so AINL slots into existing codebases and debugging. This holds for values that stay within `i64`/float-safe range; integer overflow behavior itself diverges by design across targets — see [docs/NUMERIC_MODEL.md](docs/NUMERIC_MODEL.md).
 - **Zero-dependency runtime** — installs anywhere as a small static binary.
 
 ### A note on token efficiency

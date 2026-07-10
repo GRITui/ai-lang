@@ -125,6 +125,19 @@ fn mod_min_by_neg_one_does_not_panic() {
 }
 
 #[test]
+fn overflow_promotes_to_float_matching_documented_numeric_model() {
+    // Pins the interpreter's half of the divergence documented in
+    // docs/NUMERIC_MODEL.md: i64 overflow promotes to f64 here, while the
+    // Python/Ruby targets have arbitrary-precision integers and never
+    // overflow, and the JS target is f64 throughout with no promotion step.
+    // A change to this value should come with an update to that doc.
+    assert_eq!(
+        eval("(* 9223372036854775807 2)"),
+        Value::Float(18446744073709551616.0)
+    );
+}
+
+#[test]
 fn unary_negate_promotes_to_float_on_i64_min_overflow() {
     // -i64::MIN has no i64 representation; must promote to float like every
     // other arithmetic op's overflow path, not silently wrap or panic.
