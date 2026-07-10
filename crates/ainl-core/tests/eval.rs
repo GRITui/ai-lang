@@ -51,6 +51,74 @@ fn variadic_and_lists() {
 }
 
 #[test]
+fn hash_basics() {
+    assert_eq!(eval(r#"(get (hash "a" 1 "b" 2) "a")"#), Value::Int(1));
+    assert_eq!(eval(r#"(get (hash "a" 1) "missing")"#), Value::Nil);
+    assert_eq!(eval(r#"(has (hash "a" 1) "a")"#), Value::Bool(true));
+    assert_eq!(eval(r#"(has (hash "a" 1) "z")"#), Value::Bool(false));
+    assert_eq!(eval(r#"(len (hash "a" 1 "b" 2))"#), Value::Int(2));
+}
+
+#[test]
+fn hash_assoc_does_not_mutate_the_original() {
+    let src = r#"
+        (def h (hash "a" 1))
+        (def h2 (assoc h "a" 99))
+        (list (get h "a") (get h2 "a"))
+    "#;
+    assert_eq!(
+        eval(src),
+        Value::List(std::rc::Rc::new(vec![Value::Int(1), Value::Int(99)]))
+    );
+}
+
+#[test]
+fn hash_construction_lets_a_repeated_key_keep_its_last_value() {
+    // Last value wins, but only one entry — not two.
+    assert_eq!(eval(r#"(len (hash "a" 1 "a" 2))"#), Value::Int(1));
+    assert_eq!(eval(r#"(get (hash "a" 1 "a" 2) "a")"#), Value::Int(2));
+}
+
+#[test]
+fn hash_keys_and_vals_preserve_insertion_order() {
+    let src = r#"(keys (hash "a" 1 "b" 2 "c" 3))"#;
+    assert_eq!(
+        eval(src),
+        Value::List(std::rc::Rc::new(vec![
+            Value::str("a"),
+            Value::str("b"),
+            Value::str("c"),
+        ]))
+    );
+}
+
+#[test]
+fn hash_equality_is_order_sensitive_like_list() {
+    // A deliberate simplification (docs/SYNTAX.md §3 "Maps") that keeps
+    // equality identical to List's across all four runtimes.
+    assert_eq!(
+        eval(r#"(= (hash "a" 1 "b" 2) (hash "a" 1 "b" 2))"#),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(r#"(= (hash "a" 1 "b" 2) (hash "b" 2 "a" 1))"#),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn hash_key_equality_distinguishes_symbol_from_string() {
+    // A quoted symbol and an equal-content string are different keys, same
+    // as they're different values everywhere else in the language — this
+    // works "for free" because `get`/`has` reuse Value's own PartialEq.
+    assert_eq!(
+        eval(r#"(= (hash (quote a) 1) (hash "a" 1))"#),
+        Value::Bool(false)
+    );
+    assert_eq!(eval(r#"(get (hash (quote a) 1) "a")"#), Value::Nil);
+}
+
+#[test]
 fn while_loop_mutation() {
     let src = "(let ((i 0)) (while (< i 5) (def i (+ i 1))) i)";
     assert_eq!(eval(src), Value::Int(5));

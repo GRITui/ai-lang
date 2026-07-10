@@ -55,13 +55,19 @@ impl Rb {
     }
 
     fn finish(mut self) -> String {
-        if self
+        let disp_used = self
             .needed
             .iter()
-            .any(|n| matches!(*n, "_print" | "_str" | "_error" | "_repr" | "_disp"))
-        {
+            .any(|n| matches!(*n, "_print" | "_str" | "_error" | "_repr" | "_disp"));
+        if disp_used {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
+        }
+        // `_disp` branches on `is_a?(AHash)`; `_hash`/`_assoc` construct one.
+        // No `_eq` needed here (unlike JS/Python) — Ruby's native `==`
+        // already distinguishes Symbol/String/Integer/Bool correctly.
+        if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
+            self.needed.insert("AHash");
         }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to ruby`.\n");
@@ -267,6 +273,12 @@ impl Rb {
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
                 "cons" => return self.call_builtin("_cons", args, Some("_cons")),
                 "push" => return self.call_builtin("_push", args, Some("_push")),
+                "hash" => return self.call_builtin("_hash", args, Some("_hash")),
+                "get" => return self.call_builtin("_get", args, Some("_get")),
+                "assoc" => return self.call_builtin("_assoc", args, Some("_assoc")),
+                "has" => return self.call_builtin("_has", args, Some("_has")),
+                "keys" => return self.call_builtin("_keys", args, Some("_keys")),
+                "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
                 _ => {}
             }
@@ -510,9 +522,15 @@ fn ruby_str(s: &str) -> String {
 }
 
 const RUNTIME: &[(&str, &str)] = &[
+    // A map is an array of [k, v] pairs; this subclass exists only so
+    // `_disp` can tell a hash apart from a plain list at print time (a print
+    // call can't otherwise know a variable's AINL-level type). Ruby's
+    // `Array#map`/`#select` return a plain Array (not the subclass) and
+    // `#dup` preserves it, so — unlike JS — no extra care is needed there.
+    ("AHash", "class AHash < Array\nend"),
     (
         "_disp",
-        "def _disp(x)\n  return \"true\" if x == true\n  return \"false\" if x == false\n  return \"nil\" if x.nil?\n  return x.to_s if x.is_a?(Symbol)\n  return \"(\" + x.map { |e| _repr(e) }.join(\" \") + \")\" if x.is_a?(Array)\n  x.to_s\nend",
+        "def _disp(x)\n  return \"true\" if x == true\n  return \"false\" if x == false\n  return \"nil\" if x.nil?\n  return x.to_s if x.is_a?(Symbol)\n  return \"{\" + x.map { |p| _repr(p[0]) + \" \" + _repr(p[1]) }.join(\" \") + \"}\" if x.is_a?(AHash)\n  return \"(\" + x.map { |e| _repr(e) }.join(\" \") + \")\" if x.is_a?(Array)\n  x.to_s\nend",
     ),
     (
         "_repr",
@@ -526,5 +544,20 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_nth", "def _nth(x, i)\n  (0 <= i && i < x.length) ? x[i] : nil\nend"),
     ("_cons", "def _cons(h, t)\n  [h] + t\nend"),
     ("_push", "def _push(t, *xs)\n  t + xs\nend"),
+    (
+        "_hash",
+        "def _hash(*kvs)\n  out = AHash.new\n  i = 0\n  while i < kvs.length\n    k, v = kvs[i], kvs[i + 1]\n    pair = out.find { |p| p[0] == k }\n    if pair\n      pair[1] = v\n    else\n      out << [k, v]\n    end\n    i += 2\n  end\n  out\nend",
+    ),
+    (
+        "_get",
+        "def _get(h, k)\n  pair = h.find { |p| p[0] == k }\n  pair ? pair[1] : nil\nend",
+    ),
+    (
+        "_assoc",
+        "def _assoc(h, k, v)\n  out = AHash[*h.map { |p| p.dup }]\n  pair = out.find { |p| p[0] == k }\n  if pair\n    pair[1] = v\n  else\n    out << [k, v]\n  end\n  out\nend",
+    ),
+    ("_has", "def _has(h, k)\n  h.any? { |p| p[0] == k }\nend"),
+    ("_keys", "def _keys(h)\n  h.map { |p| p[0] }\nend"),
+    ("_vals", "def _vals(h)\n  h.map { |p| p[1] }\nend"),
     ("_error", "def _error(*xs)\n  raise(xs.map { |x| _disp(x) }.join(\" \"))\nend"),
 ];

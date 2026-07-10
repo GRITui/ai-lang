@@ -102,7 +102,9 @@ counter                                    ; => 0
 
 **Strings / IO**: `(print v...)` space-joins and prints a line, returns `nil`. `(str v...)` concatenates to one string.
 
-**Lists**: `(list v...)` build. `(len list|str)`. `(first list)`. `(rest list)`. `(nth list i)` (0-based, out-of-range → `nil`). `(cons v list)` prepend. `(push list v...)` append.
+**Lists**: `(list v...)` build. `(len list|str|hash)`. `(first list)`. `(rest list)`. `(nth list i)` (0-based, out-of-range → `nil`). `(cons v list)` prepend. `(push list v...)` append.
+
+**Maps**: `(hash k v k v ...)` build from key/value pairs — a repeated key keeps its *last* value at its *first* position. `(get h k)` look up, `nil` if absent. `(assoc h k v)` a *new* map with `k` bound to `v` (like `cons`/`push`, the original is untouched). `(has h k)` bool. `(keys h)` / `(vals h)` lists in insertion order. Any value can be a key — key comparison is the same `=` used everywhere else, so a quoted symbol and an equal-content string are different keys, same as they're different values. **Equality is insertion-order-sensitive**, exactly like `List` — `(= (hash "a" 1 "b" 2) (hash "b" 2 "a" 1))` is `false`. This is a deliberate simplification (not "real" set-of-pairs equality) that keeps a map's behavior — construction, lookup, equality — identical across the interpreter and all three transpiler targets, the same way it already is for lists.
 
 **Control**: `(error msg...)` abort with a runtime error.
 
@@ -130,6 +132,14 @@ counter                                    ; => 0
   (if (= (len xs) 0) (list)
     (cons (f (first xs)) (map f (rest xs))))))
 (map (fn (x) (* x 2)) (list 1 2 3))      ; => (2 4 6)
+
+; maps: build, look up, and non-mutating update
+(def user (hash "name" "Ada" "age" 36))
+(get user "name")                        ; => "Ada"
+(get user "email")                       ; => nil
+(def user2 (assoc user "age" 37))
+(get user "age")                         ; => 36  (unchanged)
+(get user2 "age")                        ; => 37
 ```
 
 ## 5. Rules for generating AINL correctly

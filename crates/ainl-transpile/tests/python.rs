@@ -75,3 +75,20 @@ fn eq_helper_omitted_when_equality_unused() {
     let out = py("(+ 1 2)");
     assert!(!out.contains("def _eq("), "got:\n{out}");
 }
+
+#[test]
+fn hash_builtins_dispatch_to_runtime_helpers() {
+    let out = py(r#"(get (assoc (hash "a" 1) "b" 2) "a")"#);
+    assert!(out.contains("_get(_assoc(_hash("), "got:\n{out}");
+    assert!(out.contains("def _hash("), "got:\n{out}");
+    assert!(out.contains("def _get("), "got:\n{out}");
+    assert!(out.contains("def _assoc("), "got:\n{out}");
+    assert!(out.contains("class _Hash(list)"), "got:\n{out}");
+}
+
+#[test]
+fn hash_runtime_omitted_when_unused() {
+    let out = py("(+ 1 2)");
+    assert!(!out.contains("_Hash"), "got:\n{out}");
+    assert!(!out.contains("def _hash("), "got:\n{out}");
+}

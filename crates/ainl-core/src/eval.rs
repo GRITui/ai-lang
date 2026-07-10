@@ -175,6 +175,9 @@ fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
     match val {
         Value::Closure(c) => env.is_ancestor_of(&c.env),
         Value::List(items) => items.iter().any(|v| value_keeps_env_alive(v, env)),
+        Value::Map(pairs) => pairs
+            .iter()
+            .any(|(k, v)| value_keeps_env_alive(k, env) || value_keeps_env_alive(v, env)),
         _ => false,
     }
 }
@@ -506,6 +509,14 @@ fn install_prelude(env: &Env) {
     b!("nth", builtin_nth);
     b!("cons", builtin_cons);
     b!("push", builtin_push);
+
+    b!("hash", builtin_hash);
+    b!("get", builtin_get);
+    b!("assoc", builtin_assoc);
+    b!("has", builtin_has);
+    b!("keys", builtin_keys);
+    b!("vals", builtin_vals);
+
     b!("error", |a| Err(Error::runtime(
         a.iter()
             .map(|v| v.to_string())
@@ -676,11 +687,94 @@ fn builtin_len(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
         Value::List(l) => Ok(Value::Int(l.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+        Value::Map(m) => Ok(Value::Int(m.len() as i64)),
         other => Err(Error::runtime(format!(
-            "len expects list or str, got {}",
+            "len expects list, str, or hash, got {}",
             other.type_name()
         ))),
     }
+}
+
+/// `(hash k v k v ...)` — build a map from variadic key/value pairs. A
+/// repeated key keeps its *last* value and its *first* position, matching
+/// the everyday "later assignment wins" expectation.
+fn builtin_hash(args: &[Value]) -> Result<Value> {
+    if !args.len().is_multiple_of(2) {
+        return Err(Error::runtime(format!(
+            "hash expects an even number of key/value arguments, got {}",
+            args.len()
+        )));
+    }
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(args.len() / 2);
+    for kv in args.chunks_exact(2) {
+        let (k, v) = (kv[0].clone(), kv[1].clone());
+        match pairs.iter_mut().find(|(ek, _)| *ek == k) {
+            Some((_, ev)) => *ev = v,
+            None => pairs.push((k, v)),
+        }
+    }
+    Ok(Value::Map(Rc::new(pairs)))
+}
+
+fn as_map<'a>(v: &'a Value, who: &str) -> Result<&'a Rc<Vec<(Value, Value)>>> {
+    match v {
+        Value::Map(m) => Ok(m),
+        other => Err(Error::runtime(format!(
+            "{who} expects a hash, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(get h k)` — look up a key; `nil` if absent, matching `nth`'s
+/// out-of-range convention.
+fn builtin_get(args: &[Value]) -> Result<Value> {
+    let [h, k] = args else {
+        return Err(Error::runtime("get expects (get hash key)"));
+    };
+    let m = as_map(h, "get")?;
+    Ok(m.iter()
+        .find(|(ek, _)| ek == k)
+        .map(|(_, v)| v.clone())
+        .unwrap_or(Value::Nil))
+}
+
+/// `(assoc h k v)` — a *new* map with `k` bound to `v`, like `cons`/`push`
+/// leaving the original untouched. Updates in place (keeps position) if `k`
+/// already exists, else appends.
+fn builtin_assoc(args: &[Value]) -> Result<Value> {
+    let [h, k, v] = args else {
+        return Err(Error::runtime("assoc expects (assoc hash key value)"));
+    };
+    let m = as_map(h, "assoc")?;
+    let mut pairs = (**m).clone();
+    match pairs.iter_mut().find(|(ek, _)| ek == k) {
+        Some((_, ev)) => *ev = v.clone(),
+        None => pairs.push((k.clone(), v.clone())),
+    }
+    Ok(Value::Map(Rc::new(pairs)))
+}
+
+fn builtin_has(args: &[Value]) -> Result<Value> {
+    let [h, k] = args else {
+        return Err(Error::runtime("has expects (has hash key)"));
+    };
+    let m = as_map(h, "has")?;
+    Ok(Value::Bool(m.iter().any(|(ek, _)| ek == k)))
+}
+
+fn builtin_keys(args: &[Value]) -> Result<Value> {
+    let m = as_map(arg1(args)?, "keys")?;
+    Ok(Value::List(Rc::new(
+        m.iter().map(|(k, _)| k.clone()).collect(),
+    )))
+}
+
+fn builtin_vals(args: &[Value]) -> Result<Value> {
+    let m = as_map(arg1(args)?, "vals")?;
+    Ok(Value::List(Rc::new(
+        m.iter().map(|(_, v)| v.clone()).collect(),
+    )))
 }
 
 fn builtin_first(args: &[Value]) -> Result<Value> {

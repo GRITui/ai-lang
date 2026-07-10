@@ -28,6 +28,12 @@ pub enum Value {
     /// A quoted symbol (from `(quote x)`), distinct from a variable reference.
     Sym(Rc<String>),
     List(Rc<Vec<Value>>),
+    /// A key-value map. Backed by an ordered association list (not a native
+    /// hash table) so lookups use `Value`'s own `PartialEq` — this is what
+    /// keeps e.g. a quoted symbol and an equal-content string correctly
+    /// distinct as keys, matching every other equality rule in the language,
+    /// at the cost of O(n) lookup. See docs/SYNTAX.md §3 "Maps".
+    Map(Rc<Vec<(Value, Value)>>),
     Builtin {
         name: &'static str,
         f: BuiltinFn,
@@ -55,6 +61,7 @@ impl Value {
             Value::Str(_) => "str",
             Value::Sym(_) => "sym",
             Value::List(_) => "list",
+            Value::Map(_) => "hash",
             Value::Builtin { .. } => "builtin",
             Value::Closure(_) => "fn",
         }
@@ -74,6 +81,8 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Sym(a), Value::Sym(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            // Order-sensitive, like List — see the Map variant's doc comment.
+            (Value::Map(a), Value::Map(b)) => a == b,
             _ => false,
         }
     }
@@ -103,6 +112,16 @@ impl fmt::Display for Value {
                     write!(f, "{}", v.repr())?;
                 }
                 write!(f, ")")
+            }
+            Value::Map(pairs) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{} {}", k.repr(), v.repr())?;
+                }
+                write!(f, "}}")
             }
             Value::Builtin { name, .. } => write!(f, "<builtin {name}>"),
             Value::Closure(_) => write!(f, "<fn>"),

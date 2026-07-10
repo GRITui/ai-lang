@@ -73,6 +73,18 @@ impl Py {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
+        // Key comparison for hash lookups needs structural equality.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_hash" | "_get" | "_assoc" | "_has"))
+        {
+            self.needed.insert("_eq");
+        }
+        // `_disp` branches on `isinstance(x, _Hash)`; `_hash`/`_assoc` construct one.
+        if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
+            self.needed.insert("_Hash");
+        }
         if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
@@ -309,6 +321,12 @@ impl Py {
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
                 "cons" => return self.call_builtin("_cons", args, Some("_cons")),
                 "push" => return self.call_builtin("_push", args, Some("_push")),
+                "hash" => return self.call_builtin("_hash", args, Some("_hash")),
+                "get" => return self.call_builtin("_get", args, Some("_get")),
+                "assoc" => return self.call_builtin("_assoc", args, Some("_assoc")),
+                "has" => return self.call_builtin("_has", args, Some("_has")),
+                "keys" => return self.call_builtin("_keys", args, Some("_keys")),
+                "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
                 _ => {}
             }
@@ -585,9 +603,13 @@ fn python_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym(str):\n    pass"),
     ("_sym", "def _sym(s):\n    return _Sym(s)"),
+    // A map is a list of [k, v] pairs; this subclass exists only so `_disp`
+    // can tell a hash apart from a plain list at print time (a print call
+    // can't otherwise know a variable's AINL-level type).
+    ("_Hash", "class _Hash(list):\n    pass"),
     (
         "_disp",
-        "def _disp(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    if x is True: return 'true'\n    if x is False: return 'false'\n    if x is None: return 'nil'\n    if isinstance(x, list): return '(' + ' '.join(_repr(e) for e in x) + ')'\n    if isinstance(x, float): return ('%.1f' % x) if x.is_integer() else repr(x)\n    return str(x)",
+        "def _disp(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    if x is True: return 'true'\n    if x is False: return 'false'\n    if x is None: return 'nil'\n    if isinstance(x, _Hash): return '{' + ' '.join(_repr(p[0]) + ' ' + _repr(p[1]) for p in x) + '}'\n    if isinstance(x, list): return '(' + ' '.join(_repr(e) for e in x) + ')'\n    if isinstance(x, float): return ('%.1f' % x) if x.is_integer() else repr(x)\n    return str(x)",
     ),
     (
         "_repr",
@@ -604,5 +626,20 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_nth", "def _nth(x, i):\n    return x[i] if 0 <= i < len(x) else None"),
     ("_cons", "def _cons(h, t):\n    return [h] + list(t)"),
     ("_push", "def _push(t, *xs):\n    return list(t) + list(xs)"),
+    (
+        "_hash",
+        "def _hash(*kvs):\n    out = _Hash()\n    for i in range(0, len(kvs), 2):\n        k, v = kvs[i], kvs[i + 1]\n        for pair in out:\n            if _eq(pair[0], k):\n                pair[1] = v\n                break\n        else:\n            out.append([k, v])\n    return out",
+    ),
+    (
+        "_get",
+        "def _get(h, k):\n    for pair in h:\n        if _eq(pair[0], k): return pair[1]\n    return None",
+    ),
+    (
+        "_assoc",
+        "def _assoc(h, k, v):\n    out = _Hash(list(p) for p in h)\n    for pair in out:\n        if _eq(pair[0], k):\n            pair[1] = v\n            return out\n    out.append([k, v])\n    return out",
+    ),
+    ("_has", "def _has(h, k):\n    return any(_eq(pair[0], k) for pair in h)"),
+    ("_keys", "def _keys(h):\n    return [pair[0] for pair in h]"),
+    ("_vals", "def _vals(h):\n    return [pair[1] for pair in h]"),
     ("_error", "def _error(*xs):\n    raise RuntimeError(' '.join(_disp(x) for x in xs))"),
 ];

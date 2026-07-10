@@ -62,6 +62,18 @@ impl Js {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
         }
+        // Key comparison for hash lookups needs structural equality.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_hash" | "_get" | "_assoc" | "_has"))
+        {
+            self.needed.insert("_eq");
+        }
+        // `_disp` branches on `instanceof _Hash`; `_hash`/`_assoc` construct one.
+        if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
+            self.needed.insert("_Hash");
+        }
         if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
@@ -286,6 +298,12 @@ impl Js {
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
                 "cons" => return self.call_builtin("_cons", args, Some("_cons")),
                 "push" => return self.call_builtin("_push", args, Some("_push")),
+                "hash" => return self.call_builtin("_hash", args, Some("_hash")),
+                "get" => return self.call_builtin("_get", args, Some("_get")),
+                "assoc" => return self.call_builtin("_assoc", args, Some("_assoc")),
+                "has" => return self.call_builtin("_has", args, Some("_has")),
+                "keys" => return self.call_builtin("_keys", args, Some("_keys")),
+                "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
                 _ => {}
             }
@@ -539,9 +557,13 @@ fn js_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym { constructor(name) { this.name = name; } }"),
     ("_sym", "function _sym(s) { return new _Sym(s); }"),
+    // A map is an array of [k, v] pairs; this subclass exists only so
+    // `_disp` can tell a hash apart from a plain list at print time (a
+    // print call can't otherwise know a variable's AINL-level type).
+    ("_Hash", "class _Hash extends Array {}"),
     (
         "_disp",
-        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
+        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (x instanceof _Hash) return \"{\" + x.map(p => _repr(p[0]) + \" \" + _repr(p[1])).join(\" \") + \"}\";\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
     ),
     (
         "_repr",
@@ -559,5 +581,25 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_nth", "function _nth(x, i) { return (0 <= i && i < x.length) ? x[i] : null; }"),
     ("_cons", "function _cons(h, t) { return [h].concat(t); }"),
     ("_push", "function _push(t, ...xs) { return t.concat(xs); }"),
+    (
+        "_hash",
+        "function _hash(...kvs) {\n  const out = new _Hash();\n  for (let i = 0; i < kvs.length; i += 2) {\n    const k = kvs[i], v = kvs[i + 1];\n    const pair = out.find(p => _eq(p[0], k));\n    if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  }\n  return out;\n}",
+    ),
+    (
+        "_get",
+        "function _get(h, k) {\n  const pair = h.find(p => _eq(p[0], k));\n  return pair ? pair[1] : null;\n}",
+    ),
+    (
+        "_assoc",
+        "function _assoc(h, k, v) {\n  const out = _Hash.from(h, p => p.slice());\n  const pair = out.find(p => _eq(p[0], k));\n  if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  return out;\n}",
+    ),
+    (
+        "_has",
+        "function _has(h, k) { return h.some(p => _eq(p[0], k)); }",
+    ),
+    // `Array.from` (not `h.map`, which inherits _Hash via Symbol.species) —
+    // keys/vals return plain lists, not hashes.
+    ("_keys", "function _keys(h) { return Array.from(h, p => p[0]); }"),
+    ("_vals", "function _vals(h) { return Array.from(h, p => p[1]); }"),
     ("_error", "function _error(...xs) { throw new Error(xs.map(_disp).join(\" \")); }"),
 ];

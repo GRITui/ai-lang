@@ -67,3 +67,32 @@ fn only_used_runtime_is_emitted() {
     assert!(!js("(+ 1 2)").contains("function _print"));
     assert!(js("(print 1)").contains("function _print"));
 }
+
+#[test]
+fn hash_builtins_dispatch_to_runtime_helpers() {
+    let out = js(r#"(get (assoc (hash "a" 1) "b" 2) "a")"#);
+    assert!(out.contains("_get(_assoc(_hash("), "got:\n{out}");
+    assert!(out.contains("function _hash("), "got:\n{out}");
+    assert!(out.contains("function _get("), "got:\n{out}");
+    assert!(out.contains("function _assoc("), "got:\n{out}");
+    assert!(out.contains("class _Hash extends Array"), "got:\n{out}");
+}
+
+#[test]
+fn keys_and_vals_return_plain_arrays_not_hashes() {
+    // Regression: Array.prototype.map on a _Hash instance returns another
+    // _Hash (Symbol.species), which would make `_disp` wrongly render a
+    // plain key/value list as a "{...}" hash. _keys/_vals must use
+    // Array.from to force a plain array.
+    let out = js("(keys h)");
+    assert!(out.contains("Array.from(h, p => p[0])"), "got:\n{out}");
+    let out2 = js("(vals h)");
+    assert!(out2.contains("Array.from(h, p => p[1])"), "got:\n{out2}");
+}
+
+#[test]
+fn hash_runtime_omitted_when_unused() {
+    let out = js("(+ 1 2)");
+    assert!(!out.contains("_Hash"), "got:\n{out}");
+    assert!(!out.contains("function _hash("), "got:\n{out}");
+}
