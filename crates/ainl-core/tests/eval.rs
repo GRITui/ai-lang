@@ -70,6 +70,47 @@ fn errors_surface() {
 }
 
 #[test]
+fn unbounded_recursion_errors_cleanly_instead_of_overflowing_the_stack() {
+    // No base case: this must hit the depth guard and return `Err`, not
+    // crash the process with a native stack overflow.
+    let src = "(def loop (fn (n) (+ 1 (loop n)))) (loop 0)";
+    let err = run_str(src).unwrap_err().to_string();
+    assert!(err.contains("recursion limit"), "got: {err}");
+}
+
+#[test]
+fn infinite_loop_errors_cleanly_instead_of_hanging() {
+    let err = run_str("(while true 0)").unwrap_err().to_string();
+    assert!(err.contains("step limit"), "got: {err}");
+}
+
+#[test]
+fn each_run_in_call_gets_a_fresh_step_budget() {
+    // A prior run that burns its whole step budget must not starve the next
+    // call sharing the same `Env` (as the REPL does line-by-line).
+    let env = ainl_core::Env::with_prelude();
+    assert!(ainl_core::run_in("(while true 0)", &env).is_err());
+    assert_eq!(ainl_core::run_in("(+ 1 2)", &env).unwrap(), Value::Int(3));
+}
+
+#[test]
+fn mod_min_by_neg_one_does_not_panic() {
+    // i64::MIN.rem_euclid(-1) panics in std (the quotient overflows even
+    // though the true remainder is 0); AINL's `mod` must not crash.
+    assert_eq!(eval("(mod -9223372036854775808 -1)"), Value::Int(0));
+}
+
+#[test]
+fn unary_negate_promotes_to_float_on_i64_min_overflow() {
+    // -i64::MIN has no i64 representation; must promote to float like every
+    // other arithmetic op's overflow path, not silently wrap or panic.
+    assert_eq!(
+        eval("(- -9223372036854775808)"),
+        Value::Float(9223372036854775808.0)
+    );
+}
+
+#[test]
 fn line_index_locates_positions() {
     let src = "abc\n(de\nfg)";
     let idx = LineIndex::new(src);

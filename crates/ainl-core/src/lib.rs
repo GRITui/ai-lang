@@ -40,8 +40,10 @@ pub fn run_str(src: &str) -> Result<Value> {
 }
 
 /// Parse and evaluate a program in an existing environment (used by the REPL so
-/// bindings persist across lines).
+/// bindings persist across lines). Each call gets a fresh step budget (see
+/// `eval::MAX_STEPS`) so runaway work on one line/run can't starve the next.
 pub fn run_in(src: &str, env: &Env) -> Result<Value> {
+    eval::reset_limits();
     let forms = parse(src)?;
     let mut last = Value::Nil;
     for form in &forms {

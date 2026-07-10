@@ -3,9 +3,79 @@
 use crate::error::{Error, Result};
 use crate::parser::Node;
 use crate::value::{Closure, Value};
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+// ---- resource limits --------------------------------------------------------
+//
+// The tree-walking evaluator recurses through native Rust call frames with no
+// inherent bound, and `while` has no iteration cap. Both are reachable from a
+// single AINL source form (deep recursion, deeply nested calls, `(while true
+// ...)`), and a Rust stack overflow is not a catchable `Result` — it aborts
+// the process outright. These two thread-local counters turn both failure
+// modes into a clean `Error::Runtime` instead.
+
+thread_local! {
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+    static STEPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Max live `eval` call frames (recursion + nested-expression depth combined).
+/// Kept well below where a native stack overflow could occur even on a
+/// constrained thread stack (e.g. `cargo test`'s worker threads default to a
+/// couple MiB, smaller than a typical main-thread stack).
+const MAX_DEPTH: usize = 512;
+/// Max total `eval` invocations per top-level `run_str`/`run_in` call — bounds
+/// unbounded loops (`while true`) and runaway iteration generally.
+const MAX_STEPS: u64 = 2_000_000;
+
+/// Reset the step budget for a fresh top-level run. Depth is guaranteed back
+/// at 0 between runs (the RAII guard below always decrements on the way out,
+/// success or error), so only steps need an explicit reset.
+pub(crate) fn reset_limits() {
+    STEPS.with(|s| s.set(0));
+}
+
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Result<DepthGuard> {
+        let exceeded = DEPTH.with(|d| {
+            let v = d.get() + 1;
+            d.set(v);
+            v > MAX_DEPTH
+        });
+        if exceeded {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            return Err(Error::runtime(format!(
+                "recursion limit exceeded (max depth {MAX_DEPTH})"
+            )));
+        }
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+fn tick() -> Result<()> {
+    let exceeded = STEPS.with(|s| {
+        let v = s.get() + 1;
+        s.set(v);
+        v > MAX_STEPS
+    });
+    if exceeded {
+        return Err(Error::runtime(format!(
+            "step limit exceeded (max {MAX_STEPS} evaluation steps) — likely an infinite loop or runaway recursion"
+        )));
+    }
+    Ok(())
+}
 
 /// A lexical scope with an optional parent. `Env` is a cheap `Rc` handle so
 /// closures can share and outlive the scope that created them.
@@ -58,6 +128,8 @@ impl Default for Env {
 }
 
 pub fn eval(node: &Node, env: &Env) -> Result<Value> {
+    let _guard = DepthGuard::enter()?;
+    tick()?;
     match node {
         Node::Int(i, _) => Ok(Value::Int(*i)),
         Node::Float(x, _) => Ok(Value::Float(*x)),
@@ -413,7 +485,14 @@ fn builtin_sub(args: &[Value]) -> Result<Value> {
     match args {
         [] => Err(Error::runtime("- expects at least 1 argument")),
         [one] => match one {
-            Value::Int(i) => Ok(Value::Int(-*i)),
+            // i64::MIN has no positive i64 counterpart; checked_neg catches
+            // that (rather than silently wrapping in release builds) and we
+            // promote to float, matching every other arithmetic op's overflow
+            // behavior.
+            Value::Int(i) => match i.checked_neg() {
+                Some(r) => Ok(Value::Int(r)),
+                None => Ok(Value::Float(-(*i as f64))),
+            },
             Value::Float(x) => Ok(Value::Float(-*x)),
             other => Err(Error::runtime(format!(
                 "- expected number, got {}",
@@ -479,6 +558,12 @@ fn builtin_mod(args: &[Value]) -> Result<Value> {
     };
     if *b == 0 {
         return Err(Error::runtime("mod by zero"));
+    }
+    // `i64::MIN.rem_euclid(-1)` panics: the *quotient* (i64::MAX + 1) doesn't
+    // fit in i64, even though the mathematical remainder of dividing by ±1 is
+    // always 0. Special-case it rather than letting the overflow through.
+    if *b == -1 {
+        return Ok(Value::Int(0));
     }
     Ok(Value::Int(a.rem_euclid(*b)))
 }
