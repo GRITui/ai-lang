@@ -8,6 +8,7 @@
 pub mod js;
 pub mod python;
 pub mod ruby;
+mod shared;
 
 use ainl_core::parser::Node;
 use ainl_core::Result;

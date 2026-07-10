@@ -11,6 +11,7 @@
 //! preserve AINL's float division. `if` is a Ruby expression; chained
 //! comparison is expanded (Ruby, like JS, has none).
 
+use crate::shared::{self, ExprEmit};
 use ainl_core::parser::Node;
 use ainl_core::serialize::LineIndex;
 use ainl_core::{Error, Result};
@@ -185,7 +186,7 @@ impl Rb {
         let Some((binds_node, body)) = args.split_first() else {
             return Err(Error::runtime("let expects (let ((n v)...) body...)"));
         };
-        for (name, val) in let_bindings(binds_node)? {
+        for (name, val) in shared::let_bindings(binds_node)? {
             let e = self.expr(val)?;
             self.line(&format!("{} = {e}", sanitize(name)));
         }
@@ -222,21 +223,6 @@ impl Rb {
 
     // -- expressions ---------------------------------------------------------
 
-    fn expr(&mut self, node: &Node) -> Result<String> {
-        match node {
-            Node::Int(i, _) => Ok(i.to_string()),
-            Node::Float(x, _) => Ok(ruby_float(*x)),
-            Node::Str(s, _) => Ok(ruby_str(s)),
-            Node::Sym(name, _) => Ok(match name.as_str() {
-                "true" => "true".to_string(),
-                "false" => "false".to_string(),
-                "nil" => "nil".to_string(),
-                other => sanitize(other),
-            }),
-            Node::List(items, _) => self.expr_list(items, node.span()),
-        }
-    }
-
     fn expr_list(&mut self, items: &[Node], span: ainl_core::Span) -> Result<String> {
         let Some(head) = items.first() else {
             return Ok("nil".to_string());
@@ -244,19 +230,19 @@ impl Rb {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return self.infix(args, "+", "0"),
-                "*" => return self.infix(args, "*", "1"),
-                "-" => return self.infix_sub(args),
+                "+" => return shared::infix(self, args, "+", "0"),
+                "*" => return shared::infix(self, args, "*", "1"),
+                "-" => return shared::infix_sub(self, args),
                 "/" => return self.infix_div(args),
-                "=" => return self.cmp(args, "=="),
-                "<" => return self.cmp(args, "<"),
-                ">" => return self.cmp(args, ">"),
-                "<=" => return self.cmp(args, "<="),
-                ">=" => return self.cmp(args, ">="),
-                "and" => return self.logic(args, "&&", "true"),
-                "or" => return self.logic(args, "||", "false"),
-                "not" => return self.unary(args, "!"),
-                "mod" => return self.binary(args, "%"),
+                "=" => return shared::cmp(self, args, "=="),
+                "<" => return shared::cmp(self, args, "<"),
+                ">" => return shared::cmp(self, args, ">"),
+                "<=" => return shared::cmp(self, args, "<="),
+                ">=" => return shared::cmp(self, args, ">="),
+                "and" => return shared::infix(self, args, "&&", "true"),
+                "or" => return shared::infix(self, args, "||", "false"),
+                "not" => return shared::unary(self, args, "!"),
+                "mod" => return shared::binary(self, args, "%"),
                 "if" => return self.expr_if(args),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
@@ -291,10 +277,6 @@ impl Rb {
         Ok(format!("{callee}.call({})", parts.join(", ")))
     }
 
-    fn expr_all(&mut self, nodes: &[Node]) -> Result<Vec<String>> {
-        nodes.iter().map(|n| self.expr(n)).collect()
-    }
-
     fn call_builtin(
         &mut self,
         name: &str,
@@ -305,24 +287,6 @@ impl Rb {
             self.need(n);
         }
         Ok(format!("{name}({})", self.expr_all(args)?.join(", ")))
-    }
-
-    fn infix(&mut self, args: &[Node], op: &str, identity: &str) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Ok(identity.to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
-        }
-    }
-
-    fn infix_sub(&mut self, args: &[Node]) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("- expects at least 1 argument")),
-            1 => Ok(format!("(-{})", parts[0])),
-            _ => Ok(format!("({})", parts.join(" - "))),
-        }
     }
 
     /// AINL `/` is float division; Ruby `/` on integers truncates, so coerce the
@@ -338,42 +302,6 @@ impl Rb {
                 let rest: Vec<String> = it.collect();
                 Ok(format!("(({}).to_f / {})", first, rest.join(" / ")))
             }
-        }
-    }
-
-    fn binary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a, b] = args else {
-            return Err(Error::runtime(format!("'{op}' expects 2 arguments")));
-        };
-        Ok(format!("({} {op} {})", self.expr(a)?, self.expr(b)?))
-    }
-
-    fn unary(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let [a] = args else {
-            return Err(Error::runtime("expects 1 argument"));
-        };
-        Ok(format!("({op}{})", self.expr(a)?))
-    }
-
-    /// Ruby has no chained comparison — expand `(< a b c)` to `(a < b && b < c)`.
-    fn cmp(&mut self, args: &[Node], op: &str) -> Result<String> {
-        if args.len() < 2 {
-            return Ok("true".to_string());
-        }
-        let parts = self.expr_all(args)?;
-        let clauses: Vec<String> = parts
-            .windows(2)
-            .map(|w| format!("{} {op} {}", w[0], w[1]))
-            .collect();
-        Ok(format!("({})", clauses.join(" && ")))
-    }
-
-    fn logic(&mut self, args: &[Node], op: &str, identity: &str) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Ok(identity.to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
         }
     }
 
@@ -401,7 +329,7 @@ impl Rb {
         }
         let mut names = Vec::new();
         let mut vals = Vec::new();
-        for (n, v) in let_bindings(binds_node)? {
+        for (n, v) in shared::let_bindings(binds_node)? {
             names.push(sanitize(n));
             vals.push(self.expr(v)?);
         }
@@ -466,44 +394,25 @@ impl Rb {
     }
 }
 
-fn ruby_params(params_node: &Node) -> Result<Vec<String>> {
-    let Node::List(param_nodes, _) = params_node else {
-        return Err(Error::runtime("fn params must be a list"));
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < param_nodes.len() {
-        let Node::Sym(p, _) = &param_nodes[i] else {
-            return Err(Error::runtime("fn params must be symbols"));
-        };
-        if p == "&" {
-            let Some(Node::Sym(rest, _)) = param_nodes.get(i + 1) else {
-                return Err(Error::runtime("'&' must be followed by a rest parameter"));
-            };
-            out.push(format!("*{}", sanitize(rest)));
-            break;
+impl ExprEmit for Rb {
+    fn expr(&mut self, node: &Node) -> Result<String> {
+        match node {
+            Node::Int(i, _) => Ok(i.to_string()),
+            Node::Float(x, _) => Ok(ruby_float(*x)),
+            Node::Str(s, _) => Ok(ruby_str(s)),
+            Node::Sym(name, _) => Ok(match name.as_str() {
+                "true" => "true".to_string(),
+                "false" => "false".to_string(),
+                "nil" => "nil".to_string(),
+                other => sanitize(other),
+            }),
+            Node::List(items, _) => self.expr_list(items, node.span()),
         }
-        out.push(sanitize(p));
-        i += 1;
     }
-    Ok(out)
 }
 
-fn let_bindings(binds_node: &Node) -> Result<Vec<(&str, &Node)>> {
-    let Node::List(binds, _) = binds_node else {
-        return Err(Error::runtime("let bindings must be a list"));
-    };
-    let mut out = Vec::new();
-    for b in binds {
-        let Node::List(pair, _) = b else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        let [Node::Sym(name, _), val] = &pair[..] else {
-            return Err(Error::runtime("each let binding must be (name value)"));
-        };
-        out.push((name.as_str(), val));
-    }
-    Ok(out)
+fn ruby_params(params_node: &Node) -> Result<Vec<String>> {
+    shared::parse_params(params_node, "*", sanitize)
 }
 
 /// Turn an AINL symbol into a valid Ruby local-variable name (lowercase start).
