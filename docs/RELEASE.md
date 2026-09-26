@@ -22,8 +22,8 @@ triggered by pushing a `v*` tag:
 1. `linux-musl` (ubuntu-latest): `rustup target add x86_64-unknown-linux-musl`
    + `apt-get install musl-tools`, then `cargo build --release --target
    x86_64-unknown-linux-musl`. Verifies the artifact is fully static
-   (`file` → "statically linked", `ldd` → "not a dynamic executable") and
-   smoke-tests it (`ainl eval '(* 6 7)'` → 42).
+   (`file` → "static-pie linked", `ldd` → "statically linked" / "not a
+   dynamic executable") and smoke-tests it (`ainl eval '(* 6 7)'` → 42).
 2. `macos` (macos-latest, arm64): native `cargo build --release`, same smoke test.
 3. `release`: attaches both tarballs to the GitHub release with
    `gh release create` (notes from `RELEASE_NOTES.md`).

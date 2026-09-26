@@ -57,8 +57,11 @@ jobs:
           file "$BIN"
           echo "== ldd =="
           ldd "$BIN" || true
-          # Hard assertion: the artifact must not be a dynamic executable.
-          ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"
+          # Hard assertion: the artifact must have no dynamic dependencies.
+          # musl static-pie binaries report "statically linked"; classic
+          # static binaries report "not a dynamic executable".
+          LDD_OUT=$(ldd "$BIN" 2>&1)
+          echo "$LDD_OUT" | grep -Eq "not a dynamic executable|statically linked"
 
       - name: Smoke test (ainl eval '(* 6 7)' == 42)
         run: |
@@ -80,8 +83,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ainl-v${{ github.ref_name }}-x86_64-unknown-linux-musl
-          path: ainl-v${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+          name: ${{ format('ainl-{0}-x86_64-unknown-linux-musl', github.ref_name) }}
+          path: ${{ format('ainl-{0}-x86_64-unknown-linux-musl.tar.gz', github.ref_name) }}
 
   macos:
     name: macOS aarch64
@@ -123,8 +126,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ainl-v${{ github.ref_name }}-aarch64-apple-darwin
-          path: ainl-v${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+          name: ${{ format('ainl-{0}-aarch64-apple-darwin', github.ref_name) }}
+          path: ${{ format('ainl-{0}-aarch64-apple-darwin.tar.gz', github.ref_name) }}
 
   release:
     name: GitHub release
