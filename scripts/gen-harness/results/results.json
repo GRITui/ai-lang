@@ -1,0 +1,482 @@
+[
+  {
+    "index": 0,
+    "prompt": "Print the sum of 2 and 3.",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 1,
+    "prompt": "Define a function sq that squares its argument, then print (sq 12).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 2,
+    "prompt": "Compute and print the 10th fibonacci number (fib 0 = 0, fib 1 = 1).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 3,
+    "prompt": "Print the sum of the list (list 1 2 3 4 5).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 4,
+    "prompt": "Define a function that doubles each element of a list, then print it applied to (list 1 2 3).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 5,
+    "prompt": "Print the string \"hello, world\".",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 6,
+    "prompt": "Print the length of the list (list 1 2 3 4 5).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 7,
+    "prompt": "Print the first element of the list (list 10 20 30).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 8,
+    "prompt": "Define a function fact that computes the factorial of n, then print (fact 5).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 9,
+    "prompt": "Print true if the number 4 is even, else print false.",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 10,
+    "prompt": "Define a function max2 that returns the larger of two numbers, then print (max2 7 9).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 11,
+    "prompt": "Print the product of the list (list 1 2 3 4).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 12,
+    "prompt": "Define a function that reverses a list, then print it applied to (list 1 2 3).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 13,
+    "prompt": "Print the sum of the first five natural numbers (1 + 2 + 3 + 4 + 5).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 14,
+    "prompt": "Define a function that counts how many elements a list has, then print it for (list 1 2 3 4 5 6).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 15,
+    "prompt": "Build a map with key \"name\" bound to \"Ada\", then print (get user \"name\").",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 16,
+    "prompt": "Print the keys of the map (hash \"a\" 1 \"b\" 2).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 17,
+    "prompt": "Print the remainder of 10 divided by 3.",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 18,
+    "prompt": "Define a function that returns the last element of a list, then print it for (list 1 2 3 4).",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  },
+  {
+    "index": 19,
+    "prompt": "Print the number 42.",
+    "constrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\nclass Solution(object) -> str = \"\"\"class Solution(object):\n    def isPalindrome(self, s: str) -> bool:\n        \"\"\"\n        1. 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '/leetcode'"
+    }
+  }
+]

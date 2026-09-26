@@ -1,0 +1,20 @@
+Print the sum of 2 and 3.
+Define a function sq that squares its argument, then print (sq 12).
+Compute and print the 10th fibonacci number (fib 0 = 0, fib 1 = 1).
+Print the sum of the list (list 1 2 3 4 5).
+Define a function that doubles each element of a list, then print it applied to (list 1 2 3).
+Print the string "hello, world".
+Print the length of the list (list 1 2 3 4 5).
+Print the first element of the list (list 10 20 30).
+Define a function fact that computes the factorial of n, then print (fact 5).
+Print true if the number 4 is even, else print false.
+Define a function max2 that returns the larger of two numbers, then print (max2 7 9).
+Print the product of the list (list 1 2 3 4).
+Define a function that reverses a list, then print it applied to (list 1 2 3).
+Print the sum of the first five natural numbers (1 + 2 + 3 + 4 + 5).
+Define a function that counts how many elements a list has, then print it for (list 1 2 3 4 5 6).
+Build a map with key "name" bound to "Ada", then print (get user "name").
+Print the keys of the map (hash "a" 1 "b" 2).
+Print the remainder of 10 divided by 3.
+Define a function that returns the last element of a list, then print it for (list 1 2 3 4).
+Print the number 42.

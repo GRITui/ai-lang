@@ -10,7 +10,7 @@ A small, uniform programming language built to be **generated and verified by ma
 
 Getting a model to emit correct code in a full language is unreliable — the grammar is huge and ambiguous. AINL inverts that:
 
-- **Tiny, regular grammar** — expressible as GBNF, so grammar-constrained decoding forces syntactically valid output every time.
+- **Tiny, regular grammar** — expressible as GBNF, so grammar-constrained decoding forces syntactically valid output every time. Demonstrated: **100% of 20 constrained generations are valid AINL, 0% of the unconstrained baseline** ([docs/GENERATION.md](docs/GENERATION.md)).
 - **One unambiguous parse tree** — uniform `(op arg...)` structure with byte spans, trivial to validate, analyze, and map.
 - **Lossless interop** — the same AST projects to idiomatic Python/JS/Ruby (verified byte-equal for the example programs), so AINL slots into existing codebases and debugging. This holds for values that stay within `i64`/float-safe range; integer overflow behavior itself diverges by design across targets — see [docs/NUMERIC_MODEL.md](docs/NUMERIC_MODEL.md).
 - **Zero-dependency runtime** — installs anywhere as a small static binary.
@@ -45,6 +45,31 @@ ai-native-lang/
 - **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
 
 See [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) for the roadmap, [docs/SYNTAX.md](docs/SYNTAX.md) for the grammar, and [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for a hands-on walkthrough.
+
+## Constrained generation (proof of concept)
+
+[scripts/gen-harness/](scripts/gen-harness/) runs a small local model
+(Qwen2.5-0.5B-Instruct Q4_K_M) through a **real GBNF-constrained decoder**
+(llama.cpp `llama-cli --grammar-file` with the grammar from `ainl grammar`)
+and measures the output against the GBNF language itself.
+
+| mode | GBNF membership | `ainl ast` parse | `ainl run` |
+|---|---|---|---|
+| **constrained** | **20/20 (100%)** | 20/20 (100%) | 0/20 (0%) |
+| unconstrained | 0/20 (0%) | 20/20 (100%) | 0/20 (0%) |
+
+**The constraint works: 100% of constrained outputs are valid AINL, 0% of
+unconstrained ones are.** (The `ainl ast` column is 100% in *both* modes — the
+parser is a superset of the GBNF, so GBNF membership is the sound check; see
+[docs/GENERATION.md](docs/GENERATION.md) for why.)
+
+The honest negative result: a 0.5B model is too weak for *semantics*. All 20
+constrained outputs are byte-identical degenerate templates — valid AINL
+syntax, but they don't run and don't do what was asked. The decoder guarantees
+the syntax; the model's capability determines the semantics. A larger model is
+the next experiment. Full method, raw results, and the reproducible harness:
+[docs/GENERATION.md](docs/GENERATION.md) and
+[scripts/gen-harness/README.md](scripts/gen-harness/README.md).
 
 ## Install
 
