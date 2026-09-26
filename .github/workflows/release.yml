@@ -1,0 +1,148 @@
+# Release pipeline (C5).
+#
+# Triggered by pushing a `v*` tag. Builds both release assets natively —
+# Linux x86_64 musl on an ubuntu runner (musl links statically by default;
+# no Docker/cross needed) and macOS aarch64 on an arm64 runner — verifies
+# the Linux artifact is fully static, smoke-tests both binaries, packages
+# them, and attaches them to a GitHub release.
+#
+# Repeatable: cut a new release by bumping the workspace version in
+# Cargo.toml, committing, and pushing the next `v*` tag.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-musl:
+    name: Linux x86_64 (musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # Provides /usr/bin/x86_64-linux-musl-gcc, which .cargo/config.toml
+      # already wires in as the linker for this target.
+      - name: Install musl-gcc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-musl-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build static release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify static (file + ldd)
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ainl
+          echo "== file =="
+          file "$BIN"
+          echo "== ldd =="
+          ldd "$BIN" || true
+          # Hard assertion: the artifact must not be a dynamic executable.
+          ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"
+
+      - name: Smoke test (ainl eval '(* 6 7)' == 42)
+        run: |
+          OUT=$(./target/x86_64-unknown-linux-musl/release/ainl eval '(* 6 7)')
+          echo "eval output: $OUT"
+          [ "$OUT" = "42" ]
+
+      - name: Package
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          T=x86_64-unknown-linux-musl
+          D=ainl-v${V}-${T}
+          mkdir "$D"
+          cp target/$T/release/ainl "$D/ainl"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$D/"
+          tar czf "$D.tar.gz" "$D"
+          ls -lh "$D.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ainl-v${{ github.ref_name }}-x86_64-unknown-linux-musl
+          path: ainl-v${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+
+  macos:
+    name: macOS aarch64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke test (ainl eval '(* 6 7)' == 42)
+        run: |
+          OUT=$(./target/release/ainl eval '(* 6 7)')
+          echo "eval output: $OUT"
+          [ "$OUT" = "42" ]
+
+      - name: Package
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          D=ainl-v${V}-aarch64-apple-darwin
+          mkdir "$D"
+          cp target/release/ainl "$D/ainl"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$D/"
+          tar czf "$D.tar.gz" "$D"
+          ls -lh "$D.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ainl-v${{ github.ref_name }}-aarch64-apple-darwin
+          path: ainl-v${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    needs: [linux-musl, macos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "AINL ${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*/*.tar.gz

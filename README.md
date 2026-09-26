@@ -86,7 +86,15 @@ ainl version
 ainl eval '(* 6 7)'        # 42
 ```
 
-Prebuilt binaries are attached to [GitHub releases](https://github.com/GRITui/ai-lang/releases). For a fully-static Linux binary, see [docs/RELEASE.md](docs/RELEASE.md).
+Prebuilt binaries are attached to [GitHub releases](https://github.com/GRITui/ai-lang/releases). The **v0.2.0** release ships a fully-static **Linux x86_64 (musl)** binary — one file, no dependencies, runs on any Linux box or container:
+
+```sh
+curl -LO https://github.com/GRITui/ai-lang/releases/download/v0.2.0/ainl-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+tar xzf ainl-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+./ainl-v0.2.0-x86_64-unknown-linux-musl/ainl eval '(* 6 7)'   # 42
+```
+
+plus a macOS aarch64 asset. See [docs/RELEASE.md](docs/RELEASE.md) for the release pipeline and staticness verification.
 
 ## Quick start
 

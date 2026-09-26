@@ -14,6 +14,33 @@ platform with a single command.
 This always builds the native release binary and reports its dynamic
 dependencies, then builds fully-static Linux binaries if the tooling is present.
 
+## Releases (v0.2.0+)
+
+Releases are cut by the **CI release pipeline** (`.github/workflows/release.yml`),
+triggered by pushing a `v*` tag:
+
+1. `linux-musl` (ubuntu-latest): `rustup target add x86_64-unknown-linux-musl`
+   + `apt-get install musl-tools`, then `cargo build --release --target
+   x86_64-unknown-linux-musl`. Verifies the artifact is fully static
+   (`file` → "statically linked", `ldd` → "not a dynamic executable") and
+   smoke-tests it (`ainl eval '(* 6 7)'` → 42).
+2. `macos` (macos-latest, arm64): native `cargo build --release`, same smoke test.
+3. `release`: attaches both tarballs to the GitHub release with
+   `gh release create` (notes from `RELEASE_NOTES.md`).
+
+To cut a new release: bump `version` in `Cargo.toml`, update
+`RELEASE_NOTES.md`, commit, `git tag v<version> && git push origin v<version>`.
+
+### v0.2.0 artifacts
+
+| asset | size |
+|---|---|
+| `ainl-v0.2.0-x86_64-unknown-linux-musl.tar.gz` | recorded below (first CI run) |
+| `ainl-v0.2.0-aarch64-apple-darwin.tar.gz` | recorded below (first CI run) |
+
+The binary itself is ~400 KB (release profile: `opt-level="z"`, `lto`, `strip`,
+`panic="abort"`); the tarball adds README + both licenses.
+
 ## What "zero dependency" means, verified
 
 The native macOS build links only the base system library:
@@ -67,5 +94,7 @@ $ ldd target/x86_64-unknown-linux-musl/release/ainl
 
 Building a Linux/musl target on macOS **compiles** fine but **links** only when a
 GNU/Linux cross-linker is available (Apple's `ld` rejects GNU link options). Use
-Path A or Path B above; a plain `cargo build --target ...-musl` on a bare macOS
-host will fail at the link step by design.
+Path A or Path B above, or — simplest — let CI do it: pushing a `v*` tag runs
+the release pipeline, which builds the musl artifact natively on an ubuntu
+runner (see "Releases (v0.2.0+)" above). A plain `cargo build --target ...-musl`
+on a bare macOS host will fail at the link step by design.

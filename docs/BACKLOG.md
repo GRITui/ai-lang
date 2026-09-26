@@ -9,9 +9,7 @@ later, **Blockers** = needs an external resource or decision.
 
 ## 🔴 Blockers
 
-| Item | Blocked on | Impact |
-|------|-----------|--------|
-| **musl static binary artifact** | No Docker/`cross` or musl cross-toolchain on this host; macOS can't link a Linux musl target without one. | The *pipeline* (`scripts/build-release.sh`, `.cargo/config.toml`, docs) is done and zero-dep is verified natively, but the actual static Linux artifact can't be produced here. Unblock: install Docker + `cargo install cross`, then re-run the release script. |
+(none)
 
 ## 🟡 Prioritize (next, unblocked)
 
@@ -51,7 +49,9 @@ later, **Blockers** = needs an external resource or decision.
 
 ## Recently completed
 
-v0.1.0 shipped · M1 interpreter · M2 grammar export · M3 JSON AST + source maps ·
+v0.2.0 shipped · **Linux x86_64 musl static artifact via CI** (release
+workflow builds + verifies + attaches it; no Docker/cross needed on the dev
+host) · v0.1.0 shipped · M1 interpreter · M2 grammar export · M3 JSON AST + source maps ·
 M4 Python transpiler · §1.4 JavaScript + Ruby transpilers (3×3 byte-equal) · M5
 zero-dep release pipeline · dual license · token-density benchmark · **forked the
 Prompt Auditor to its own repo** · a four-lens multi-agent review (design,
