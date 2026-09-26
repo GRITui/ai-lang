@@ -46,6 +46,7 @@ fn print_help() {
          ainl eval <code>         evaluate a snippet\n  \
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
+         ainl ast <file> --json-out <f>  read a JSON AST back (inverse of --json)\n  \
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                start an interactive REPL\n  \
@@ -90,20 +91,57 @@ fn cmd_eval(code: &str) -> ExitCode {
 fn cmd_ast(rest: &[String]) -> ExitCode {
     let mut path: Option<&String> = None;
     let mut json = false;
-    for a in rest {
-        match a.as_str() {
+    let mut json_out: Option<&String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
             "--json" => json = true,
+            "--json-out" => {
+                let Some(f) = rest.get(i + 1) else {
+                    eprintln!("--json-out needs a file (JSON AST to read back)");
+                    return ExitCode::FAILURE;
+                };
+                json_out = Some(f);
+                i += 1;
+            }
             flag if flag.starts_with("--") => {
-                eprintln!("unknown flag '{flag}' (supported: --json)");
+                eprintln!("unknown flag '{flag}' (supported: --json, --json-out <file>)");
                 return ExitCode::FAILURE;
             }
-            _ => path = Some(a),
+            _ => path = Some(&rest[i]),
         }
+        i += 1;
     }
     let Some(path) = path else {
-        eprintln!("usage: ainl ast <file.ainl> [--json]");
+        eprintln!("usage: ainl ast <file.ainl> [--json] [--json-out <json-file>]");
         return ExitCode::FAILURE;
     };
+    // `--json-out` mode: read a JSON AST document back into a Node tree and
+    // print it (indented, with spans). This is the deserialization direction —
+    // the inverse of `--json` — and lets you verify a round trip:
+    //   ainl ast x.ainl --json > x.json
+    //   ainl ast x.ainl --json-out x.json   # must match `ainl ast x.ainl`
+    if let Some(json_path) = json_out {
+        let doc = match std::fs::read_to_string(json_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot read {json_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match ainl_core::json_to_forms(&doc) {
+            Ok(forms) => {
+                for form in &forms {
+                    print_node(form, 0);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {

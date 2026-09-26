@@ -39,7 +39,8 @@ ai-native-lang/
 **Phase 1 — the language — is complete.** AINL is implemented in Rust with zero external dependencies and:
 
 - **runs** — tree-walking interpreter (`run`/`eval`/`repl`),
-- **serializes** its AST to stable JSON with source-map spans (`ast --json`),
+- **serializes** its AST to stable JSON with source-map spans (`ast --json`)
+  and **reads it back** (`ast --json-out`), a lossless round trip,
 - **exports** a constrained-decoding grammar (`grammar`, GBNF/EBNF),
 - **transpiles** byte-equivalently to **Python, JavaScript, and Ruby** (`transpile --to`),
 - **ships** as a zero-dependency static binary (`scripts/build-release.sh`, see [docs/RELEASE.md](docs/RELEASE.md)).
@@ -113,6 +114,9 @@ cargo build --release
 
 # emit the AST as stable JSON with source-map loc (span + line/col per node)
 ./target/release/ainl ast examples/fib.ainl --json
+
+# read a JSON AST back into the AST (inverse of --json; round-trip check)
+./target/release/ainl ast examples/fib.ainl --json-out fib.json
 
 # project AINL into runnable, readable Python (bidirectional interop, §1.4)
 ./target/release/ainl transpile examples/fib.ainl --to python

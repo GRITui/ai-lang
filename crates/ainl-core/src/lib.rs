@@ -4,6 +4,7 @@
 //! [`eval`] runtime [`Value`]. Zero external dependencies so the runtime can be
 //! packaged as a static, zero-dependency binary (see docs/MASTER_PLAN.md §1.2).
 
+pub mod deserialize;
 pub mod error;
 pub mod eval;
 pub mod grammar;
@@ -12,6 +13,7 @@ pub mod parser;
 pub mod serialize;
 pub mod value;
 
+pub use deserialize::json_to_forms;
 pub use error::{Error, Result};
 pub use eval::Env;
 pub use grammar::{Dialect, GBNF};

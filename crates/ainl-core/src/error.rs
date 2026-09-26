@@ -10,6 +10,8 @@ pub enum Error {
     Lex { msg: String, at: usize },
     /// Parsing failure (e.g. unbalanced parens).
     Parse { msg: String, at: usize },
+    /// JSON AST deserialization failure (malformed document) with a byte offset.
+    Json { msg: String, at: usize },
     /// Runtime failure (unbound symbol, arity, type mismatch, user `error`).
     Runtime(String),
 }
@@ -25,6 +27,7 @@ impl fmt::Display for Error {
         match self {
             Error::Lex { msg, at } => write!(f, "lex error at byte {at}: {msg}"),
             Error::Parse { msg, at } => write!(f, "parse error at byte {at}: {msg}"),
+            Error::Json { msg, at } => write!(f, "json error at byte {at}: {msg}"),
             Error::Runtime(msg) => write!(f, "runtime error: {msg}"),
         }
     }

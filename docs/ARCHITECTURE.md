@@ -56,6 +56,17 @@ primitive: a projected human-readable line maps back to the exact AINL bytes.
 The serializer is hand-written (no serde) to preserve the zero-dependency
 guarantee. Deterministic field order makes the output diffable in VCS.
 
+The interchange is **bidirectional**: `deserialize::json_to_forms` (crate API
+`json_to_forms`, CLI `ainl ast <file> --json-out <json>`) reads a stable JSON
+document back into a `Node` tree, recovering every node's exact byte `span`
+(`loc` is validated as a two-element non-negative array; it is a pure function
+of `span` + source, so it is not stored). Malformed documents — unknown node
+types, missing/extra fields, wrong value types, bad spans — are rejected
+rather than silently mis-parsed. `parse → to_json → from_json` is a lossless
+round trip, verified by `crates/ainl-core/tests/roundtrip.rs` for every file
+in `examples/` plus a suite exercising every node type and every builtin's
+call shape, with structural equality including spans.
+
 ### Transpiler plugins (M4, Python implemented)
 
 `ainl-transpile` projects the AST into traditional languages (master plan §1.4).
@@ -79,7 +90,6 @@ follow the same `Node`→`String` shape.
 
 ## Phase 1 roadmap hooks (not yet built)
 
-- JSON → AST deserialization (round-trip) so tools can author/rewrite AST as JSON.
 - JavaScript + Ruby transpiler targets (§1.4 rollout).
 - Release workflow targeting `*-unknown-linux-musl` for static binaries (M5).
 

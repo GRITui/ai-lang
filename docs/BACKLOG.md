@@ -13,15 +13,10 @@ later, **Blockers** = needs an external resource or decision.
 
 ## 🟡 Prioritize (next, unblocked)
 
-1. **JSON → AST round-trip (deserialization).** Hand-write a small JSON parser in
-   `ainl-core` so `ast --json` output can be read back into a `Node` tree.
-   Completes the §1.1 bidirectional-interop story; unblocks tools (and the
-   auditor) that author/rewrite AST as JSON. Verify: `parse → to_json →
-   from_json` round-trips equal.
-2. **Make the repo public** (optional) — so `cargo install --git` and the release
+1. **Make the repo public** (optional) — so `cargo install --git` and the release
    assets work for others, and so the auditor's CI can fetch `ainl-core` without
    a token.
-3. **Publish `ainl-core` to crates.io** — turns the auditor's git dependency into
+2. **Publish `ainl-core` to crates.io** — turns the auditor's git dependency into
    a normal versioned crate dependency and gives the language a real distribution
    channel. (Bigger commitment; do once the crate API feels stable.)
 
@@ -49,7 +44,12 @@ later, **Blockers** = needs an external resource or decision.
 
 ## Recently completed
 
-v0.2.0 shipped · **Linux x86_64 musl static artifact via CI** (release
+**JSON → AST round-trip (deserialization)** — hand-written zero-dependency JSON
+parser in `ainl-core` (`deserialize::json_to_forms`, CLI `ainl ast <file>
+--json-out <json>`); reads the stable JSON AST back into a `Node` tree with
+exact byte-span recovery; `parse → to_json → from_json` round-trips equal
+(structural equality including spans) for every example plus a full
+node-type/builtin suite. · v0.2.0 shipped · **Linux x86_64 musl static artifact via CI** (release
 workflow builds + verifies + attaches it; no Docker/cross needed on the dev
 host) · v0.1.0 shipped · M1 interpreter · M2 grammar export · M3 JSON AST + source maps ·
 M4 Python transpiler · §1.4 JavaScript + Ruby transpilers (3×3 byte-equal) · M5
