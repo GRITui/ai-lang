@@ -83,7 +83,16 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                         Some((_, 'r')) => text.push('\r'),
                         Some((_, '\\')) => text.push('\\'),
                         Some((_, '"')) => text.push('"'),
-                        Some((_, other)) => text.push(other),
+                        Some((_, '/')) => text.push('/'),
+                        Some((_, other)) => {
+                            // Only \" \\ \/ \n \r \t are valid (see the GBNF
+                            // `string` rule). Anything else is a silent-data-
+                            // corruption bug, so reject it explicitly.
+                            return Err(Error::Lex {
+                                msg: format!("invalid escape '\\{}'", other),
+                                at: j,
+                            });
+                        }
                         None => {
                             return Err(Error::Lex {
                                 msg: "unterminated escape".into(),
@@ -121,4 +130,66 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
         }
     }
     Ok(toks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lex_str(src: &str) -> Result<String> {
+        // Lex a single string literal and return its unescaped text.
+        let toks = lex(src)?;
+        match toks.into_iter().next() {
+            Some(Tok::Str { text, .. }) => Ok(text),
+            other => Err(Error::Lex {
+                msg: format!("expected one Str token, got {:?}", other),
+                at: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn valid_escapes_unescape() {
+        assert_eq!(lex_str(r#""a\nb""#).unwrap(), "a\nb");
+        assert_eq!(lex_str(r#""a\tb""#).unwrap(), "a\tb");
+        assert_eq!(lex_str(r#""a\rb""#).unwrap(), "a\rb");
+        assert_eq!(lex_str(r#""a\\b""#).unwrap(), "a\\b");
+        assert_eq!(lex_str(r#""a\"b""#).unwrap(), "a\"b");
+        assert_eq!(lex_str(r#""a\/b""#).unwrap(), "a/b");
+    }
+
+    #[test]
+    fn invalid_escape_is_rejected() {
+        // \q is not a valid escape — must error, not silently become "q".
+        let err = lex_str(r#""a\qb""#).unwrap_err();
+        match err {
+            Error::Lex { msg, .. } => assert!(msg.contains("invalid escape"), "{msg}"),
+            other => panic!("expected Lex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_invalid_letter_escape_is_rejected() {
+        // Only \" \\ \/ \n \r \t are valid; every other letter must error.
+        // (n, r, t are valid — excluded from this set.)
+        for ch in "abcdefghijklmopqsuvwxyzABCDEFGHIJKLMOPQSUVWXYZ".chars() {
+            let src = format!(r#""a\{}b""#, ch);
+            assert!(
+                matches!(lex_str(&src), Err(Error::Lex { .. })),
+                "escape \\{} should be rejected, but was accepted",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_escape_still_errors() {
+        // A backslash as the very last character: the escape has no body.
+        assert!(matches!(lex_str(r#""a\"#), Err(Error::Lex { .. })));
+    }
+
+    #[test]
+    fn plain_string_unchanged() {
+        assert_eq!(lex_str(r#""hello, world""#).unwrap(), "hello, world");
+    }
 }

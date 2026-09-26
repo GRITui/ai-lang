@@ -20,7 +20,7 @@ atom      ::= int | float | string | symbol
 int       ::= "-"? digit+
 float     ::= "-"? digit+ ("." digit+)? (("e"|"E") "-"? digit+)?   ; must contain "." or "e"
 string    ::= '"' ( char | escape )* '"'
-escape    ::= "\\" ("n"|"t"|"r"|'"'|"\\")
+escape    ::= "\\" ("n"|"t"|"r"|"\""|"\\"|"/")   ; any other backslash-letter is a lexer error
 symbol    ::= any run of non-whitespace chars except ( ) " ;   (that is not a number)
 comment   ::= ";" ... end-of-line          ; ignored
 ```
@@ -156,17 +156,49 @@ counter                                    ; => 0
 ## 6. Constrained decoding
 
 The grammar above is regular enough to express directly as GBNF/EBNF for
-grammar-constrained decoding (llama.cpp GBNF, Outlines, etc.). A minimal GBNF:
+grammar-constrained decoding (llama.cpp GBNF, Outlines, etc.). The canonical
+GBNF is exported by `ainl grammar` (source of truth: `crates/ainl-core/src/grammar.rs`):
 
 ```gbnf
-root    ::= form+
-form    ::= "(" ws form* ")" ws | atom ws
-atom    ::= string | number | symbol
-string  ::= "\"" ([^"\\] | "\\" .)* "\""
-number  ::= "-"? [0-9]+ ("." [0-9]+)?
-symbol  ::= [a-zA-Z0-9+\-*/<>=!?._-]+
-ws      ::= [ \t\n]*
+root    ::= ws form (ws form)* ws
+form    ::= list | atom
+list    ::= "(" ws (form ws)* ")"
+atom    ::= (string | number | symbol) ws
+string  ::= "\"" ( [^"\\] | "\\" ["\\/nrt] )* "\""
+number  ::= "-"? [0-9]+ ( "." [0-9]+ )? ( [eE] "-"? [0-9]+ )?
+symbol  ::= sym-char+
+sym-char ::= [a-zA-Z0-9] | "+" | "-" | "*" | "/" | "<" | ">" | "=" | "!" | "?" | "." | "_" | "&"
+ws      ::= ( [ \t\n\r] | comment )*
+comment ::= ";" [^\n]* "\n"
 ```
 
 A grammar-constrained decoder using this grammar can only produce AINL that
 parses — which is what makes the language a reliable generation target.
+
+### Grammar vs. parser (the GBNF is a strict subset)
+
+The exported GBNF is a **conservative subset** of what the parser accepts:
+every string the GBNF accepts is valid AINL, but the parser accepts a few
+shapes the GBNF deliberately does not generate. This is the safe direction —
+a constrained decoder can never emit something that fails to parse. The known
+superset cases (parser accepts, GBNF rejects):
+
+- **Empty / whitespace-only programs.** The GBNF's `root` requires at least
+  one form; the parser accepts `""` and whitespace-only input. A decoder
+  never needs to emit an empty program, so the GBNF stays conservative.
+
+Two earlier "drift" reports were investigated and resolved:
+
+- *No whitespace between forms* (`(+ 1(+ 2 3))`): **not a real gap.** That
+  string is a single list (one top-level form), and `ws` may be empty, so the
+  GBNF always accepted it. The parser and GBNF agree.
+- *Whitespace-separated top-level forms* (`(def x 1)\n(print x)`): this was a
+  **real GBNF defect** — the old `root ::= ws form (form)* ws` could not place
+  whitespace after a list-form, so it rejected every multi-form program (all
+  the examples in §4). It is fixed by `root ::= ws form (ws form)* ws`, which
+  allows optional whitespace before each subsequent top-level form.
+
+This is pinned by `scripts/gbnf-conformance.py` (run in CI): it parses the
+exported GBNF with a real GBNF parser (llguidance), fuzzes ≥1000 strings the
+grammar accepts and asserts every one parses with `ainl ast`, and cross-checks
+the walker against an independent pure-Python GBNF acceptor.

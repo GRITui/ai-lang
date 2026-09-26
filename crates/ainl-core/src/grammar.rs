@@ -9,7 +9,7 @@
 /// to force valid AINL output.
 pub const GBNF: &str = r#"# AINL v0.1 — GBNF grammar for constrained decoding.
 # Every string this grammar accepts is a syntactically valid AINL program.
-root    ::= ws form (form)* ws
+root    ::= ws form (ws form)* ws
 form    ::= list | atom
 list    ::= "(" ws (form ws)* ")"
 atom    ::= (string | number | symbol) ws
