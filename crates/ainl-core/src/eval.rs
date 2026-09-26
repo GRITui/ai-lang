@@ -706,8 +706,8 @@ fn builtin_hash(args: &[Value]) -> Result<Value> {
         )));
     }
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(args.len() / 2);
-    for kv in args.chunks_exact(2) {
-        let (k, v) = (kv[0].clone(), kv[1].clone());
+    for i in (0..args.len()).step_by(2) {
+        let (k, v) = (args[i].clone(), args[i + 1].clone());
         match pairs.iter_mut().find(|(ek, _)| *ek == k) {
             Some((_, ev)) => *ev = v,
             None => pairs.push((k, v)),
