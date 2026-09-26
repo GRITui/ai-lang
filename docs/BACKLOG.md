@@ -1,8 +1,8 @@
 # Backlog & priorities — the language
 
-This project is now **language + toolchain only**. The Prompt Auditor was forked
-to **[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)**; its backlog
-(real model wiring, retry loop, GUI, MCP providers) lives there.
+This project is now **language + toolchain only**. The Prompt Auditor was spun
+out to its own (currently private) repository; its backlog (real model wiring,
+retry loop, GUI, MCP providers) lives there.
 
 **Prioritize** = do next (high value, unblocked), **Backlog** = valuable but
 later, **Blockers** = needs an external resource or decision.

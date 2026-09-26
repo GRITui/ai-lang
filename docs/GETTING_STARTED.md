@@ -127,9 +127,9 @@ ainl grammar --ebnf   # EBNF
 ```
 
 Feed the GBNF to a constrained decoder (llama.cpp, Outlines, …) and a model can
-only emit syntactically valid AINL. This is the backbone of the separate
-[Prompt Auditor](https://github.com/GRITui/ainl-auditor) project, which pipelines
-local models to compile natural language into a validated AINL schema.
+only emit syntactically valid AINL. This is the backbone of the separate Prompt Auditor project (spun out to its
+own, currently private repository), which pipelines local models to compile
+natural language into a validated AINL schema.
 
 ## Where to go next
 

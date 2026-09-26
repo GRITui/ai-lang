@@ -85,8 +85,8 @@ follow the same `Node`→`String` shape.
 
 ## Prompt Auditor — separate project
 
-The multi-model Prompt Auditor that generates AINL from natural language now
-lives in its own repository: **[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor)**.
+The multi-model Prompt Auditor that generates AINL from natural language has
+been spun out to its own repository, which is currently private.
 It consumes this project — the Auditor stage emits AINL under the exported GBNF
 grammar and validates it with `ainl-core`'s parser — but is developed and
 released independently. Nothing in `ai-lang` depends on it.

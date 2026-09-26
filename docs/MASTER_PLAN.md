@@ -34,9 +34,9 @@ language optimized for LLM context windows rather than human readability.
 ## A natural-language front end (separate project)
 
 The original plan had a second phase — a tool to compile natural language into
-AINL. That has been built and **spun out into its own repository**:
-[GRITui/ainl-auditor](https://github.com/GRITui/ainl-auditor). It consumes this
-project (`ainl-core`) as a crate and is developed independently. This plan now
+AINL. That has been built and **spun out into its own repository** (currently
+private). It consumes this project (`ainl-core`) as a crate and is developed
+independently. This plan now
 covers the language + toolchain only.
 
 ---
