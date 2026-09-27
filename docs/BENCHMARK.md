@@ -1,5 +1,8 @@
 # Token-density benchmark — results & honest analysis
 
+> This doc is **token-density only**. For execution speed (interpreter timing +
+> the 2M step-cap finding), see [docs/PERFORMANCE.md](PERFORMANCE.md).
+
 **Run it:** `python3 bench/bench.py` (needs `tiktoken`).
 
 The project's founding claim is that AINL is *"high-density… optimized for LLM

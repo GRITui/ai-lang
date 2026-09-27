@@ -26,7 +26,8 @@ ai-native-lang/
 ├── docs/
 │   ├── MASTER_PLAN.md    # full two-phase project plan
 │   ├── SYNTAX.md         # the AI-ingestion grammar guide (feed this to any model)
-│   └── ARCHITECTURE.md   # how the pieces fit together
+│   ├── ARCHITECTURE.md   # how the pieces fit together
+│   └── PERFORMANCE.md    # execution speed (interpreter) + the 2M step-cap finding
 ├── crates/
 │   ├── ainl-core/        # lexer + parser + AST + evaluator (Rust, zero deps)
 │   └── ainl-cli/         # the `ainl` binary: run / repl / fmt / ast
