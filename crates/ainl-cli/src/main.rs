@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(args.get(1)),
         Some("eval") => cmd_eval(&args[1..].join(" ")),
         Some("ast") => cmd_ast(&args[1..]),
+        Some("compile") => cmd_compile(&args[1..]),
         Some("transpile") => cmd_transpile(&args[1..]),
         Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(),
@@ -47,6 +48,7 @@ fn print_help() {
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
          ainl ast <file> --json-out <f>  read a JSON AST back (inverse of --json)\n  \
+         ainl compile <file.ainl> -o <out>   AOT-compile to a standalone C binary (via cc)\n  \
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                start an interactive REPL\n  \
@@ -182,6 +184,103 @@ fn print_node(node: &Node, depth: usize) {
             for it in items {
                 print_node(it, depth + 1);
             }
+        }
+    }
+}
+
+fn cmd_compile(rest: &[String]) -> ExitCode {
+    let mut path: Option<&String> = None;
+    let mut out: Option<&String> = None;
+    let mut c_only = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "-o" => {
+                let Some(o) = rest.get(i + 1) else {
+                    eprintln!("-o needs an output path");
+                    return ExitCode::FAILURE;
+                };
+                out = Some(o);
+                i += 2;
+            }
+            "--c-only" => {
+                c_only = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag '{flag}' (supported: -o <file>, --c-only)");
+                return ExitCode::FAILURE;
+            }
+            _ => {
+                path = Some(&rest[i]);
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: ainl compile <file.ainl> -o <out> [--c-only]");
+        return ExitCode::FAILURE;
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let forms = match ainl_core::parse(&src) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let c = ainl_cc::generate(&forms);
+    if c_only {
+        match out {
+            Some(o) => {
+                if let Err(e) = std::fs::write(o, c) {
+                    eprintln!("cannot write {o}: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!("wrote {o}");
+            }
+            None => print!("{c}"),
+        }
+        return ExitCode::SUCCESS;
+    }
+    let out = match out {
+        Some(o) => o.clone(),
+        None => {
+            eprintln!("usage: ainl compile <file.ainl> -o <out>");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Write the generated .c next to the output binary, then invoke cc.
+    let stem = std::path::Path::new(&out)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ainl_prog".to_string());
+    let c_path = format!("{stem}.c");
+    if let Err(e) = std::fs::write(&c_path, &c) {
+        eprintln!("cannot write {c_path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let status = std::process::Command::new("cc")
+        .args(["-O2", "-o", &out, &c_path])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("compiled {path} -> {out}");
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("cc failed with {s}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("failed to run cc: {e}");
+            ExitCode::FAILURE
         }
     }
 }

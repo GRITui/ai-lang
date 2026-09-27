@@ -4,6 +4,7 @@ members = [
     "crates/ainl-core",
     "crates/ainl-transpile",
     "crates/ainl-cli",
+    "crates/ainl-cc",
 ]
 
 [workspace.package]

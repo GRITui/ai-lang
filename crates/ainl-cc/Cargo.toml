@@ -1,0 +1,9 @@
+[package]
+name = "ainl-cc"
+description = "AOT compiler for the AI-Native Language (AINL): AST -> C -> cc. Zero external dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ainl-core = { path = "../ainl-core" }
