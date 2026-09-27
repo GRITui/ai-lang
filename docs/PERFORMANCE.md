@@ -84,6 +84,38 @@ runners don't flake). An iterative `Drop` for `ConsCell` keeps dropping a long
 list off the stack (the derived drop would recurse once per cell and overflow a
 small test thread's stack).
 
+## Bytecode VM (2026-09-27)
+
+A bytecode compiler + stack machine was added to `ainl-core`
+(`src/code.rs` = `Instr` + self-contained `FnCode`, `src/vm.rs` = compiler +
+dispatch loop). `run`/`run_str`/`run_in` now route through the VM; the
+tree-walking evaluator is retained as `run_in_tree_walk` for comparison and
+fallback. Semantics are identical — the full test suite (88 tests, including
+the recursion/step-limit and `LIVE_SCOPES` memory tests) passes unchanged, and
+there are zero new dependencies.
+
+Design (settled by the PO): flat dispatch loop, O(1) dense local slots (hot
+variables resolve to fixed slot indices, no `HashMap`), an explicit frame stack
+(recursion is a data operation, not native call-stack recursion), and a local
+step counter that replaces the tree-walk's thread-local `tick()`. A per-function
+`env_active` flag means a closure-free hot loop never touches the `Env`
+`HashMap` at all. Malformed special forms (wrong arity, non-symbol `def` name,
+…) are compile-time errors — the compiler returns `Err` rather than emitting a
+runtime-error instruction.
+
+Measured on the 40,000-iteration sum-to loop, release build, best of 3
+(`crates/ainl-core/tests/vm_perf.rs`):
+
+| Runtime | 40k sum-to loop | Speedup |
+|---|---|---|
+| AINL tree-walk | ~35 ms | 1.0× |
+| AINL bytecode VM | ~5.8 ms | **~6×** |
+
+The gate is ≥5× over tree-walk; the VM lands at ~6×. The single largest win was
+eliminating a per-`LoadSlot` `String` clone (160,000 heap allocations in the
+benchmark); the rest came from dense slots, a precomputed slot-name-symbol pool
+for `def`, and inlined integer fast paths for `+` and `<`.
+
 ## The step-cap finding (the important part)
 
 `MAX_STEPS = 2_000_000` in `crates/ainl-core/src/eval.rs` (line ~32) is a
