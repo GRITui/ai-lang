@@ -1,0 +1,25 @@
+```python
+import numpy as np
+
+ainl = """
+# AINL Program
+# Author: [Your Name]
+# Date: [Today's Date]
+# Purpose: Print the first element of the list 10 20 30
+# Description: This program uses the NumPy library to create a list and then access its first element.
+#              The first element is 10.
+
+# Import the NumPy library
+import numpy as np
+
+# Create a list with 3 elements
+my_list = [10, 20, 30]
+
+# Access the first element of the list
+first_element = my_list[0]
+
+# Print the first element
+print(first_element)
+"""
+```
+

@@ -1,0 +1,7 @@
+```python
+def max2(a, b):
+    print(max(a, b))
+
+max2(7, 9)
+```
+

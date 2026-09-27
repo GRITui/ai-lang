@@ -1,0 +1,15 @@
+```adinl
+import { map } from 'adinl';
+
+const map = map();
+
+map.bind('name', 'Ada');
+
+function printName() {
+  const name = map.get('name');
+  console.log(name);
+}
+
+printName();
+```
+

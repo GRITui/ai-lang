@@ -1,0 +1,338 @@
+[
+  {
+    "index": 0,
+    "id": "sum-2-3",
+    "prompt": "Write an AINL program that prints the sum of 2 and 3. Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "5",
+    "constrained": {
+      "generated": "**AINL Program**\nprint(2 + 3)\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '**AINL'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```\nAINL Program:\nprint(2 + 3)\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```'",
+      "correct": false
+    }
+  },
+  {
+    "index": 1,
+    "id": "print-42",
+    "prompt": "Write an AINL program that prints the number 42. Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "42",
+    "constrained": {
+      "generated": "print(42)\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: cannot call a int",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```\nAINL program to print 42\nprint(42)\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```'",
+      "correct": false
+    }
+  },
+  {
+    "index": 2,
+    "id": "hello",
+    "prompt": "Write an AINL program that prints the string \"hello, world\". Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "hello, world",
+    "constrained": {
+      "generated": "print(\"hello, world\")\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: cannot call a str",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```\nAINL program to print \"hello, world\"\nprint(\"hello, world\")\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```'",
+      "correct": false
+    }
+  },
+  {
+    "index": 3,
+    "id": "sq-12",
+    "prompt": "Write an AINL program that defines a function sq that squares its argument, then prints (sq 12). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "144",
+    "constrained": {
+      "generated": "def sq(x) -> int or float or str or None or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes or complex or str or bytes or dict or tuple or list or set or dict or bytes\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'def'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef sq(x):\n    print(x**2)\n\nsq(12)\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 4,
+    "id": "fib-10",
+    "prompt": "Write an AINL program that computes and prints the 10th fibonacci number (fib 0 = 0, fib 1 = 1). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "55",
+    "constrained": {
+      "generated": "Fib(10) = 0 + 1 = 1\nFib(11) = 1 + 1 = 2\nFib(12) = 2 + 1 = 3\nFib(13) = 3 + 2 = 5\nFib(14) = 5 + 3 = 8\nFib(15) = 8 + 5 = 13\nFib(16) = 13 + 8 = 21\nFib(17) = 21 + 13 = 34\nFib(18) = 34 + 21 = 55\nFib(19) = 55 + 34 = 89\nFib(20) = 89 + 55 = 144\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'Fib'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef fib(n):\n    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        fib_prev = 0\n        fib_curr = 1\n        for _ in range(2, n):\n            fib_next = fib_prev + fib_curr\n            fib_prev = fib_curr\n            fib_curr = fib_next\n        return fib_curr\n\ndef main():\n    print(fib(10))\n\nif __name__ == \"__main__\":\n    main()\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 5,
+    "id": "fact-5",
+    "prompt": "Write an AINL program that defines a function fact that computes the factorial of n, then prints (fact 5). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "120",
+    "constrained": {
+      "generated": "fact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = n * fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = n * fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  # prints 120\nfact = lambda n = 0; fact(n) = fact(n) + fact(n-1); print(fact(5))  #\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'fact'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef fact(n):\n    if n == 0:\n        return 1\n    else:\n        return n * fact(n-1)\n\nprint(fact(5))\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 6,
+    "id": "max2-7-9",
+    "prompt": "Write an AINL program that defines a function max2 that returns the larger of two numbers, then prints (max2 7 9). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "9",
+    "constrained": {
+      "generated": "def max2(a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a1=0.0a\n\n",
+      "gbnf_member": false,
+      "parse_ok": false,
+      "parse_err": "parse error at byte 8: unclosed '('",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "parse error at byte 8: unclosed '('",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef max2(a, b):\n    print(max(a, b))\n\nmax2(7, 9)\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 7,
+    "id": "len-5",
+    "prompt": "Write an AINL program that prints the length of the list (list 1 2 3 4 5). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "5",
+    "constrained": {
+      "generated": "def print_list_length(lst) -> None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None or str or None or None\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'def'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef print_list_length():\n    lst = [1, 2, 3, 4, 5]\n    print(len(lst))\n\nprint_list_length()\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 8,
+    "id": "first-10",
+    "prompt": "Write an AINL program that prints the first element of the list (list 10 20 30). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "10",
+    "constrained": {
+      "generated": "10 20 30\nprint(list(10).pop(0))\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: cannot call a int",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\nimport numpy as np\n\nainl = \"\"\"\n# AINL Program\n# Author: [Your Name]\n# Date: [Today's Date]\n# Purpose: Print the first element of the list 10 20 30\n# Description: This program uses the NumPy library to create a list and then access its first element.\n#              The first element is 10.\n\n# Import the NumPy library\nimport numpy as np\n\n# Create a list with 3 elements\nmy_list = [10, 20, 30]\n\n# Access the first element of the list\nfirst_element = my_list[0]\n\n# Print the first element\nprint(first_element)\n\"\"\"\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  },
+  {
+    "index": 9,
+    "id": "double-1-2-3",
+    "prompt": "Write an AINL program that defines a function that doubles each element of a list, then prints it applied to (list 1 2 3). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "(2 4 6)",
+    "constrained": {
+      "generated": "def double_list(lst) -> list or None or str or None or tuple or None or str or None or list or None or str or None or dict or None or str or None or set or None or str or None or int or None or str or None or float or None or str or None or bool or None or str or None or tuple or None or str or None or list or None or str or None or dict or None or str or None or set or None or str or None or int or None or str or None or float or None or str or None or bool or None or str or None or tuple or None or str or None or list or None or str or None or dict or None or str or None or set or None or str or None or int or None or str or None or float or None or str or None or bool or None or str or None or tuple or None or str or None or list or None or str or None or dict or None or str or None or set or None or str or None or int or None or str or None or float or None or str or None or bool or None or str or None or tuple or None or str or None or list or None or str or None or dict or\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'def'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": true,
+      "run_exit": 0,
+      "run_out": "",
+      "run_err": "",
+      "correct": false
+    }
+  },
+  {
+    "index": 10,
+    "id": "map-ada",
+    "prompt": "Write an AINL program that builds a map with key \"name\" bound to \"Ada\", then prints (get user \"name\"). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "Ada",
+    "constrained": {
+      "generated": "name = \"Ada\"\nprint(get(user(name)))\n\n",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol 'name'",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```adinl\nimport { map } from 'adinl';\n\nconst map = map();\n\nmap.bind('name', 'Ada');\n\nfunction printName() {\n  const name = map.get('name');\n  console.log(name);\n}\n\nprintName();\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```adinl'",
+      "correct": false
+    }
+  },
+  {
+    "index": 11,
+    "id": "last-1-2-3-4",
+    "prompt": "Write an AINL program that defines a function that returns the last element of a list, then prints it for (list 1 2 3 4). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "expected": "4",
+    "constrained": {
+      "generated": "\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": true,
+      "run_exit": 0,
+      "run_out": "",
+      "run_err": "",
+      "correct": false
+    },
+    "unconstrained": {
+      "generated": "```python\ndef last_element(lst):\n    print(lst[-1])\n\nlast_element([1, 2, 3, 4])\n```\n\n",
+      "gbnf_member": false,
+      "parse_ok": true,
+      "parse_err": "",
+      "run_ok": false,
+      "run_exit": 1,
+      "run_out": "",
+      "run_err": "runtime error: unbound symbol '```python'",
+      "correct": false
+    }
+  }
+]
