@@ -26,10 +26,10 @@ thread_local! {
 /// Kept well below where a native stack overflow could occur even on a
 /// constrained thread stack (e.g. `cargo test`'s worker threads default to a
 /// couple MiB, smaller than a typical main-thread stack).
-const MAX_DEPTH: usize = 512;
+pub(crate) const MAX_DEPTH: usize = 512;
 /// Max total `eval` invocations per top-level `run_str`/`run_in` call — bounds
 /// unbounded loops (`while true`) and runaway iteration generally.
-const MAX_STEPS: u64 = 2_000_000;
+pub(crate) const MAX_STEPS: u64 = 2_000_000;
 
 /// Reset the step budget for a fresh top-level run. Depth is guaranteed back
 /// at 0 between runs (the RAII guard below always decrements on the way out,
@@ -163,7 +163,7 @@ impl Env {
     /// scope's body has finished evaluating and nothing in its result still
     /// needs it (see `apply` and `sf_let`), so this never removes bindings a
     /// live closure could still look up.
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         self.0.vars.borrow_mut().clear();
     }
 }
@@ -171,7 +171,7 @@ impl Env {
 /// True if some closure reachable from `val` (directly, or nested inside a
 /// list) was defined in `env` or in a scope that has `env` as an ancestor —
 /// i.e. `env`'s bindings are still needed by something the caller now holds.
-fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
+pub(crate) fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
     match val {
         Value::Closure(c) => env.is_ancestor_of(&c.env),
         Value::List(items) => {
@@ -352,6 +352,7 @@ fn sf_fn(args: &[Node], env: &Env) -> Result<Value> {
         variadic,
         body: body.to_vec(),
         env: env.clone(),
+        code: None,
     })))
 }
 
@@ -548,7 +549,7 @@ fn arg1(a: &[Value]) -> Result<&Value> {
         .ok_or_else(|| Error::runtime("expected 1 argument"))
 }
 
-fn as_f64(v: &Value) -> Result<f64> {
+pub(crate) fn as_f64(v: &Value) -> Result<f64> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(x) => Ok(*x),
@@ -561,7 +562,7 @@ fn as_f64(v: &Value) -> Result<f64> {
 
 /// Fold numeric args, staying in integer arithmetic until a float appears (or
 /// an integer op overflows), matching typical dynamic-language semantics.
-fn numeric_fold(
+pub(crate) fn numeric_fold(
     args: &[Value],
     _f_id: f64,
     i_id: i64,
@@ -600,7 +601,7 @@ fn numeric_fold(
     }
 }
 
-fn builtin_sub(args: &[Value]) -> Result<Value> {
+pub(crate) fn builtin_sub(args: &[Value]) -> Result<Value> {
     match args {
         [] => Err(Error::runtime("- expects at least 1 argument")),
         [one] => match one {
@@ -653,7 +654,7 @@ fn float_sub(first: &Value, rest: &[Value]) -> Result<Value> {
     Ok(Value::Float(acc))
 }
 
-fn builtin_div(args: &[Value]) -> Result<Value> {
+pub(crate) fn builtin_div(args: &[Value]) -> Result<Value> {
     let [first, rest @ ..] = args else {
         return Err(Error::runtime("/ expects at least 1 argument"));
     };
@@ -671,7 +672,7 @@ fn builtin_div(args: &[Value]) -> Result<Value> {
     Ok(Value::Float(acc))
 }
 
-fn builtin_mod(args: &[Value]) -> Result<Value> {
+pub(crate) fn builtin_mod(args: &[Value]) -> Result<Value> {
     let [Value::Int(a), Value::Int(b)] = args else {
         return Err(Error::runtime("mod expects (mod int int)"));
     };
@@ -687,7 +688,7 @@ fn builtin_mod(args: &[Value]) -> Result<Value> {
     Ok(Value::Int(a.rem_euclid(*b)))
 }
 
-fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> Result<Value> {
+pub(crate) fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> Result<Value> {
     for w in args.windows(2) {
         let a = as_f64(&w[0])?;
         let b = as_f64(&w[1])?;

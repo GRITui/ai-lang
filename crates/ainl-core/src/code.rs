@@ -1,14 +1,31 @@
 //! Bytecode for the AINL stack machine.
 //!
 //! The compiler (`vm::compile`) lowers the AST (`Node`) into a flat
-//! `Vec<Instr>` plus a constant pool, a name pool, and a table of nested
-//! function bodies. The VM (`vm::run`) executes the code on an operand stack
-//! with an explicit frame stack, so recursion is a data operation rather than
-//! native call-stack recursion — the core of the speedup over the tree-walk.
+//! `Vec<Instr>` plus per-function constant / name / local pools. The VM
+//! (`vm::run`) executes the code on an operand stack with an explicit frame
+//! stack, so recursion is a data operation rather than native call-stack
+//! recursion — a core part of the speedup over the tree-walk.
 //!
-//! Every call (builtin or user function) is compiled to `Load(head)` + args +
-//! `Call(n)`, dispatching to the *same* builtin function pointers the
-//! tree-walking evaluator uses, so semantics are identical by construction.
+//! Each [`FnCode`] is self-contained: it carries its own constant pool, name
+//! pool, nested-function table, and local-slot table. That makes a compiled
+//! closure portable across `run_in` calls (a closure created in one run can be
+//! invoked in a later run), which the `LIVE_SCOPES` escaping-closure test
+//! requires.
+//!
+//! Variable access has two paths:
+//! - **Local slots** (`LoadSlot`/`DefSlot`): hot-loop variables are resolved to
+//!   fixed slot indices (a `Vec<Value>` in the frame), so the common case is an
+//!   O(1) array access with no `HashMap`. `DefSlot` also writes the value into
+//!   the frame's [`Env`], keeping the lexical scope in sync so closures can
+//!   capture it and the `LIVE_SCOPES` cycle-breaking works.
+//! - **Env lookups** (`Load`/`Def`): non-local variables go through the
+//!   existing tree-walk [`Env`] (the same `HashMap`-backed lexical scope the
+//!   tree-walking evaluator uses).
+//!
+//! The common builtins (`+ - * / mod = < > <= >= not`) are inlined as dedicated
+//! instructions that call the *same* helper functions the tree-walk's builtins
+//! use, so their semantics are identical by construction and the hot loop avoids
+//! the head-eval + arg-`Vec` + `apply` dispatch the tree-walk pays per call.
 //!
 //! This is the fast execution path. The tree-walking evaluator in `eval.rs` is
 //! retained as a fallback and as the semantic reference the VM is checked
@@ -17,9 +34,9 @@
 use crate::value::Value;
 use std::rc::Rc;
 
-/// A single bytecode instruction. Operands are indices into the `Code`'s
-/// constant pool, name pool, function table, or bytecode offsets (jump
-/// targets).
+/// A single bytecode instruction. Operands are indices into the owning
+/// [`FnCode`]'s pools (constants, names, locals, nested functions) or bytecode
+/// offsets (jump targets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instr {
     // --- constants & literals ---
@@ -30,13 +47,47 @@ pub enum Instr {
     /// Push the boolean `b`.
     Bool(bool),
 
-    // --- variables (lexical scoping via the `Env` parent chain) ---
-    /// Push the value bound to `names[idx]` in the current env (cloned).
+    // --- local-slot access (O(1) array, no HashMap) ---
+    /// Push the value in local slot `slot` (cloned). Errors if unbound,
+    /// matching the tree-walk's `unbound symbol` error.
+    LoadSlot(usize),
+    /// Pop a value, store it in local slot `slot` *and* bind `locals[slot]` in
+    /// the frame's `Env`, then push the symbol `locals[slot]` — matching
+    /// `sf_def`'s return value.
+    DefSlot(usize),
+
+    // --- env access (non-local variables) ---
+    /// Push the value bound to `names[idx]` in the frame's `Env` (cloned).
     /// Errors if unbound, matching the tree-walk's `unbound symbol` error.
     Load(usize),
-    /// Pop a value, bind it to `names[idx]` in the current env, then push the
-    /// symbol `names[idx]` — matching `sf_def`'s return value (the name).
+    /// Pop a value, bind it to `names[idx]` in the frame's `Env`, then push the
+    /// symbol `names[idx]` — matching `sf_def`'s return value.
     Def(usize),
+
+    // --- inlined numeric ops ---
+    /// Pop 2 (a, b), push `a + b`.
+    Add,
+    /// Pop 2 (a, b), push `a - b`.
+    Sub,
+    /// Pop 2 (a, b), push `a * b`.
+    Mul,
+    /// Pop 2 (a, b), push `a / b` (float).
+    Div,
+    /// Pop 2 (a, b), push `a mod b` (int).
+    Mod,
+    /// Pop 1 (a), push `-a`.
+    Neg,
+    /// Pop 1 (a), push `1 / a` (float).
+    Recip,
+
+    // --- inlined comparisons (pop 2, push bool) ---
+    CmpLt,
+    CmpGt,
+    CmpLe,
+    CmpGe,
+    CmpEq,
+    /// Pop 1, push `!truthy`.
+    Not,
 
     // --- control flow ---
     /// Unconditional jump to bytecode offset `target`.
@@ -47,7 +98,7 @@ pub enum Instr {
     JumpIfTrue(usize),
 
     // --- functions ---
-    /// Push a closure for `fns[idx]`, capturing the current env.
+    /// Push a closure for `fns[idx]`, capturing the current frame's env.
     MakeFn(usize),
     /// Pop `n` args (top = last) and the callee (below them); push the result.
     /// Dispatches to builtins (function pointer) or closures (new frame).
@@ -58,44 +109,77 @@ pub enum Instr {
     // --- stack plumbing ---
     /// Pop and discard the top value.
     Pop,
-    /// Swap the top two values.
-    Swap,
     /// Duplicate the top value.
     Dup,
+    /// Swap the top two values.
+    Swap,
+
+    // --- error ---
+    /// Return a runtime error with the message `consts[idx]`.
+    RuntimeErr(usize),
 }
 
-/// A named function's compiled body.
+/// A compiled function (or the top-level program). Self-contained: carries its
+/// own pools so a closure can be invoked in a later `run_in` call.
 #[derive(Debug, Clone)]
 pub struct FnCode {
-    /// Display name for diagnostics (`<top>` for the program, `<let>` for
-    /// let-scopes).
+    /// Display name for diagnostics (`<top>` for the program, the param list
+    /// for `fn`, `<let>` for let-scopes).
     pub name: String,
+    /// Parameter names, in order. These occupy local slots `0..params.len()`.
     pub params: Vec<String>,
     /// Optional rest-parameter name introduced by `&`.
     pub variadic: Option<String>,
+    /// The compiled body.
     pub body: Vec<Instr>,
-}
-
-/// A compiled program: top-level instructions plus the shared pools.
-#[derive(Debug, Clone)]
-pub struct Code {
-    /// Top-level instructions.
-    pub instrs: Vec<Instr>,
     /// Constant pool (literals: ints, floats, strings, quoted forms, …).
     pub consts: Vec<Value>,
-    /// Name pool (variable / function names), indexed by `Load`/`Def`.
+    /// Name pool for non-local (`Load`/`Def`) variable references.
     pub names: Vec<String>,
-    /// Function bodies, indexed by `MakeFn`'s operand.
+    /// Nested function bodies, indexed by `MakeFn`'s operand.
     pub fns: Vec<Rc<FnCode>>,
+    /// Local-slot table: `slot` -> variable name. Slots `0..params.len()` are
+    /// the params; the rest are variables `def`-bound in the body.
+    pub locals: Vec<String>,
+    /// Precomputed name symbol for each local slot (`Value::Sym`). `DefSlot`
+    /// pushes a clone of this (an `Rc` refcount bump, no heap allocation) to
+    /// match `sf_def`'s return value — precomputing it keeps the hot loop
+    /// allocation-free.
+    pub slot_syms: Vec<Value>,
+    /// True if this scope (or a descendant scope) contains a closure. When
+    /// true, `DefSlot`/param-binding sync the value into the frame's `Env` so
+    /// closures can look it up and the `LIVE_SCOPES` cycle-breaking works. When
+    /// false (no closures in the subtree), the hot loop skips all env updates.
+    pub env_active: bool,
 }
 
-impl Code {
-    pub fn new() -> Self {
-        Code {
-            instrs: Vec::new(),
+/// A compiled program is just the top-level [`FnCode`].
+pub type Code = FnCode;
+
+impl FnCode {
+    pub fn new(name: &str) -> Self {
+        FnCode {
+            name: name.to_string(),
+            params: Vec::new(),
+            variadic: None,
+            body: Vec::new(),
             consts: Vec::new(),
             names: Vec::new(),
             fns: Vec::new(),
+            locals: Vec::new(),
+            slot_syms: Vec::new(),
+            env_active: false,
         }
+    }
+
+    /// Rebuild the precomputed slot name symbols from `locals`. Called after
+    /// `locals` is finalized (at code emission) so `DefSlot` can push a name
+    /// symbol without a heap allocation in the hot loop.
+    pub fn sync_slot_syms(&mut self) {
+        self.slot_syms = self
+            .locals
+            .iter()
+            .map(|n| Value::Sym(Rc::new(n.clone())))
+            .collect();
     }
 }
