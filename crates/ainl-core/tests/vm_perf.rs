@@ -12,9 +12,7 @@ const N: i64 = 40_000;
 const EXPECTED: i64 = 799_980_000; // 0 + 1 + ... + 39999
 
 fn loop_src() -> String {
-    format!(
-        "(def i 0)\n(def s 0)\n(while (< i {N})\n  (def s (+ s i))\n  (def i (+ i 1)))\ns"
-    )
+    format!("(def i 0)\n(def s 0)\n(while (< i {N})\n  (def s (+ s i))\n  (def i (+ i 1)))\ns")
 }
 
 /// Warm up, then run `runs` times and return (last value, best duration).
@@ -48,9 +46,7 @@ fn vm_is_faster_than_tree_walk_on_40k_loop() {
     assert_eq!(vm_val, Value::Int(EXPECTED), "VM result");
 
     let speedup = tw_dur.as_secs_f64() / vm_dur.as_secs_f64();
-    eprintln!(
-        "40k loop  tree-walk={tw_dur:?}  vm={vm_dur:?}  speedup={speedup:.2}x"
-    );
+    eprintln!("40k loop  tree-walk={tw_dur:?}  vm={vm_dur:?}  speedup={speedup:.2}x");
     assert!(
         speedup >= 5.0,
         "VM must be >=5x faster than tree-walk; got {speedup:.2}x \

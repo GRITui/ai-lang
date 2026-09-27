@@ -64,13 +64,6 @@ struct Scope {
 }
 
 impl Scope {
-    fn with_params(params: Vec<String>) -> Self {
-        Scope {
-            locals: params,
-            env_active: false,
-        }
-    }
-
     /// The slot a variable is bound to, if it is local to this scope.
     fn slot_of(&self, name: &str) -> Option<usize> {
         self.locals.iter().position(|n| n == name)
@@ -250,13 +243,24 @@ impl Compiler {
         let Node::List(param_nodes, _) = params_node else {
             return Err(Error::runtime("fn params must be a list"));
         };
-        let (params, variadic) = parse_params(param_nodes)
-            .map_err(Error::runtime)?;
+        let (params, variadic) = parse_params(param_nodes).map_err(Error::runtime)?;
         let name = fn_name(&params, &variadic);
         let mut fnc = Compiler::new_fn(name, params, variadic);
         collect_defs(body, &mut fnc.scope);
-        for form in body {
-            fnc.compile_expr(form)?;
+        // A fn body is a `do`: only the last form's value is returned
+        // (tree-walk keeps `last` and discards intermediates). Without the
+        // `Pop`s, the name symbols that `def` pushes back would accumulate on
+        // the operand stack and corrupt the enclosing call.
+        if body.is_empty() {
+            fnc.emit(Instr::Nil);
+        } else {
+            let last = body.len() - 1;
+            for (i, form) in body.iter().enumerate() {
+                fnc.compile_expr(form)?;
+                if i != last {
+                    fnc.emit(Instr::Pop);
+                }
+            }
         }
         fnc.emit(Instr::Ret);
         fnc.code.locals = fnc.scope.locals.clone();
@@ -341,9 +345,22 @@ impl Compiler {
             };
             fnc.compile_expr(val_node)?;
             fnc.emit_def_var(name);
+            // `DefSlot`/`Def` pushes the binding's name symbol back (matching
+            // tree-walk's `def` return value); drop it — only the last body
+            // form's value is the let's result.
+            fnc.emit(Instr::Pop);
         }
-        for form in body {
-            fnc.compile_expr(form)?;
+        // The let body is a `do`: keep only the last form's value.
+        if body.is_empty() {
+            fnc.emit(Instr::Nil);
+        } else {
+            let last = body.len() - 1;
+            for (i, form) in body.iter().enumerate() {
+                fnc.compile_expr(form)?;
+                if i != last {
+                    fnc.emit(Instr::Pop);
+                }
+            }
         }
         fnc.emit(Instr::Ret);
         fnc.code.locals = fnc.scope.locals.clone();
@@ -446,12 +463,10 @@ impl Compiler {
 
     fn compile_inlined_op(&mut self, op: &str, args: &[Node]) -> Result<()> {
         // `not` is unary.
-        if op == "not" {
-            if args.len() == 1 {
-                self.compile_expr(&args[0])?;
-                self.emit(Instr::Not);
-                return Ok(());
-            }
+        if op == "not" && args.len() == 1 {
+            self.compile_expr(&args[0])?;
+            self.emit(Instr::Not);
+            return Ok(());
         }
         // `-` / `/` are unary (neg / reciprocal) or binary.
         if (op == "-" || op == "/") && args.len() == 1 {
@@ -514,7 +529,7 @@ fn collect_defs(forms: &[Node], scope: &mut Scope) {
                         scope.define(name.clone());
                     }
                     for item in items.get(2..).unwrap_or(&[]) {
-                        collect_defs(&[item.clone()], scope);
+                        collect_defs(std::slice::from_ref(item), scope);
                     }
                     continue;
                 }
@@ -559,7 +574,9 @@ fn is_inlined_op(op: &str) -> bool {
     )
 }
 
-fn parse_params(param_nodes: &[Node]) -> std::result::Result<(Vec<String>, Option<String>), &'static str> {
+fn parse_params(
+    param_nodes: &[Node],
+) -> std::result::Result<(Vec<String>, Option<String>), &'static str> {
     let mut params = Vec::new();
     let mut variadic = None;
     let mut i = 0;
@@ -604,9 +621,7 @@ fn quote_node(node: &Node) -> Value {
         Node::Float(x, _) => Value::Float(*x),
         Node::Str(s, _) => Value::str(s.clone()),
         Node::Sym(s, _) => Value::Sym(Rc::new(s.clone())),
-        Node::List(items, _) => Value::List(ConsCell::from_values(
-            items.iter().map(quote_node),
-        )),
+        Node::List(items, _) => Value::List(ConsCell::from_values(items.iter().map(quote_node))),
     }
 }
 
@@ -687,11 +702,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         let name = &frame.code.locals[s];
                         match frame.env.get(name) {
                             Some(v) => v,
-                            None => {
-                                return Err(Error::runtime(format!(
-                                    "unbound symbol '{name}'"
-                                )))
-                            }
+                            None => return Err(Error::runtime(format!("unbound symbol '{name}'"))),
                         }
                     }
                 };
@@ -752,7 +763,13 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
             Instr::Mul => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(numeric_fold(&[a, b], 1.0, 1, |x, y| x * y, i64::checked_mul)?);
+                stack.push(numeric_fold(
+                    &[a, b],
+                    1.0,
+                    1,
+                    |x, y| x * y,
+                    i64::checked_mul,
+                )?);
             }
             Instr::Sub => {
                 let b = stack.pop().unwrap();
