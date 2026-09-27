@@ -1,0 +1,98 @@
+[
+  {
+    "index": 0,
+    "prompt": "Print the sum of 2 and 3.",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 1,
+    "prompt": "Define a function sq that squares its argument, then print sq(12).",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 2,
+    "prompt": "Compute and print the 10th fibonacci number (fib 0 = 0, fib 1 = 1).",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 3,
+    "prompt": "Print the sum of the list [1, 2, 3, 4, 5].",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 4,
+    "prompt": "Define a function that doubles each element of a list, then print it applied to [1, 2, 3].",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 5,
+    "prompt": "Print the string \"hello, world\".",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 6,
+    "prompt": "Print the length of the list [1, 2, 3, 4, 5].",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  },
+  {
+    "index": 7,
+    "prompt": "Build a map with key \"name\" bound to \"Ada\", then print get(user, \"name\").",
+    "constrained": {
+      "generated": "\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n10 years ago\n\n",
+      "gbnf_member": true
+    },
+    "unconstrained": {
+      "generated": "/leetcode\n\n/leetcode/0000/0000.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n        return self.isSameTree(p.left, q.left) and self.isSameTree(p.right, q.right)\n        \n/leetcode/0000/0001.py\n# Definition for a binary tree node.\n# class TreeNode:\n#     def __init__(self, x):\n#         self.val = x\n#         self.left = None\n#         self.right = None\n\nclass Solution:\n    def isSameTree(self, p: TreeNode, q: TreeNode) -> bool:\n        if not p and not q:\n            return True\n        if not p or not q:\n            return False\n        if p.val != q.val:\n            return False\n       \n\n",
+      "gbnf_member": false
+    }
+  }
+]

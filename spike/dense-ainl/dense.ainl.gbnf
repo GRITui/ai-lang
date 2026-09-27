@@ -1,0 +1,67 @@
+# Dense AINL — GBNF grammar for constrained decoding (spike t_4bb53833).
+#
+# Surface syntax: infix operators (standard precedence), `=` assignment,
+# `fn (params) { ... }` functions, `{ }` blocks, `[...]` list and `{k: v}` map
+# literals, `#` comments. This is a SURFACE change only — the AST / transpile
+# target is unchanged (see docs/DENSITY_SPIKE.md).
+#
+# Every string this grammar accepts is a syntactically valid dense-AINL program.
+# It is a conservative subset: the (future) dense parser may accept a few shapes
+# this GBNF does not generate, but the GBNF never generates something invalid.
+#
+# Braces (not indentation) are used for blocks ON PURPOSE: significant
+# indentation is context-sensitive and cannot be expressed in a context-free
+# GBNF, so braces are the price of staying GBNF-constrainable. See the doc.
+#
+# NOTE: rule names use hyphens, not underscores — llama.cpp's GBNF front-end
+# (0.5.0) rejects rule names containing `_` ("expecting ::= at _bar"). This
+# matches the repo's own AINL GBNF convention (sym-char, comment).
+
+root        ::= ws stmt (ws stmt)* ws
+
+stmt        ::= assignment | if-stmt | while-stmt | return-stmt | expr-stmt
+
+assignment  ::= ident ws "=" ws expr
+
+if-stmt     ::= "if" ws expr ws "{" ws block "}" (ws "else" ws (if-stmt | "{" ws block "}") )?
+while-stmt  ::= "while" ws expr ws "{" ws block "}"
+return-stmt ::= "return" ws expr
+expr-stmt   ::= expr
+
+block       ::= (ws stmt)* ws
+
+# --- expressions (precedence climbing, lowest to highest) ---
+expr        ::= ternary
+ternary     ::= or-expr (ws "?" ws expr ws ":" ws expr)?
+or-expr     ::= and-expr (ws "or" ws and-expr)*
+and-expr    ::= not-expr (ws "and" ws not-expr)*
+not-expr    ::= "not" ws not-expr | cmp-expr
+cmp-expr    ::= add-expr (ws cmp-op ws add-expr)*
+cmp-op      ::= "<=" | ">=" | "==" | "!=" | "<" | ">"
+add-expr    ::= mul-expr (ws add-op ws mul-expr)*
+add-op      ::= "+" | "-"
+mul-expr    ::= unary (ws mul-op ws unary)*
+mul-op      ::= "*" | "/" | "%"
+unary       ::= "-" ws unary | postfix
+postfix     ::= primary (ws call-args)*
+primary     ::= number | string | list-lit | map-lit | fn-expr | ident | "(" ws expr ws ")"
+
+fn-expr     ::= "fn" ws "(" ws params? ws ")" ws "{" ws block "}"
+params      ::= param (ws "," ws param)*
+param       ::= "&"? ident
+
+call-args   ::= "(" ws (expr ws ("," ws expr)*)? ws ")"
+
+list-lit    ::= "[" ws (expr ws ("," ws expr)*)? ws "]"
+map-lit     ::= "{" ws (map-entry ws ("," ws map-entry)*)? ws "}"
+map-entry   ::= (string | ident) ws ":" ws expr
+
+# --- atoms ---
+ident       ::= ident-start ident-char*
+ident-start ::= [a-zA-Z_]
+ident-char  ::= [a-zA-Z0-9_]
+number      ::= [0-9]+ ( "." [0-9]+ )?
+string      ::= "\"" ( [^"\\] | "\\" [\"\\/nrt] )* "\""
+
+ws          ::= ( [ \t\r\n] | comment )*
+comment     ::= "#" [^\n]* "\n"

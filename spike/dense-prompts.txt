@@ -1,0 +1,8 @@
+Print the sum of 2 and 3.
+Define a function sq that squares its argument, then print sq(12).
+Compute and print the 10th fibonacci number (fib 0 = 0, fib 1 = 1).
+Print the sum of the list [1, 2, 3, 4, 5].
+Define a function that doubles each element of a list, then print it applied to [1, 2, 3].
+Print the string "hello, world".
+Print the length of the list [1, 2, 3, 4, 5].
+Build a map with key "name" bound to "Ada", then print get(user, "name").

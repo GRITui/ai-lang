@@ -1,0 +1,11 @@
+print("hello, ai-native world")
+sq = fn(x) { x * x }
+print("sq 12 =", sq(12))
+sum = fn(&xs) {
+  go = fn(lst, acc) {
+    if len(lst) == 0 { return acc }
+    return go(rest(lst), acc + first(lst))
+  }
+  return go(xs, 0)
+}
+print("sum 1..5 =", sum(1, 2, 3, 4, 5))
