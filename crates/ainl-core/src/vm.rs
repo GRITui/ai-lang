@@ -188,13 +188,8 @@ impl Compiler {
         }
     }
 
-    fn emit_runtime_err(&mut self, msg: &str) {
-        self.code.consts.push(Value::str(msg.to_string()));
-        self.emit(Instr::RuntimeErr(self.code.consts.len() - 1));
-    }
-
     /// Compile a single expression (leaves one value on the stack).
-    fn compile_expr(&mut self, node: &Node) {
+    fn compile_expr(&mut self, node: &Node) -> Result<()> {
         match node {
             Node::Int(i, _) => self.push_const(Value::Int(*i)),
             Node::Float(x, _) => self.push_const(Value::Float(*x)),
@@ -205,15 +200,16 @@ impl Compiler {
                 "nil" => self.emit(Instr::Nil),
                 _ => self.emit_load_var(name),
             },
-            Node::List(items, _) => self.compile_list(items),
-        }
+            Node::List(items, _) => self.compile_list(items)?,
+        };
+        Ok(())
     }
 
     /// Compile a list node: a special form, an inlined op, or a call.
-    fn compile_list(&mut self, items: &[Node]) {
+    fn compile_list(&mut self, items: &[Node]) -> Result<()> {
         let Some(head) = items.first() else {
             self.emit(Instr::Nil); // empty list evaluates to nil
-            return;
+            return Ok(());
         };
         if let Node::Sym(op, _) = head {
             match op.as_str() {
@@ -230,45 +226,37 @@ impl Compiler {
                 _ => {}
             }
         }
-        self.compile_call(items);
+        self.compile_call(items)
     }
 
     // ---- special forms -----------------------------------------------------
 
-    fn sf_def(&mut self, args: &[Node]) {
+    fn sf_def(&mut self, args: &[Node]) -> Result<()> {
         let [name_node, val_node] = args else {
-            self.emit_runtime_err("def expects (def name value)");
-            return;
+            return Err(Error::runtime("def expects (def name value)"));
         };
         let Node::Sym(name, _) = name_node else {
-            self.emit_runtime_err("def name must be a symbol");
-            return;
+            return Err(Error::runtime("def name must be a symbol"));
         };
-        self.compile_expr(val_node);
+        self.compile_expr(val_node)?;
         self.emit_def_var(name);
+        Ok(())
     }
 
-    fn sf_fn(&mut self, args: &[Node]) {
+    fn sf_fn(&mut self, args: &[Node]) -> Result<()> {
         let Some((params_node, body)) = args.split_first() else {
-            self.emit_runtime_err("fn expects (fn (params...) body...)");
-            return;
+            return Err(Error::runtime("fn expects (fn (params...) body...)"));
         };
         let Node::List(param_nodes, _) = params_node else {
-            self.emit_runtime_err("fn params must be a list");
-            return;
+            return Err(Error::runtime("fn params must be a list"));
         };
-        let (params, variadic) = match parse_params(param_nodes) {
-            Ok(p) => p,
-            Err(msg) => {
-                self.emit_runtime_err(msg);
-                return;
-            }
-        };
+        let (params, variadic) = parse_params(param_nodes)
+            .map_err(Error::runtime)?;
         let name = fn_name(&params, &variadic);
         let mut fnc = Compiler::new_fn(name, params, variadic);
         collect_defs(body, &mut fnc.scope);
         for form in body {
-            fnc.compile_expr(form);
+            fnc.compile_expr(form)?;
         }
         fnc.emit(Instr::Ret);
         fnc.code.locals = fnc.scope.locals.clone();
@@ -278,62 +266,61 @@ impl Compiler {
         self.scope.env_active = true; // a closure now exists in this subtree
         self.code.fns.push(rc);
         self.emit(Instr::MakeFn(self.code.fns.len() - 1));
+        Ok(())
     }
 
-    fn sf_if(&mut self, args: &[Node]) {
+    fn sf_if(&mut self, args: &[Node]) -> Result<()> {
         match args {
             [cond, then] => {
-                self.compile_expr(cond);
+                self.compile_expr(cond)?;
                 let jump = self.emit_jump(Instr::JumpIfFalse);
-                self.compile_expr(then);
+                self.compile_expr(then)?;
                 self.patch_jump(jump, self.body_len());
                 self.emit(Instr::Nil);
             }
             [cond, then, els] => {
-                self.compile_expr(cond);
+                self.compile_expr(cond)?;
                 let jump = self.emit_jump(Instr::JumpIfFalse);
-                self.compile_expr(then);
+                self.compile_expr(then)?;
                 let jump2 = self.emit_jump(Instr::Jump);
                 self.patch_jump(jump, self.body_len());
-                self.compile_expr(els);
+                self.compile_expr(els)?;
                 self.patch_jump(jump2, self.body_len());
             }
-            _ => self.emit_runtime_err("if expects (if cond then [else])"),
+            _ => return Err(Error::runtime("if expects (if cond then [else])")),
         }
+        Ok(())
     }
 
-    fn sf_do(&mut self, args: &[Node]) {
+    fn sf_do(&mut self, args: &[Node]) -> Result<()> {
         if args.is_empty() {
             self.emit(Instr::Nil);
-            return;
+            return Ok(());
         }
         let last = args.len() - 1;
         for (i, form) in args.iter().enumerate() {
-            self.compile_expr(form);
+            self.compile_expr(form)?;
             if i != last {
                 self.emit(Instr::Pop);
             }
         }
+        Ok(())
     }
 
-    fn sf_let(&mut self, args: &[Node]) {
+    fn sf_let(&mut self, args: &[Node]) -> Result<()> {
         let Some((binds_node, body)) = args.split_first() else {
-            self.emit_runtime_err("let expects (let ((n v)...) body...)");
-            return;
+            return Err(Error::runtime("let expects (let ((n v)...) body...)"));
         };
         let Node::List(binds, _) = binds_node else {
-            self.emit_runtime_err("let bindings must be a list");
-            return;
+            return Err(Error::runtime("let bindings must be a list"));
         };
         let mut bind_names = Vec::new();
         for b in binds {
             let Node::List(pair, _) = b else {
-                self.emit_runtime_err("each let binding must be (name value)");
-                return;
+                return Err(Error::runtime("each let binding must be (name value)"));
             };
             let [Node::Sym(name, _), _] = &pair[..] else {
-                self.emit_runtime_err("each let binding must be (name value)");
-                return;
+                return Err(Error::runtime("each let binding must be (name value)"));
             };
             bind_names.push(name.clone());
         }
@@ -352,11 +339,11 @@ impl Compiler {
             let [_, val_node] = &pair[..] else {
                 unreachable!("validated above");
             };
-            fnc.compile_expr(val_node);
+            fnc.compile_expr(val_node)?;
             fnc.emit_def_var(name);
         }
         for form in body {
-            fnc.compile_expr(form);
+            fnc.compile_expr(form)?;
         }
         fnc.emit(Instr::Ret);
         fnc.code.locals = fnc.scope.locals.clone();
@@ -367,12 +354,12 @@ impl Compiler {
         self.code.fns.push(rc);
         self.emit(Instr::MakeFn(self.code.fns.len() - 1));
         self.emit(Instr::Call(0));
+        Ok(())
     }
 
-    fn sf_while(&mut self, args: &[Node]) {
+    fn sf_while(&mut self, args: &[Node]) -> Result<()> {
         let Some((cond, body)) = args.split_first() else {
-            self.emit_runtime_err("while expects (while cond body...)");
-            return;
+            return Err(Error::runtime("while expects (while cond body...)"));
         };
         // `while` returns the value of the last body form of the last
         // iteration (or nil if the body never ran) — matching tree-walk
@@ -384,13 +371,13 @@ impl Compiler {
         // the per-form `Swap`+`Pop` bookkeeping.
         self.emit(Instr::Nil); // initial `last`
         let start = self.body_len();
-        self.compile_expr(cond);
+        self.compile_expr(cond)?;
         let exit = self.emit_jump(Instr::JumpIfFalse);
         if !body.is_empty() {
             self.emit(Instr::Pop); // drop the stale `last` before re-running
             let last_idx = body.len() - 1;
             for (i, form) in body.iter().enumerate() {
-                self.compile_expr(form);
+                self.compile_expr(form)?;
                 if i != last_idx {
                     self.emit(Instr::Pop);
                 }
@@ -399,27 +386,28 @@ impl Compiler {
         self.emit(Instr::Jump(start));
         self.patch_jump(exit, self.body_len());
         // `exit`: the operand stack holds `last`.
+        Ok(())
     }
 
-    fn sf_quote(&mut self, args: &[Node]) {
+    fn sf_quote(&mut self, args: &[Node]) -> Result<()> {
         let [node] = args else {
-            self.emit_runtime_err("quote expects one form");
-            return;
+            return Err(Error::runtime("quote expects one form"));
         };
         self.push_const(quote_node(node));
+        Ok(())
     }
 
-    fn sf_and(&mut self, args: &[Node]) {
+    fn sf_and(&mut self, args: &[Node]) -> Result<()> {
         // Returns the first falsey value, or the last value if all truthy
         // (nil-ary -> true). `Dup` preserves the value across `JumpIfFalse`
         // (which pops the tested copy).
         if args.is_empty() {
             self.emit(Instr::Bool(true));
-            return;
+            return Ok(());
         }
         let mut jumps = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            self.compile_expr(a);
+            self.compile_expr(a)?;
             self.emit(Instr::Dup);
             let jump = self.emit_jump(Instr::JumpIfFalse);
             jumps.push(jump);
@@ -430,17 +418,18 @@ impl Compiler {
         for j in jumps {
             self.patch_jump(j, self.body_len());
         }
+        Ok(())
     }
 
-    fn sf_or(&mut self, args: &[Node]) {
+    fn sf_or(&mut self, args: &[Node]) -> Result<()> {
         // Returns the first truthy value, or false if none (nil-ary -> false).
         if args.is_empty() {
             self.emit(Instr::Bool(false));
-            return;
+            return Ok(());
         }
         let mut jumps = Vec::new();
         for a in args {
-            self.compile_expr(a);
+            self.compile_expr(a)?;
             self.emit(Instr::Dup);
             let jump = self.emit_jump(Instr::JumpIfTrue);
             jumps.push(jump);
@@ -450,29 +439,30 @@ impl Compiler {
         for j in jumps {
             self.patch_jump(j, self.body_len());
         }
+        Ok(())
     }
 
     // ---- inlined ops & calls ----------------------------------------------
 
-    fn compile_inlined_op(&mut self, op: &str, args: &[Node]) {
+    fn compile_inlined_op(&mut self, op: &str, args: &[Node]) -> Result<()> {
         // `not` is unary.
         if op == "not" {
             if args.len() == 1 {
-                self.compile_expr(&args[0]);
+                self.compile_expr(&args[0])?;
                 self.emit(Instr::Not);
-                return;
+                return Ok(());
             }
         }
         // `-` / `/` are unary (neg / reciprocal) or binary.
         if (op == "-" || op == "/") && args.len() == 1 {
-            self.compile_expr(&args[0]);
+            self.compile_expr(&args[0])?;
             self.emit(if op == "-" { Instr::Neg } else { Instr::Recip });
-            return;
+            return Ok(());
         }
         // Binary inlining for the common 2-arg case.
         if args.len() == 2 {
-            self.compile_expr(&args[0]);
-            self.compile_expr(&args[1]);
+            self.compile_expr(&args[0])?;
+            self.compile_expr(&args[1])?;
             self.emit(match op {
                 "+" => Instr::Add,
                 "*" => Instr::Mul,
@@ -486,23 +476,24 @@ impl Compiler {
                 ">=" => Instr::CmpGe,
                 _ => unreachable!("is_inlined_op"),
             });
-            return;
+            return Ok(());
         }
         // Other arities: fall back to a general call of the (possibly
         // shadowed) operator symbol, which dispatches to the same builtin.
         let mut full = Vec::with_capacity(args.len() + 1);
         full.push(Node::Sym(op.to_string(), Span::new(0, 0)));
         full.extend(args.to_vec());
-        self.compile_call(&full);
+        self.compile_call(&full)
     }
 
-    fn compile_call(&mut self, items: &[Node]) {
+    fn compile_call(&mut self, items: &[Node]) -> Result<()> {
         let n = items.len() - 1;
-        self.compile_expr(&items[0]);
+        self.compile_expr(&items[0])?;
         for a in &items[1..] {
-            self.compile_expr(a);
+            self.compile_expr(a)?;
         }
         self.emit(Instr::Call(n));
+        Ok(())
     }
 }
 
@@ -535,12 +526,15 @@ fn collect_defs(forms: &[Node], scope: &mut Scope) {
 }
 
 /// Compile a top-level program (a sequence of forms) into one `FnCode`.
-pub fn compile_top(forms: &[Node]) -> FnCode {
+/// Malformed special forms (wrong arity, non-symbol `def` name, …) are
+/// compile-time errors — the compiler returns `Err` rather than emitting a
+/// runtime-error instruction.
+pub fn compile_top(forms: &[Node]) -> Result<FnCode> {
     let mut c = Compiler::new_top();
     collect_defs(forms, &mut c.scope);
     let last = forms.len().saturating_sub(1);
     for (i, form) in forms.iter().enumerate() {
-        c.compile_expr(form);
+        c.compile_expr(form)?;
         if i != last {
             c.emit(Instr::Pop);
         }
@@ -551,7 +545,7 @@ pub fn compile_top(forms: &[Node]) -> FnCode {
     c.code.locals = c.scope.locals.clone();
     c.code.env_active = c.scope.env_active;
     c.code.sync_slot_syms();
-    c.code
+    Ok(c.code)
 }
 
 // ---------------------------------------------------------------------------
@@ -947,11 +941,6 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 let l = stack.len();
                 stack.swap(l - 1, l - 2);
             }
-
-            Instr::RuntimeErr(i) => {
-                let frame = &frames.last().unwrap();
-                return Err(Error::runtime(frame.code.consts[i].to_string()));
-            }
         }
     }
 
@@ -978,6 +967,6 @@ pub fn run_str(src: &str) -> Result<Value> {
 /// call gets a fresh step budget (the VM's step counter is local to `run`).
 pub fn run_in(src: &str, env: &Env) -> Result<Value> {
     let forms = crate::parse(src)?;
-    let code = compile_top(&forms);
+    let code = compile_top(&forms)?;
     run(&code, env)
 }

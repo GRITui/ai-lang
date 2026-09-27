@@ -113,10 +113,6 @@ pub enum Instr {
     Dup,
     /// Swap the top two values.
     Swap,
-
-    // --- error ---
-    /// Return a runtime error with the message `consts[idx]`.
-    RuntimeErr(usize),
 }
 
 /// A compiled function (or the top-level program). Self-contained: carries its
