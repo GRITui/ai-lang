@@ -1,5 +1,6 @@
 //! Runtime values.
 
+use crate::code::FnCode;
 use crate::error::Result;
 use crate::eval::Env;
 use crate::parser::Node;
@@ -11,8 +12,14 @@ pub struct Closure {
     pub params: Vec<String>,
     /// Optional rest-parameter name introduced by `&`, e.g. `(fn (a & rest) ...)`.
     pub variadic: Option<String>,
+    /// The AST body — used by the tree-walking evaluator.
     pub body: Vec<Node>,
     pub env: Env,
+    /// Compiled bytecode for this closure, set by the VM (`MakeFn`). `None` for
+    /// closures created by the tree-walk, which interpret `body` instead. A run
+    /// is either all-VM or all-tree-walk, so `code` and `body` are never mixed
+    /// within a single run.
+    pub code: Option<Rc<FnCode>>,
 }
 
 /// A native function implemented in Rust.
