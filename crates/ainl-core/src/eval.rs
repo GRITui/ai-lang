@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::parser::Node;
-use crate::value::{Closure, Value};
+use crate::value::{Closure, ConsCell, Value};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -174,7 +174,23 @@ impl Env {
 fn value_keeps_env_alive(val: &Value, env: &Env) -> bool {
     match val {
         Value::Closure(c) => env.is_ancestor_of(&c.env),
-        Value::List(items) => items.iter().any(|v| value_keeps_env_alive(v, env)),
+        Value::List(items) => {
+            let mut cur = items;
+            loop {
+                match cur.first() {
+                    Some(v) => {
+                        if value_keeps_env_alive(v, env) {
+                            return true;
+                        }
+                        match cur.rest() {
+                            Some(next) => cur = next,
+                            None => return false,
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        }
         Value::Map(pairs) => pairs
             .iter()
             .any(|(k, v)| value_keeps_env_alive(k, env) || value_keeps_env_alive(v, env)),
@@ -262,7 +278,7 @@ pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
             }
             if let Some(rest) = &clos.variadic {
                 let extra: Vec<Value> = args[np..].to_vec();
-                call_env.define(rest.clone(), Value::List(Rc::new(extra)));
+                call_env.define(rest.clone(), Value::List(ConsCell::from_values(extra)));
             }
             let mut last = Value::Nil;
             let mut err = None;
@@ -434,7 +450,7 @@ fn quote_node(node: &Node) -> Value {
         Node::Float(x, _) => Value::Float(*x),
         Node::Str(s, _) => Value::str(s.clone()),
         Node::Sym(s, _) => Value::Sym(Rc::new(s.clone())),
-        Node::List(items, _) => Value::List(Rc::new(items.iter().map(quote_node).collect())),
+        Node::List(items, _) => Value::List(ConsCell::from_values(items.iter().map(quote_node))),
     }
 }
 
@@ -502,7 +518,9 @@ fn install_prelude(env: &Env) {
         Ok(Value::str(s))
     });
 
-    b!("list", |a| Ok(Value::List(Rc::new(a.to_vec()))));
+    b!("list", |a| Ok(Value::List(ConsCell::from_values(
+        a.to_vec()
+    ))));
     b!("len", builtin_len);
     b!("first", builtin_first);
     b!("rest", builtin_rest);
@@ -685,7 +703,7 @@ fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> Result<Value
 
 fn builtin_len(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
-        Value::List(l) => Ok(Value::Int(l.len() as i64)),
+        Value::List(l) => Ok(Value::Int(l.len as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Map(m) => Ok(Value::Int(m.len() as i64)),
         other => Err(Error::runtime(format!(
@@ -765,15 +783,15 @@ fn builtin_has(args: &[Value]) -> Result<Value> {
 
 fn builtin_keys(args: &[Value]) -> Result<Value> {
     let m = as_map(arg1(args)?, "keys")?;
-    Ok(Value::List(Rc::new(
-        m.iter().map(|(k, _)| k.clone()).collect(),
+    Ok(Value::List(ConsCell::from_values(
+        m.iter().map(|(k, _)| k.clone()),
     )))
 }
 
 fn builtin_vals(args: &[Value]) -> Result<Value> {
     let m = as_map(arg1(args)?, "vals")?;
-    Ok(Value::List(Rc::new(
-        m.iter().map(|(_, v)| v.clone()).collect(),
+    Ok(Value::List(ConsCell::from_values(
+        m.iter().map(|(_, v)| v.clone()),
     )))
 }
 
@@ -789,10 +807,10 @@ fn builtin_first(args: &[Value]) -> Result<Value> {
 
 fn builtin_rest(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
-        Value::List(l) => {
-            let rest: Vec<Value> = l.iter().skip(1).cloned().collect();
-            Ok(Value::List(Rc::new(rest)))
-        }
+        Value::List(l) => Ok(Value::List(match l.rest() {
+            Some(rest) => rest.clone(),
+            None => ConsCell::empty(),
+        })),
         other => Err(Error::runtime(format!(
             "rest expects list, got {}",
             other.type_name()
@@ -807,26 +825,36 @@ fn builtin_nth(args: &[Value]) -> Result<Value> {
     if *i < 0 {
         return Ok(Value::Nil);
     }
-    Ok(l.get(*i as usize).cloned().unwrap_or(Value::Nil))
+    Ok(l.nth(*i as usize).cloned().unwrap_or(Value::Nil))
 }
 
 fn builtin_cons(args: &[Value]) -> Result<Value> {
     let [head, Value::List(l)] = args else {
         return Err(Error::runtime("cons expects (cons value list)"));
     };
-    let mut out = Vec::with_capacity(l.len() + 1);
-    out.push(head.clone());
-    out.extend(l.iter().cloned());
-    Ok(Value::List(Rc::new(out)))
+    // O(1): a fresh cell pointing at the existing tail.
+    Ok(Value::List(ConsCell::cons(head.clone(), l)))
 }
 
 fn builtin_push(args: &[Value]) -> Result<Value> {
     let [Value::List(l), tail @ ..] = args else {
         return Err(Error::runtime("push expects (push list value...)"));
     };
-    let mut out: Vec<Value> = l.iter().cloned().collect();
-    out.extend(tail.iter().cloned());
-    Ok(Value::List(Rc::new(out)))
+    // O(n + k): one traversal of the existing list, then append every value.
+    // (Acceptable — the O(n²) case was repeated `cons`, which is now O(1).)
+    let mut items = Vec::with_capacity(l.len + tail.len());
+    let mut cur = l;
+    while let Some(h) = cur.first() {
+        items.push(h.clone());
+        match cur.rest() {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    for v in tail {
+        items.push(v.clone());
+    }
+    Ok(Value::List(ConsCell::from_values(items)))
 }
 
 #[cfg(test)]
@@ -873,5 +901,162 @@ mod tests {
         // correct — this is the correctness counterpart to the leak test
         // above: the fix must not clear a scope a live closure still needs.
         assert_eq!(crate::run_in("(add5 10)", &env).unwrap(), Value::Int(15));
+    }
+
+    // ---- list (cons cell) semantics ---------------------------------------
+
+    #[test]
+    fn cons_rest_first_len_round_trips() {
+        // cons prepends; first/rest peel; len counts — all the same values
+        // the old Vec-backed lists produced.
+        assert_eq!(
+            crate::run_str("(first (cons 1 (list 2 3)))").unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            crate::run_str("(rest (cons 1 (list 2 3)))").unwrap(),
+            crate::run_str("(list 2 3)").unwrap()
+        );
+        assert_eq!(
+            crate::run_str("(len (cons 1 (list 2 3)))").unwrap(),
+            Value::Int(3)
+        );
+        // cons is immutable: the original list is untouched.
+        let src = "\
+            (def xs (list 2 3))\
+            (def ys (cons 1 xs))\
+            (list (len xs) (len ys) (first xs) (first ys))\
+            ";
+        assert_eq!(
+            crate::run_str(src).unwrap(),
+            crate::run_str("(list 2 3 2 1)").unwrap()
+        );
+        // cons of two equal lists compares equal to a directly built list.
+        assert_eq!(
+            crate::run_str("(= (cons 1 (list 2)) (list 1 2))").unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn nth_and_empty_list_edge_cases() {
+        assert_eq!(
+            crate::run_str("(nth (list 1 2 3) 0)").unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            crate::run_str("(nth (list 1 2 3) 1)").unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            crate::run_str("(nth (list 1 2 3) 2)").unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(crate::run_str("(nth (list 1 2 3) 3)").unwrap(), Value::Nil);
+        assert_eq!(crate::run_str("(nth (list 1 2 3) -1)").unwrap(), Value::Nil);
+        // Empty list: len 0, first/rest are nil/empty.
+        assert_eq!(crate::run_str("(len (list))").unwrap(), Value::Int(0));
+        assert_eq!(crate::run_str("(first (list))").unwrap(), Value::Nil);
+        assert_eq!(
+            crate::run_str("(len (rest (list)))").unwrap(),
+            Value::Int(0)
+        );
+        // `rest` of a one-element list is the empty list (not nil).
+        assert_eq!(
+            crate::run_str("(rest (list 1))").unwrap(),
+            crate::run_str("(list)").unwrap()
+        );
+        // and it prints as `()`.
+        assert_eq!(
+            crate::run_str("(str (rest (list 1)))").unwrap(),
+            Value::str("()")
+        );
+    }
+
+    #[test]
+    fn push_appends_to_the_end_and_is_non_mutating() {
+        assert_eq!(
+            crate::run_str("(push (list 1) 2 3)").unwrap(),
+            crate::run_str("(list 1 2 3)").unwrap()
+        );
+        assert_eq!(
+            crate::run_str("(push (list) 1)").unwrap(),
+            crate::run_str("(list 1)").unwrap()
+        );
+        let src = "\
+            (def xs (list 1))\
+            (def ys (push xs 2))\
+            (list (len xs) (len ys) (first ys) (rest ys))\
+            ";
+        assert_eq!(
+            crate::run_str(src).unwrap(),
+            crate::run_str("(list 1 2 1 (list 2))").unwrap()
+        );
+    }
+
+    #[test]
+    fn quote_and_variadic_rest_build_cons_lists() {
+        // Quoted list literals and variadic rest bindings both build lists.
+        assert_eq!(
+            crate::run_str("(nth (quote (a b c)) 1)").unwrap(),
+            crate::run_str("(quote b)").unwrap()
+        );
+        // (The rest param is named `xs` — naming it `rest` would shadow the
+        // `rest` builtin inside the body.)
+        let src = "(def f (fn (a & xs) (list a (len xs) (first xs) (rest xs)))) (f 1 2 3 4)";
+        assert_eq!(
+            crate::run_str(src).unwrap(),
+            crate::run_str("(list 1 3 2 (list 3 4))").unwrap()
+        );
+    }
+
+    #[test]
+    fn list_display_and_error_messages_unchanged() {
+        // Public rendering: `(1 2 3)`, nested, empty.
+        assert_eq!(
+            crate::run_str("(str (list 1 (list 2 3) 4))").unwrap(),
+            Value::str("(1 (2 3) 4)")
+        );
+        assert_eq!(crate::run_str("(str (list))").unwrap(), Value::str("()"));
+        // Error messages keep the same type names and wording.
+        let err = crate::run_str("(first 1)").unwrap_err().to_string();
+        assert!(err.contains("first expects list, got int"), "got: {err}");
+        let err = crate::run_str("(cons 1 2)").unwrap_err().to_string();
+        assert!(err.contains("cons expects (cons value list)"), "got: {err}");
+        let err = crate::run_str("(rest 1)").unwrap_err().to_string();
+        assert!(err.contains("rest expects list, got int"), "got: {err}");
+        let err = crate::run_str("(len true)").unwrap_err().to_string();
+        assert!(
+            err.contains("len expects list, str, or hash, got bool"),
+            "got: {err}"
+        );
+    }
+
+    /// Performance regression guard: building a 20,000-element list by
+    /// repeated `cons` must stay well under 500ms. The old `Rc<Vec<Value>>`
+    /// representation made each `cons` an O(n) whole-list clone, so this
+    /// program was O(n²) (~1.3s at 20k on the PO's machine); with O(1) cons
+    /// cells it is O(n) and runs in single-digit milliseconds. The bound is
+    /// deliberately generous so slow CI runners don't flake — it only trips
+    /// if the representation regresses to quadratic behavior.
+    #[test]
+    fn building_a_20k_list_via_cons_stays_linear() {
+        let src = "\
+            (def n 20000)\
+            (def i 0)\
+            (def acc (list))\
+            (while (< i n)\
+              (def acc (cons i acc))\
+              (def i (+ i 1)))\
+            (len acc)\
+            ";
+        let start = std::time::Instant::now();
+        let result = crate::run_str(src).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(result, Value::Int(20000));
+        assert!(
+            elapsed.as_millis() < 500,
+            "20k cons build took {elapsed:?} — list builtins may have regressed to O(n²)"
+        );
     }
 }

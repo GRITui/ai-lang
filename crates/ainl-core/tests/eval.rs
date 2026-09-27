@@ -1,4 +1,4 @@
-use ainl_core::{parse_to_json, run_str, LineIndex, Value};
+use ainl_core::{parse_to_json, run_str, ConsCell, LineIndex, Value};
 
 fn eval(src: &str) -> Value {
     run_str(src).unwrap_or_else(|e| panic!("eval failed for `{src}`: {e}"))
@@ -68,7 +68,7 @@ fn hash_assoc_does_not_mutate_the_original() {
     "#;
     assert_eq!(
         eval(src),
-        Value::List(std::rc::Rc::new(vec![Value::Int(1), Value::Int(99)]))
+        Value::List(ConsCell::from_values([Value::Int(1), Value::Int(99)]))
     );
 }
 
@@ -84,7 +84,7 @@ fn hash_keys_and_vals_preserve_insertion_order() {
     let src = r#"(keys (hash "a" 1 "b" 2 "c" 3))"#;
     assert_eq!(
         eval(src),
-        Value::List(std::rc::Rc::new(vec![
+        Value::List(ConsCell::from_values([
             Value::str("a"),
             Value::str("b"),
             Value::str("c"),

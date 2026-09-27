@@ -19,7 +19,7 @@ pub use eval::Env;
 pub use grammar::{Dialect, GBNF};
 pub use parser::{Node, Span};
 pub use serialize::{forms_to_json, LineIndex};
-pub use value::Value;
+pub use value::{ConsCell, Value};
 
 /// Parse a source string into the AST (a sequence of top-level forms).
 pub fn parse(src: &str) -> Result<Vec<Node>> {
