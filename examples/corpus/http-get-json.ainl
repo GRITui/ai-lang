@@ -1,0 +1,106 @@
+; @example   http-get-json
+; @summary   An HTTP GET against a local server, then parse and report the JSON response.
+; @teaches   http-get, json-parse, hash, get, headers, env-get
+; @scope     server
+; @expect    GET /items -> 200 ok
+; @run       python3 examples/corpus/http-fixture/server.py & AINL_PORT=8080 ainl run examples/corpus/http-get-json.ainl
+;
+; The everyday client shape: fetch, parse, extract, report.
+;
+; SCOPE, and it is a hard boundary rather than a caveat:
+;
+;   * `http-get`/`http-post` are INTERPRETER-ONLY. `ainl compile` (AOT) and all
+;     three transpilers REFUSE a program using them with an `interpreter-only`
+;     error. The AOT backend emits ONE standalone C program that must link
+;     against nothing but libc, and carrying a TCP client plus a TLS stack
+;     would break that guarantee. The transpilers emit one source file for one
+;     host language, where an HTTP call would have to become a host library
+;     call with that host's own semantics — so the language says no rather
+;     than emitting something that builds and behaves differently.
+;   * `https://` is refused BY NAME, before any connection is attempted, so
+;     the failure is the same on a machine with no network at all. TLS would
+;     mean a crypto library in the static binary; see docs/HTTP_TLS.md.
+;
+; THE RESPONSE IS AN ORDINARY MAP. No new value type, no new access syntax:
+;
+;   (get r "status")            200
+;   (get r "ok")                true for 2xx
+;   (get r "reason")            "OK"
+;   (get r "body")              the payload, as a str
+;   (get r "headers")           itself a map; (get (get r "headers") "content-type")
+;
+; AND A NON-2xx STATUS IS A VALUE, NOT AN ERROR. A 404 is a fact about the
+; server, not a failure of the fetch — the builtin returns it and the caller
+; decides. That is why `ok` exists as a separate field: a program that wants
+; "raise on 404" has to raise it itself.
+;
+; RUN IT. This example needs a server; the fixture beside it is a stdlib
+; Python one on loopback, and it needs no outbound network:
+;
+;     python3 examples/corpus/http-fixture/server.py 8080 &
+;     AINL_PORT=8080 ainl run examples/corpus/http-get-json.ainl
+;
+; (scripts/check-examples.sh starts that fixture itself and asserts this
+; example runs, so the example cannot quietly rot.)
+
+(def port (or (env-get "AINL_PORT") "8080"))
+(def base (str "http://127.0.0.1:" port))
+
+; --- one helper, any endpoint ----------------------------------------------
+; This is the shape a real client has: a function that takes a URL and prints
+; what came back. Everything below is written in terms of it.
+(def show
+  (fn (label url headers)
+    (let ((r (http-get url headers)))
+      (print label "->" (get r "status")
+             (if (get r "ok") "ok" "not-ok"))
+      r)))
+
+; --- a text endpoint -------------------------------------------------------
+(def health (show "GET /health" (str base "/health") (hash)))
+(print "     content-type:" (get (get health "headers") "content-type"))
+
+; Header names are LOWERCASED by the client, so a lookup must be lowercase
+; even if the server sent `Content-Type`. Getting this wrong yields nil, and
+; nil prints as nil — a quiet failure, not an error.
+(print "     server said:" (get health "body"))
+
+; --- a JSON endpoint -------------------------------------------------------
+; The body is a STRING, so parsing is an explicit second step. There is no
+; automatic decode on `http-get`, and there is no `try` to catch a malformed
+; one, so a client that cannot trust its server has to check the content type
+; first — see error-handling.ainl for why that check is currently mandatory.
+(def items (show "GET /items" (str base "/items")
+                 (hash "Accept" "application/json")))
+
+(def parsed (json-parse (get items "body")))
+(print "     parsed:" parsed)
+(print "     first id:" (get (first (get parsed "data")) "id"))
+(print "     count:" (len (get parsed "data")))
+
+; A request header is how a real API gets an Accept or an Authorization. The
+; reserved headers (Host, Content-Length) and any CRLF in a value are REFUSED
+; rather than sanitized — smuggling a second header through a value is the
+; attack that a naive hand-written client has.
+(def authed (show "GET /items?auth" (str base "/items")
+                 (hash "Accept" "application/json" "X-Client" "ainl-corpus")))
+(print "     our header came back:" (get (get authed "headers") "x-client"))
+
+; --- a non-2xx is a value, not an error ------------------------------------
+; This does not raise. The program keeps going, which is the whole point: a
+; missing resource is a normal outcome of a GET, not a crash.
+(def missing (show "GET /nope" (str base "/nope") (hash)))
+(print "     and the program is still running")
+
+; --- https is refused by name, before any connection -----------------------
+; `https://example.invalid/` is an `interpreter-only`-style refusal with the
+; message "http: https is not supported" — and it is refused BEFORE the host
+; is resolved, so it fails identically on a machine with no network at all.
+; It is NOT called here, because it aborts the program and this example has
+; to exit 0 to be worth anything. To see it for yourself:
+;
+;     printf '(http-get "https://example.invalid/")\n' > /tmp/h.ainl
+;     ainl run /tmp/h.ainl
+;
+; scripts/check-examples.sh asserts exactly that refusal, so the claim above
+; is tested rather than merely written down.

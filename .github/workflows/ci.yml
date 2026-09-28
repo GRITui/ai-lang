@@ -372,6 +372,42 @@ jobs:
       - name: landing page in sync with the README (no number drift)
         run: ./scripts/check-site.py
 
+  examples:
+    name: examples corpus (every example runs; few-shot is current)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # python3, node and ruby are preinstalled on ubuntu-latest runners, and
+      # the HTTP example's fixture is a stdlib Python one on loopback — so this
+      # job needs no outbound network and no API key.
+      #
+      # The card's acceptance test, end to end. A corpus of examples is a
+      # PROPOSITION to a model, and a model shown a program that does not run
+      # learns the broken shape — so every example is executed here, every
+      # portable one is diffed byte-for-byte against all three transpiler
+      # targets, and the generated few-shot file is checked against the
+      # examples it was generated from. The last check is the important one:
+      # few-shot.txt is what a model actually reads, and a stale copy teaches
+      # syntax that no longer parses.
+      - name: Every example runs, on every backend it claims
+        run: ./scripts/check-examples.sh
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest

@@ -1,0 +1,88 @@
+; @example   main
+; @summary   A main that imports two modules — one flatly, one namespaced.
+; @teaches   import, modules, namespace, env-get
+; @scope     interpreter-only
+; @expect    15
+; @run       ainl run examples/corpus/libmod/main.ainl
+;
+; The multi-file shape, with BOTH import forms side by side.
+;
+;   (import "lib/text.ainl")          bind every top-level def, by name
+;   (import "lib/math.ainl" as m)     bind ONE name, m — a map of the exports
+;
+; TWO RULES THAT ARE THE EASIEST TO GET WRONG, both visible in this example:
+;
+;   1. A module does NOT re-export. `text.ainl` imports `math.ainl` and uses
+;      `fold` and `keys`; that does NOT put `fold` in this file's scope.
+;      `main.ainl` imports `math.ainl` itself, and the `(import "math")` line
+;      is load-bearing: comment it out and `fold` becomes an unbound symbol.
+;      A module's public surface is the names it `def`s, not everything its
+;      scope happens to hold. Re-importing the same file is a no-op rather
+;      than a collision, so importing it twice (flatly AND as `m`, as this
+;      file does) is fine.
+;
+;   2. Resolution order decides what a bare name means, and it is why every
+;      import here is a BARE name. A path-like specifier (`lib/math.ainl`)
+;      resolves against the importing file's directory FIRST — so from inside
+;      libmod/ it would look for libmod/lib/math.ainl, and then for
+;      lib/math.ainl relative to the *working directory*. The first is wrong
+;      and the second only works if you happen to be standing in examples/
+;      corpus. A bare name resolves the other way round — working directory
+;      first, then the importing file's directory — so `(import "math")` finds
+;      the sibling next to this file no matter where you run the command from.
+;      That is what "my neighbour" means.
+;
+;      A rule worth stating as a habit: a path-like import makes your program
+;      depend on the directory it is launched from, and an example that only
+;      works from one place is an example that breaks the first time someone
+;      reads it from the repo root.
+;
+; SCOPE: interpreter-only. AOT and all three transpilers REFUSE this program
+; with an `interpreter-only` error rather than emitting something that builds
+; and behaves wrongly (docs/SYNTAX.md 3b).
+
+(import "math")
+(import "text")
+(import "math" as m)
+
+; --- flat import: the names are in scope directly --------------------------
+; `fold` takes THREE arguments — the function, the seed, and the list. AINL
+; has no default arguments, so the caller always supplies the seed, and the
+; order is (f init xs). `sum-all` is the two-argument convenience version
+; built on top of it, and takes any number of values via `&`.
+(print (fold (fn (acc n) (+ acc n)) 0 (list 1 2 3 4 5)))
+(print (sum-all 10 20 30))
+(print (flatten-lines "  one\n  two  \n three "))
+
+; A function that returns a function: `(adder 3)` is a function, and applying
+; it is just another call. There is no lambda shorthand, but `(fn (m) ...)` is
+; an ordinary value, so this is all the currying AINL offers.
+(print "curried:" ((adder 3) 4))
+
+(def counts (word-counts (words "alpha beta alpha")))
+(print "counts:" counts)
+
+; `word-counts` builds its map with `assoc` in recursive order, so the keys
+; come out in the order the recursion reached them. That is insertion order,
+; and it is deterministic — which is why a corpus example can assert on it.
+
+; --- namespaced import: one name, holding a map ----------------------------
+; `m` is an ordinary AINL map, so it needs no access syntax of its own. A
+; function is a value, so you CALL it by looking it up first and applying the
+; result: `((get m "fold") f 0 xs)`. The extra parentheses are the whole
+; mechanism — `(get m "fold")` evaluates to the function, and the outer call
+; applies it. This form is what you want when a module's names might collide
+; with yours, or when you want to be explicit about where something came from.
+(print "via namespace:" ((get m "fold") (fn (acc n) (+ acc n)) 0 (list 10 20)))
+(print "namespace is a map:" (has m "fold") (has m "square"))
+(print "square via namespace:" ((get m "square") 7))
+
+; --- no argv, so the environment is the only input channel ------------------
+; AINL has no `argv` builtin. A program that wants input from its caller
+; reads `env-get`, and returns nil when the variable is unset, which is why
+; every such read is wrapped in `or` with a default. Run it as:
+;
+;     AINL_GREETING="hi there" ainl run examples/corpus/libmod/main.ainl
+;
+(def greeting (or (env-get "AINL_GREETING") "hello from the module example"))
+(print "greeting:" greeting)

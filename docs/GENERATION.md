@@ -109,6 +109,44 @@ handed to `curl` on **stdin**, so it appears in neither `ps` output nor shell
 history; the command takes no TLS stack of its own (see
 [HTTP_TLS.md](HTTP_TLS.md)).
 
+### The few-shot corpus
+
+The prompt is not just the language reference. `examples/few-shot.txt` holds
+complete, working AINL programs, and `--examples` controls how many of them go
+into the request:
+
+```sh
+ainl gen "count the words in a file"      # 2 examples (the default)
+ainl gen --examples all "…"               # the whole corpus
+ainl gen --no-examples "…"                # the language reference alone
+```
+
+The default is 2, which is a measured choice rather than a round number. Zero
+leaves the model with the three tiny snippets in the language reference —
+enough for a small program, but too small to contain the mistakes models
+actually make. All crowds out the task, and a repair loop re-sends the prompt
+on every attempt. Two puts a real program — a loop, a map, a recursion — in
+front of the model while leaving the request dominated by what was asked.
+
+**Selection is a count, not a keyword.** Matching examples against the spec
+would need a matcher with no idea what the request is about, and a wrong guess
+costs more than it saves: a model shown a file-I/O example when it asked for
+arithmetic wastes context and may copy the wrong shape. So the corpus is
+ordered and documented in [../examples/README.md](../examples/README.md), and
+the caller picks the number.
+
+The corpus is **generated** from the example programs by
+`scripts/build-few-shot.sh`, and CI fails if the committed copy is out of date.
+A hand-maintained prompt drifts from the code the moment a builtin is added,
+and nothing notices until a generation quietly starts failing — a stale
+few-shot prompt teaches syntax that no longer parses, which is the one failure
+this corpus cannot have.
+
+The file is read relative to the **working directory**, so run from an
+ai-lang checkout. Without it the command still works: it sends the language
+reference alone, which is what it did before the corpus existed, and says so
+rather than failing.
+
 ### Two independent checks, because a backend can lie
 
 Neither check is trusted to the other:

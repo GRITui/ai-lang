@@ -1,0 +1,62 @@
+; pure_test.ainl — the test suite for pure.ainl, run by `ainl test`.
+;
+;   ainl test examples/corpus/testing/suite
+;
+; Files in a suite are discovered in SORTED order, so the report reads the
+; same on every machine. Each file is independent: a failure in one aborts
+; that file, and the runner still runs the others and reports the exact
+; pass/fail split. An empty suite is a FAILURE, not a vacuous success — a
+; runner that reported "0 passed" for a directory containing no tests would
+; let a broken path look like a green build.
+
+; FILES IN A SUITE, AND HOW THEY IMPORT.
+;
+; A suite is a directory (or a single file) full of `.ainl` files, discovered
+; in SORTED order, so the report reads the same on every machine. Each file is
+; independent: a failure aborts that file, and the runner still runs the others
+; and reports the exact pass/fail split.
+;
+; Note the IMPORT SPECIFIER here. This file is in suite/, but the module it
+; tests is one level up, and that is the one case where a PATH-LIKE specifier
+; is the right choice rather than a bare name:
+;
+;   * a bare name ("pure") resolves the WORKING DIRECTORY first, then the
+;     importing file's directory — so it would look for ./pure.ainl, not
+;     ../pure.ainl, and would not find it;
+;   * a path-like specifier ("../pure.ainl") resolves the IMPORTING FILE's
+;     directory first — so it looks right next to this file, climbs one level,
+;     and finds it. That is the general rule: use a bare name for a sibling,
+;     a relative path when the module is not a sibling. (An absolute path
+;     always works too, and is what you would use from outside the repo.)
+;
+; The rule this obeys: a suite that only passes from one working directory is
+; a suite that will fail in CI.
+
+(import "../pure")
+
+; --- the happy paths -------------------------------------------------------
+(test "square 7 is 49" (square 7) "49")
+(test "square 0 is 0" (square 0) "0")
+(test "square is its own inverse on 1" (square (square 1)) "1")
+
+(test "append joins in order" (append (list 1 2) (list 3 4)) "(1 2 3 4)")
+(test "append with an empty left side" (append (list) (list 1)) "(1)")
+(test "append with an empty right side" (append (list 1) (list)) "(1)")
+
+(test "classify negative" (classify -1) "negative")
+(test "classify zero" (classify 0) "zero")
+(test "classify positive" (classify 42) "positive")
+
+; --- asserting on things that are NOT the return value ----------------------
+; A test's expression can be any expression, so the interesting assertions are
+; usually about a property rather than one output.
+(test "the prelude is a list" (len (list 1 2 3)) "3")
+(test "an absent map key is nil" (get (hash "a" 1) "b") "nil")
+(test "string comparison is available in a test"
+       (if (contains "hello" "ell") "yes" "no") "yes")
+
+; The expectation is a STRING, so a float must be written the way it prints.
+; Floats always print with a mandatory ".0" (docs/NUMERIC_MODEL.md), which is
+; what keeps a float distinguishable from an int in the text.
+(test "a float expectation keeps its .0" (/ 1 2.0) "0.5")
+(test "a whole float still prints its .0" (* 2.0 3) "6.0")

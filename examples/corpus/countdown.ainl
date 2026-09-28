@@ -1,0 +1,28 @@
+; examples/corpus/countdown.ainl
+; @example   countdown
+; @summary   A while loop that accumulates into bindings and prints each step.
+; @teaches   loop, accumulator, def-rebind, print
+; @scope     portable
+; @expect    sum of the steps: 15
+;
+; `while` does NOT open a scope (docs/SYNTAX.md 2a), so `def` inside the loop
+; body rebinds the *enclosing* binding and the mutation sticks. Wrapping the
+; body in a `let` would look tidier and silently break the loop: a `let` body
+; IS a new scope, so `def` inside it would create a binding that vanishes at
+; the end of each iteration.
+;
+; Run:  ainl run examples/corpus/countdown.ainl
+
+(def n 5)
+(def i n)
+(def total 0)
+
+(while (> i 0)
+  (print "  " i)
+  (def total (+ total i))
+  (def i (- i 1)))
+
+; `print` space-joins its arguments, so a label ends in NO trailing space —
+; `"countdown: " n` would print "countdown:  5", with a double space.
+(print "countdown:" n)
+(print "sum of the steps:" total)

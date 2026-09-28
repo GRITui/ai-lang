@@ -1,0 +1,108 @@
+; @example   error-handling
+; @summary   A program that detects a failure, reports it, and exits with a meaningful code.
+; @teaches   error, exit, file-exists, error messages, exit codes
+; @scope     portable
+; @expect    missing: 1
+; @run       ainl run examples/corpus/error-handling.ainl
+;
+; HOW AINL REPORTS FAILURE TODAY — read this before writing the next one.
+;
+; There is NO `try`/`catch` in AINL today. A runtime error is UNCATCHABLE: it
+; propagates to the top level, prints a diagnostic, and exits non-zero. That
+; is the single biggest "not a real language" gap, and it is being addressed —
+; but a program written now has to plan around it, and this example is the
+; honest shape of that.
+;
+; The workaround is a principle, not a trick: CHECK BEFORE YOU ACT, using a
+; predicate that returns a value instead of raising.
+;
+;     (read-file p)            raises on a missing file
+;     (file-exists p)          returns nil  <- ask this first
+;
+;     (json-parse s)           raises on malformed text
+;     ...                      no `try`, so validate before you parse
+;
+;     (nth xs 99)              returns nil for an out-of-range index (no raise)
+;
+;     (get h "missing")        returns nil (no raise)
+;
+; So: prefer builtins that return `nil` over builtins that raise, and when you
+; must use a raising builtin, guard it with a check. `(if (file-exists p) ... )`
+; is not defensive noise — with no `try`, it is the only way to express
+; "if this is there".
+;
+; Two kinds of failure, handled differently:
+;
+;   EXPECTED  — a missing file, a malformed payload. Check first, report,
+;               continue or exit deliberately. This is what this example does.
+;   IMPOSSIBLE — a broken invariant, a bug. Call `error`, which aborts
+;               immediately. Do not try to carry on past it.
+
+(def path "ainl-corpus-does-not-exist.txt")
+
+; --- the expected failure: a check, then a decision -----------------------
+; `file-exists` returns `nil` (not `false`) for absence, and that is
+; deliberate: it is tested the same way as a missing map key, with
+; `(= (file-exists p) nil)`. `nil` is falsey, so `(if (file-exists p) ...)`
+; works too, and that is what a reader expects.
+(def present (file-exists path))
+(print "exists?" present)
+
+(if (= present nil)
+  (do
+    (print "missing:" 1)
+    (print "the program continues — it did not die on a missing file")
+    nil)
+  nil)
+
+; --- the same check, but for a case that IS an error -----------------------
+; Here the file DOES exist — this program is running from the repository
+; root, and this very file is there. So a missing file would mean something
+; the program cannot explain: a bug, or a path it does not control. `error`
+; aborts with a diagnostic and a non-zero exit, which is exactly right for
+; that, because continuing would mean processing data the program never
+; verified.
+;
+; The point being made is the shape: the `if` is FALSE here, so `error` does
+; not run and the program carries on. Written the other way round — erroring
+; whenever a check fails, without asking whether the failure is expected —
+; this is the program that dies on the first missing file and never reaches
+; the rest of its work.
+(def self (env-get "AINL_SELF"))
+(if (and (not (= self nil)) (= (file-exists self) nil))
+  (error "this program is running but its own source is missing")
+  nil)
+
+; The same guard, against a file the program cannot control, is the one to
+; write on. It does not run, because the path is intentionally absent.
+(if (= (file-exists "no-such-dir-anywhere/never.txt") nil)
+  (do
+    (print "and a check that passes leaves the program alone")
+    nil)
+  nil)
+
+; --- what an error message looks like --------------------------------------
+; An uncaught runtime error is written to stderr and exits 1:
+;
+;   <kind> error: <what went wrong> at line N, col M (byte B) — did you mean 'x'?
+;
+; The four shapes are: unbound symbol, arity mismatch, type error, parse
+; error. Columns count CHARACTERS, not bytes, so they line up with an editor.
+; The `— did you mean 'x'?` suggestion appears when a close name is in scope,
+; which turns a failed run into a single edit. Two errors deliberately carry
+; no position: resource limits (they belong to the whole run, not one form) and
+; the AOT C / transpiler backends (they embed no source, so a line does not
+; exist to point at). See docs/SYNTAX.md 5a.
+
+; --- exiting deliberately --------------------------------------------------
+; A program that prints an error and then returns NORMALLY still exits 0,
+; which tells every shell and CI job that it succeeded. `exit` is the only way
+; to set the status deliberately, so a tool that can fail should always end in
+; an explicit `exit`.
+;
+; Below, the run succeeds and exits 0. Run the failing variant yourself with:
+;
+;   printf '(error "deliberate")\n' > /tmp/e.ainl && ainl run /tmp/e.ainl; echo $?
+;
+(print "handled 1 expected failure and exited cleanly")
+(exit 0)

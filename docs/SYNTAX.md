@@ -563,6 +563,15 @@ everywhere**, which is what `test_parity.rs` asserts.
 
 ## 4. Canonical examples
 
+These are one-liners to fix the shape in your head. For programs that are
+worth reading in full — a loop that accumulates, a group-by, a hand-written
+sort, a module split across files, a test suite — see
+[../examples/README.md](../examples/README.md). Every one of those is a real,
+runnable program, and CI runs all of them on every backend each claims to
+support, so they cannot be out of date with the language. They are also the
+corpus `ainl gen` puts in front of a model, which makes them the closest
+thing AINL has to a reference implementation.
+
 ```lisp
 ; define and call
 (def sq (fn (x) (* x x)))

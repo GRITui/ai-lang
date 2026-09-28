@@ -263,6 +263,13 @@ natural language into a validated AINL schema.
 
 ## Where to go next
 
+- [../examples/README.md](../examples/README.md) — **ten complete, runnable
+  programs**, each checked in CI on every backend it claims to support. Start
+  here rather than at the grammar: `countdown.ainl` is a loop,
+  `word-frequency.ainl` is a real program with maps and a hand-written sort,
+  and each file's comments explain the one rule in it that is easy to get
+  wrong. This is also the few-shot corpus `ainl gen` draws on, so what you
+  read is exactly what a model is shown.
 - [SYNTAX.md](SYNTAX.md) — the complete grammar (also written for model ingestion).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how the interpreter, serializer, and transpilers fit together.
 - [BENCHMARK.md](BENCHMARK.md) — the honest token-count numbers.

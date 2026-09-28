@@ -1,0 +1,86 @@
+; @example   aot-compare
+; @summary   A compute-heavy loop that runs identically interpreted and AOT-compiled.
+; @teaches   while, integer arithmetic, the step cap, AOT parity
+; @scope     portable
+; @expect    over 400 iterations, loop and fold agree: true
+; @run       ainl run examples/corpus/aot-compare.ainl
+; @aot       ainl compile examples/corpus/aot-compare.ainl -o /tmp/aot-compare && /tmp/aot-compare
+;
+; A program whose only job is to do a lot of arithmetic, so the two execution
+; backends can be compared directly. This is the shape CI uses for its
+; performance gates, and it is worth having in the corpus because "runs on
+; the interpreter" and "runs compiled" are different claims.
+;
+; WHY THIS PROGRAM IS PORTABLE, which is the thing to notice:
+;
+; Everything it uses — `while`, `def`-rebind, integer `+` and `mod` — is in
+; the AOT C runtime AND in all three transpiler targets. `ainl compile`
+; emits ONE standalone C program that links against nothing but libc, and the
+; AOT builtin table has an id for every one of these. A program that reaches
+; for `http-get` or `import` is refused by that backend rather than
+; half-supported, so "portable" here is a property you can rely on.
+;
+; THE STEP CAP. AINL bounds every run at 2,000,000 evaluation steps
+; (AINL_MAX_STEPS), so an accidental infinite loop fails loudly with
+; "max 2000000 evaluation steps" instead of hanging a CI job. The cap counts
+; EVALUATIONS, not iterations, so the loop below — three operations per pass —
+; is bounded at roughly 660,000 iterations. Raising the cap for a genuine
+; long run is a deliberate act:
+;
+;     AINL_MAX_STEPS=20000000 ./aot-compare
+;
+; An AOT binary honors the same variable, so a program that runs under the
+; interpreter at a raised cap runs compiled too.
+
+(def n 20000)
+(def i 0)
+(def checksum 0)
+
+(while (< i n)
+  (def checksum (+ checksum (mod (* i 3) 7)))
+  (def i (+ i 1)))
+
+(print "iterations:" n)
+(print "checksum:" checksum)
+
+; --- the same computation, written differently, must agree -----------------
+; A fold and a loop are two spellings of one recursion, and getting the same
+; answer from both is a cheap self-check that the loop above is not
+; accidentally computing something else. If these two lines ever disagree,
+; one of them is wrong — and an AOT binary that disagreed with the
+; interpreter would be the far more serious version of that bug.
+;
+; THE RECURSION DEPTH LIMIT IS 512, and that is a HARD bound on this call
+; style: a 20,000-deep fold exceeds it and dies with "recursion limit
+; exceeded (max depth 512)". So the fold below is checked at a size that fits,
+; and the two computations are run over DIFFERENT ranges on purpose:
+;
+;   * the `while` loop above handles 20,000 iterations, because a loop's cost
+;     is the machine's STACK-FREE — it reuses one frame;
+;   * the recursive fold handles only 400, because each nested call costs a
+;     frame, and 512 is the ceiling.
+;
+; This is the single most important practical difference between the two
+; styles in AINL, and it is worth stating as a rule: use `while` for anything
+; whose length is not known to be small, and recursion for shapes whose depth
+; is bounded by the DATA. `fib` at n=20 is fine because 20 frames is nothing;
+; a list walk of 20,000 elements is not, and that is the walk `while` is for.
+; Note the limit is deliberately NOT reported with a line and column — it
+; belongs to the whole run, not to any one form, and a plausible-looking
+; wrong line is worse than none (docs/SYNTAX.md 5a).
+(def small 400)
+
+(def fold-checksum
+  (fn (i acc)
+    (if (>= i small) acc
+      (fold-checksum (+ i 1) (+ acc (mod (* i 3) 7))))))
+
+(def loop-small
+  (fn ()
+    (let ((acc 0) (k 0))
+      (while (< k small)
+        (def acc (+ acc (mod (* k 3) 7)))
+        (def k (+ k 1)))
+      acc)))
+
+(print "over" small "iterations, loop and fold agree:" (= (loop-small) (fold-checksum 0 0)))

@@ -1,0 +1,74 @@
+; lib/text.ainl — text helpers for the modules example, kept as their own module.
+;
+; A module exists so that logic with its own tests can be tested on its own.
+; Everything here is pure: no file access, no printing, no I/O. That is what
+; makes a unit test of this file meaningful, and it is the usual reason to
+; split a file at all.
+;
+; SCOPE: modules are INTERPRETER-ONLY. `ainl compile` (AOT) and all three
+; transpilers refuse a program containing `import` with an `interpreter-only`
+; error, and they refuse it on purpose — `import` is a keyword in Python, Ruby
+; and JavaScript, so an unhandled directive would lower to a call into the
+; host's own import machinery: a program that builds cleanly and does the
+; wrong thing. See docs/SYNTAX.md 3b.
+
+; Append, because AINL has no builtin for it. `cons` prepends, so walking the
+; list and consing each element puts them back in their original order.
+; This is the first function nearly every AINL program ends up writing.
+(def append
+  (fn (a b)
+    (if (= (len a) 0) b
+      (cons (first a) (append (rest a) b)))))
+
+; AINL has no regex, so text work is `split` plus list operations. That single
+; constraint shapes everything below, and it is worth internalizing: a
+; character-level transformation is not available, but a token-level one is,
+; and most real text processing is token-level anyway.
+(def words
+  (fn (text)
+    (let ((raw (split (trim (replace text "\n" " ")) " "))
+           (out (list))
+           (i 0))
+      (while (< i (len raw))
+        (def w (trim (nth raw i)))
+        (if (= w "") nil (def out (push out (downcase w))))
+        (def i (+ i 1)))
+      out)))
+
+; Fold newlines to spaces, then squeeze the result into one line. The
+; "squeeze" is `trim` plus a split-and-rejoin, NOT a loop of `replace`
+; calls: `replace` rewrites non-overlapping occurrences left to right, so
+; collapsing runs of spaces with it does not converge in a single pass.
+(def flatten-lines
+  (fn (text)
+    (let ((raw (split (trim (replace text "\n" " ")) " "))
+           (out (list))
+           (i 0))
+      (while (< i (len raw))
+        (if (= (trim (nth raw i)) "")
+          nil
+          (def out (append out (list (trim (nth raw i))))))
+        (def i (+ i 1)))
+      (join out " "))))
+
+; Frequency count over a list of words. `has`/`get`/`assoc` on a hash is the
+; whole map API, and `assoc` returns a NEW map — the original is untouched,
+; which is why the accumulator has to be threaded through the recursion
+; rather than mutated in place.
+(def word-counts
+  (fn (ws)
+    (if (= (len ws) 0) (hash)
+      (let ((w (first ws))
+            (rest-counts (word-counts (rest ws))))
+        (if (has rest-counts w)
+          (assoc rest-counts w (+ 1 (get rest-counts w)))
+          (assoc rest-counts w 1))))))
+
+; A helper that consumes a MODULE'S OWN IMPORT, to show that a module can use
+; its siblings. `main.ainl` still has to import `text` itself: a module does
+; not re-export what it imported, so the names it pulled in are not part of
+; its public surface.
+(def summarize
+  (fn (text)
+    (let ((ws (words text)))
+      (str (len ws) " words, " (len (keys (word-counts ws))) " distinct"))))

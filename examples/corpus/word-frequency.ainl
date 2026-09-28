@@ -1,0 +1,171 @@
+; @example   word-frequency
+; @summary   Tokenize a text, count the words, and report the most frequent ones.
+; @teaches   while, let, def-rebind, list, hash, assoc, selection sort
+; @scope     portable
+; @expect    most frequent: ("alpha" 4)
+; @run       ainl run examples/corpus/word-frequency.ainl
+;
+; The single most common real AINL shape: split some text, count it, report
+; it. Everything here is list and map operations — no I/O, no server.
+
+(def text "alpha beta alpha gamma beta alpha delta alpha epsilon beta")
+
+; --- tokenize --------------------------------------------------------------
+; `split` keeps TRAILING empty fields, so the empty guard is not optional: a
+; text ending in a space would otherwise contribute a final "" word.
+; `trim` removes the whitespace at each end and `downcase` folds case, so
+; "Alpha" and "alpha" are one word.
+;
+; `while` does NOT open a scope, so `def` in the body mutates the `let`'s own
+; bindings. Wrapping the body in a nested `let` would create a binding that
+; vanishes at the end of each iteration, and this function would return an
+; empty list — silently, on every backend.
+(def tokenize
+  (fn (t)
+    (let ((raw (split (trim (replace t "\n" " ")) " "))
+           (out (list))
+           (i 0))
+      (while (< i (len raw))
+        (def w (trim (nth raw i)))
+        (if (= w "") nil (def out (push out (downcase w))))
+        (def i (+ i 1)))
+      out)))
+
+(def words (tokenize text))
+(print "tokens:" (len words))
+(print words)
+
+; --- count -----------------------------------------------------------------
+; `assoc` returns a NEW map rather than mutating one, so the accumulator is
+; threaded through the recursion and returned. There is no mutable map to
+; update in place; `def`-ing the map inside a loop body would just rebind the
+; local to a fresh value each time and lose the count.
+(def count-words
+  (fn (ws)
+    (if (= (len ws) 0) (hash)
+      (let ((w (first ws))
+            (seen (count-words (rest ws))))
+        (if (has seen w)
+          (assoc seen w (+ 1 (get seen w)))
+          (assoc seen w 1))))))
+
+(def counts (count-words words))
+(print "distinct:" (len (keys counts)))
+(print "counts:" counts)
+
+; --- from a map to sortable pairs ------------------------------------------
+; A (word, count) pair is just a two-element list: `first` is the word and
+; `nth p 1` is the count. AINL has no tuples and no `sort`, so this is the
+; shape to reach for whenever a map has to be ordered by its values.
+(def to-pairs
+  (fn (h)
+    (let ((ks (keys h))
+           (out (list))
+           (i 0))
+      (while (< i (len ks))
+        (def out (push out (list (nth ks i) (get h (nth ks i)))))
+        (def i (+ i 1)))
+      out)))
+
+; --- selection sort, by count descending -----------------------------------
+; For each position, find the pair with the largest count and swap it there.
+; The swap needs an explicit remove-then-insert, because AINL has no
+; list-slicing or index-assignment builtin — `remove-at` and `insert-at` are
+; the two primitives a sort needs, and a general program ends up writing both.
+(def remove-at
+  (fn (xs i)
+    (let ((out (list))
+           (k 0))
+      (while (< k (len xs))
+        (if (= k i) nil (def out (push out (nth xs k))))
+        (def k (+ k 1)))
+      out)))
+
+(def insert-at
+  (fn (xs i v)
+    (let ((out (list))
+           (k 0))
+      (while (< k (len xs))
+        (if (= k i) (def out (push out v)) nil)
+        (def out (push out (nth xs k)))
+        (def k (+ k 1)))
+      (if (>= i (len xs)) (push out v) out))))
+
+; THE SCOPING TRAP, made concrete. This sort needs three loop variables, and
+; the obvious way to write it is to open a `let` for the inner two:
+;
+;     (while (< i n)
+;       (let ((best i) (j 0))        ; <-- WRONG
+;         ...))
+;
+; A `let` body IS A NEW SCOPE (docs/SYNTAX.md 2a), so every `def out` inside
+; it creates a binding that VANISHES at the end of the iteration. The sort
+; then returns its input completely unchanged, with no error, on every
+; backend — the worst possible failure, because it looks like it worked.
+;
+; `while` itself does NOT open a scope, so the fix is to keep the whole body
+; FLAT and declare `best` and `j` in the same `let` as `out` and `i`, before
+; the loop. That is also why the existing project examples write their loop
+; bodies flat. The rule: use one `let` for the whole function, and `do` (which
+; does not open a scope either) purely to group.
+(def sort-by-count
+  (fn (ps)
+    (let ((n (len ps))
+           (out ps)
+           (i 0)
+           (best 0)
+           (j 0)
+           (held-i nil)
+           (held-best nil))
+      (while (< i n)
+        (def best i)
+        ; THE SCAN STARTS AT `i`, NOT AT 0. Position 0 already holds the
+        ; largest count from the previous pass, so a scan from 0 immediately
+        ; re-finds it, sets `best` to 0, and then `(> best i)` is false for
+        ; every remaining i — the loop runs to completion having done nothing
+        ; after the first pass. Selection sort over a suffix is the whole
+        ; algorithm: positions before `i` are already final and must not be
+        ; considered again.
+        (def j i)
+        (while (< j n)
+          ; STRICT `>`, not `>=`: on a tie the earlier element stays the
+          ; maximum, so the sort is STABLE and the output is deterministic.
+          ; A sort whose result depends on strict-versus-non-strict is a sort
+          ; whose output can differ between backends, and this corpus is
+          ; compared byte-for-byte on four of them.
+          (if (> (nth (nth out j) 1) (nth (nth out best) 1))
+            (def best j)
+            nil)
+          (def j (+ j 1)))
+        (if (> best i)
+          (do
+            ; Hold BOTH values BEFORE removing anything: reading `(nth out
+            ; best)` from a list that has already had an element removed gets
+            ; whatever shifted into that slot.
+            (def held-i (nth out i))
+            (def held-best (nth out best))
+            (def out (remove-at out i))
+            ; `best - 1`, because the removal above shifted every later index
+            ; down by one.
+            (def out (remove-at out (- best 1)))
+            (def out (insert-at out i held-best))
+            (def out (insert-at out best held-i)))
+          nil)
+        (def i (+ i 1)))
+      out)))
+
+(def ranked (sort-by-count (to-pairs counts)))
+(print "ranked:" ranked)
+(print "most frequent:" (first ranked))
+
+; Every word that appears more than once, which is the query a real report
+; wants. `filter` is a list walk with a predicate — AINL has no builtin for
+; it, so this is the shape to reuse.
+(def frequent
+  (fn (ps)
+    (if (= (len ps) 0) (list)
+      (if (> (nth (first ps) 1) 1)
+        (cons (first ps) (frequent (rest ps)))
+        (frequent (rest ps))))))
+
+(print "appearing twice or more:" (frequent ranked))

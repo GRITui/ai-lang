@@ -1,0 +1,115 @@
+; @example   csv-report
+; @summary   Parse a CSV table into records and report counts and a total.
+; @teaches   split, list, hash, assoc, get, while, the limits of the stdlib
+; @scope     portable
+; @expect    rows per sku: {"A-1" 2 "B-2" 1}
+; @run       ainl run examples/corpus/csv-report.ainl
+;
+; The most common data job that is not JSON: turn delimited text into records
+; and compute something over them.
+;
+; THREE LIMITS OF THE STDLIB THIS EXAMPLE IS BUILT AROUND. They are stated
+; first because each one has a portable answer, and a reader who meets one
+; mid-program will think the language is broken rather than bounded.
+;
+;   1. `split` KEEPS trailing empty fields, so a line ending in a delimiter
+;      yields a final "" column. `trim` on every field hides this in ordinary
+;      data, which is why it is applied below.
+;
+;   2. THERE IS NO `str->int` CONVERSION BUILTIN. `(+ "3" 1)` is a type
+;      error, and AINL cannot build one from what it has: `nth` takes a LIST,
+;      `rest` takes a LIST, and `(split s "")` — the obvious way to get a list
+;      of characters — is an EXPLICIT ERROR, because JavaScript would return
+;      characters, Rust and C a trailing empty field, and Python would raise.
+;      AINL cannot index or iterate a string at all.
+;
+;      So a numeric field parsed from text stays a STRING, and the aggregate
+;      that needs arithmetic runs on values that were integers to begin with.
+;      That is not a workaround dressed up as a design; it is the actual
+;      boundary, and the two honest responses are to keep numbers as numbers
+;      upstream (parse the CSV in a host language and hand AINL a JSON
+;      document — see json-payload.ainl) or to add a `str->int` builtin, which
+;      would need the same four-backend treatment as the path functions in
+;      docs/SYNTAX.md 3.
+;
+;   3. There is no quote-aware splitter, so a field containing a quoted comma
+;      breaks. That is said here rather than papered over: shipping a parser
+;      that silently mangles such input is worse than one with a stated limit.
+
+(def csv
+  (str "sku,qty,price\n"
+       "A-1,2,9.50\n"
+       "B-2,5,2.75\n"
+       "A-1,1,4.25\n"))
+
+; --- split into lines and fields --------------------------------------------
+(def lines (split (trim csv) "\n"))
+(def header (split (first lines) ","))
+(print "header:" header)
+(print "data rows:" (- (len lines) 1))
+
+; --- one row -> a map ------------------------------------------------------
+; A record is a MAP keyed by the header names, not a positional list. That is
+; what makes the report below readable, and what would make it survive the
+; column order changing — a positional record would need the header re-read at
+; every access.
+;
+; `while` does NOT open a scope, so `def row` in the body mutates the `let`'s
+; own binding. Wrapping the body in a nested `let` would create a binding
+; that vanishes at the end of each iteration, and every record would come back
+; EMPTY — silently, and on every backend.
+(def to-row
+  (fn (fields)
+    (let ((row (hash))
+          (i 0))
+      (while (< i (len header))
+        (def row (assoc row (nth header i) (trim (nth fields i))))
+        (def i (+ i 1)))
+      row)))
+
+(def rows
+  (fn (ls)
+    (if (< (len ls) 1) (list)
+      (cons (to-row (split (first ls) ",")) (rows (rest ls))))))
+
+(def records (rows (rest lines)))
+(print "first record:" (first records))
+(print "price is still a string:" (get (first records) "price"))
+
+; --- group by a key, with a count ------------------------------------------
+; A group-by is a map from key -> count, and `assoc` builds it in one pass
+; because it returns a NEW map rather than mutating one. The result's
+; insertion order is the order the keys were first seen, which is
+; deterministic — so this report is stable across all four backends, and an
+; example can assert on its exact text.
+(def group-count
+  (fn (rs key)
+    (if (= (len rs) 0) (hash)
+      (let ((k (get (first rs) key))
+            (rest-counts (group-count (rest rs) key)))
+        (if (has rest-counts k)
+          (assoc rest-counts k (+ 1 (get rest-counts k)))
+          (assoc rest-counts k 1))))))
+
+(def by-sku (group-count records "sku"))
+(print "rows per sku:" by-sku)
+
+; A field-level check, to show that a record is an ordinary map: an absent key
+; is `nil`, and `has` is what distinguishes "absent" from "present and nil".
+(print "a missing column is nil:" (get (first records) "colour"))
+(print "has says so:" (has (first records) "colour"))
+
+; --- where the arithmetic does happen --------------------------------------
+; The quantities live in this list as AINL integers, because they were written
+; as integers to begin with. A program that RECEIVES numbers in a CSV has to
+; keep them as strings, or hand the whole table over as a JSON document —
+; which is the real lesson of this example, and the reason the aggregate above
+; is a count rather than a sum of the price column.
+(def quantities (list 2 5 1))
+
+(def total
+  (fn (xs)
+    (if (= (len xs) 0) 0
+      (+ (first xs) (total (rest xs))))))
+
+(print "total quantity:" (total quantities))

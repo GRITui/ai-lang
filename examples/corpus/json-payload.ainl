@@ -1,0 +1,72 @@
+; @example   json-payload
+; @summary   Parse an API-shaped JSON payload, extract fields, and re-serialize a summary.
+; @teaches   json-parse, json-serialize, hash, get, keys, list, fn
+; @scope     portable
+; @expect    summary: {"count":2,"units":7}
+; @run       ainl run examples/corpus/json-payload.ainl
+;
+; The shape almost every real AINL program has: a JSON document arrives as a
+; string, becomes a value, gets read, and leaves as a string.
+;
+; WHAT JSON BECOMES. The reader is hand-written in every backend rather than
+; mapped onto the host's JSON library, and it is a strict, unsurprising
+; mapping (docs/SYNTAX.md 3):
+;
+;     object -> hash (a map), keys in INSERTION order
+;     array  -> list
+;     string -> str    number -> int or float    true/false -> true/false
+;     null   -> nil
+;
+; Two consequences shape the code below. A parsed object is an ordinary AINL
+; map, so `get` is the only access syntax you ever need — no dotted paths, no
+; field syntax, and a nested object is reached with a nested `get`. And
+; because a map's equality is insertion-order-sensitive, re-serializing a
+; parsed object is idempotent in the way that matters: parse, write, parse
+; again and you get an equal value, because the order survived.
+
+(def payload
+  (json-parse
+    (str "{\"page\": 1, \"items\": ["
+         "{\"sku\": \"A-1\", \"name\": \"widget\", \"qty\": 2, \"price\": 9.5},"
+         "{\"sku\": \"B-2\", \"name\": \"gadget\", \"qty\": 5, \"price\": 2.75}"
+         "], \"meta\": {\"total\": 2}, \"cursor\": null}")))
+
+; --- reading nested fields --------------------------------------------------
+(print "page:" (get payload "page"))
+(print "meta.total:" (get (get payload "meta") "total"))
+; A key that is absent is `nil`, and a JSON `null` is ALSO `nil` — the two are
+; indistinguishable. That is a real limit of the mapping, and a program that
+; must tell "missing" from "explicitly null" cannot use this representation.
+(print "cursor:" (get payload "cursor") "(absent key gives the same:) " (get payload "nope"))
+
+(def items (get payload "items"))
+(print "items:" items)
+(print "first item's name:" (get (first items) "name"))
+
+; --- walking a list of records ---------------------------------------------
+; A parsed array is a plain list, so the ordinary list operations apply with no
+; JSON-specific code at all. AINL has no `map` builtin, so the fold is written
+; out; the accumulator is a second parameter, not a special closure.
+(def total-units
+  (fn (rows)
+    (if (= (len rows) 0) 0
+      (+ (get (first rows) "qty")
+         (total-units (rest rows))))))
+
+(print "total units:" (total-units items))
+
+; --- building a new document -----------------------------------------------
+; `(hash k v ...)` builds a map; insertion order is what `json-serialize`
+; prints, so the order here IS the order in the output. This is why a
+; hand-built document and a re-serialized one can be compared byte-for-byte.
+(def summary (hash "count" (len items) "units" (total-units items)))
+(def out (json-serialize summary))
+(print "summary:" out)
+
+; --- the round trip ---------------------------------------------------------
+; Re-parsing what we serialized gives a value equal to the one we built. This
+; is the property that makes it safe to hand a document to another system: the
+; text and the value agree.
+(def reparsed (json-parse out))
+(print "round trip is equal:" (= reparsed summary))
+(print "the original still parses cleanly:" (= (get (json-parse (json-serialize payload)) "page") 1))

@@ -262,7 +262,8 @@ reports it as **SKIP**, not a failure — everything else works without `cc`.
 ```sh
 cargo build --release
 
-ainl run examples/hello.ainl                  # interpret
+ainl run examples/corpus/countdown.ainl         # a loop — start here
+ainl run examples/corpus/word-frequency.ainl    # maps, counting, a sort
 ainl run examples/wordcount/main.ainl          # multi-file: (import "lib/...")
 ainl run examples/http/http-demo.ainl           # HTTP client (interpreter-only; see below)
 ainl repl                                      # interactive REPL
@@ -272,6 +273,9 @@ ainl transpile examples/fib.ainl --to python  # → python | js | ruby
 ainl ast examples/fib.ainl --json             # stable JSON + source spans
 ainl grammar --gbnf                          # the constrained-decoding grammar
 ```
+
+Ten complete programs live in [`examples/`](examples/README.md), each one
+runnable, commented, and checked in CI on every backend it claims to support.
 
 ## The language in 10 seconds
 
@@ -311,6 +315,9 @@ ai-lang/
 │   ├── ainl-transpile/    # AINL → Python / JavaScript / Ruby
 │   └── ainl-cli/          # the `ainl` binary
 ├── examples/              # sample .ainl programs
+│   ├── README.md          # the worked-example corpus: 10 runnable programs
+│   ├── corpus/            # …the programs themselves
+│   └── few-shot.txt       # …generated from them; the `ainl gen` prompt source
 ├── scripts/
 │   ├── gen-harness/       # the constrained-decoding harness (not in CI)
 │   ├── install.sh         # the one-line installer

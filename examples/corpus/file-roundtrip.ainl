@@ -1,0 +1,94 @@
+; @example   file-roundtrip
+; @summary   Read a file, transform its contents, and write it back out.
+; @teaches   file-io, read-file, write-file, delete-file, file-exists, string
+; @scope     portable
+; @expect    normalized: AINL IS A LIST OF FORMS
+; @run       ainl run examples/corpus/file-roundtrip.ainl
+;
+; The everyday shape: a program that owns a file it produced itself.
+;
+; WHERE THE FILE GOES, and why it is a fixed relative path:
+;
+;   * AINL has no notion of a current directory, so the program names the
+;     path explicitly.
+;   * `write-file` does NOT create parent directories. A missing directory is
+;     a `write-file: cannot write` error, not a silent mkdir — so the path
+;     must name a directory that already exists.
+;   * The name is FIXED, not derived from `env-get "TMPDIR"`. A corpus
+;     example's output is compared byte-for-byte against three transpiler
+;     targets and re-run on every CI job; a path containing a per-user
+;     temporary directory would make the output machine-dependent and turn
+;     that comparison into a coin flip. The path below lands in the repository
+;     root, which exists, and the program deletes the file before exiting, so
+;     a run leaves nothing behind.
+;
+; The cleanup is not optional. An example that leaks a file makes the checkout
+; dirty on every run, and a corpus people stop running is a corpus that stops
+; teaching.
+
+(def path "ainl-corpus-file-roundtrip.tmp")
+
+; --- write -----------------------------------------------------------------
+; A file's content is ONE string; newlines are ordinary characters inside it.
+; Nothing here "adds a line" — the program builds a string containing
+; newlines and the runtime writes those bytes exactly as they are.
+(write-file path (str "  ainl  is  a  list  of  forms\n"
+                      "the  second  line  has  double  spaces\n"
+                      "  and the third is indented\n"))
+(print "wrote 3 lines to" path)
+
+; --- read back -------------------------------------------------------------
+; The bytes just written are valid UTF-8 by construction, so `read-file`
+; returns a str and the round trip is byte-exact: the leading spaces on the
+; first and third lines are still there.
+(print "leading spaces survive the round trip:"
+       (first (split (read-file path) "\n")))
+
+; --- transform -------------------------------------------------------------
+; AINL cannot index a string (`(nth "abc" 1)` is an error — `nth` takes a
+; list), so text processing is `split` plus list operations. Here: split into
+; lines, trim each, drop the empties, upper-case.
+;
+; THREE THINGS THAT MAKE THIS CORRECT, all of them easy to get wrong:
+;
+;   1. `split` KEEPS trailing empty fields, so a file ending in "\n" yields a
+;      final "" element. The `(= (trim w) "")` guard removes it. Without it,
+;      the last line of every real file is a blank one.
+;
+;   2. `while` does NOT open a scope, so `def` in the body mutates the `let`'s
+;      own bindings. Wrapping the body in a nested `let` would create a
+;      binding that vanishes at the end of each iteration, and `out` would
+;      come back empty — silently, and on every backend.
+;
+;   3. `replace s "  " " "` is NOT a whitespace collapser, and this example
+;      does not pretend otherwise. It rewrites non-overlapping occurrences
+;      left to right, so four spaces become TWO, not one — one pass does not
+;      converge, and AINL has no regex to say "a run of whitespace" instead.
+;      What it does do is collapse the DOUBLE spaces this sample actually
+;      contains, and `trim` removes whatever the ends still carry. If you
+;      genuinely need runs collapsed, the honest AINL answer is `split` on " "
+;      and `join` with " " — which drops the empty fields that runs produce.
+;      That is a two-liner, and it is the shape used in flatten-lines.ainl.
+
+(def raw (split (read-file path) "\n"))
+(def out (list))
+(def i 0)
+(while (< i (len raw))
+  (def w (trim (replace (nth raw i) "  " " ")))
+  (if (= (trim w) "")
+    nil
+    (def out (push out (upcase w))))
+  (def i (+ i 1)))
+
+(print "normalized:" (join out " | "))
+
+; --- write it back ---------------------------------------------------------
+(write-file path (str (join out "\n") "\n"))
+(print "first line after rewriting:" (first (split (read-file path) "\n")))
+
+; --- clean up --------------------------------------------------------------
+; `delete-file` errors on a directory and on a missing path, so it is only
+; safe here because this program definitely just created the file. `file-exists`
+; returns `nil` (not `false`) for absence, which is why it prints as nil below.
+(delete-file path)
+(print "cleaned up; the file exists now?" (file-exists path))

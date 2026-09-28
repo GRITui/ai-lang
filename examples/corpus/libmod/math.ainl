@@ -1,0 +1,30 @@
+; lib/math.ainl — numeric helpers for the modules example.
+;
+; Pure functions over numbers. The point of this file in the example is not
+; the arithmetic (AINL has `+`, `-`, `*`, `/`); it is that a module's exports
+; are exactly its top-level `def`s, and that `main.ainl` has to import this
+; file ITSELF even though `text.ainl` already imported it. A module does not
+; re-export what it imported.
+
+(def square (fn (n) (* n n)))
+
+; Left fold, the standard shape. The accumulator is the second parameter and
+; the starting value is the first ARGUMENT — AINL has no default arguments,
+; so the caller supplies the seed. AINL has no `reduce` builtin, so every
+; program that needs one writes this.
+(def fold
+  (fn (f init xs)
+    (if (= (len xs) 0) init
+      (fold f (f init (first xs)) (rest xs)))))
+
+; A variadic function: `& extra` collects the arguments after the named ones
+; into a list. This is how an AINL function takes "the rest of them" without
+; a fixed arity — `(sum)` is legal and sums nothing, returning 0.
+(def sum-all
+  (fn (& ns)
+    (fold (fn (acc n) (+ acc n)) 0 ns)))
+
+; A function that RETURNS a function. There is no lambda shorthand, but
+; `(fn (x) ...)` is an ordinary value, so this is all the closure support
+; AINL has and it is enough for currying.
+(def adder (fn (n) (fn (m) (+ n m))))

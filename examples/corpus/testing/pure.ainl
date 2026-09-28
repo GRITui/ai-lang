@@ -1,0 +1,20 @@
+; pure.ainl — the module under test. Pure functions only: no I/O, no
+; printing, no environment. That is what makes each of these testable in
+; isolation, and it is the usual reason to split a file out at all.
+;
+; SCOPE: interpreter-only, because the file that imports it uses `import`.
+
+(def square (fn (n) (* n n)))
+
+(def append
+  (fn (a b)
+    (if (= (len a) 0) b
+      (cons (first a) (append (rest a) b)))))
+
+; A `cond`-style chain written out, because AINL has `if` and `and`/`or` but
+; no `cond`. The last `else` is just the final argument of the `if`.
+(def classify
+  (fn (n)
+    (if (< n 0) "negative"
+      (if (= n 0) "zero"
+        "positive"))))

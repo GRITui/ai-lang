@@ -1,0 +1,96 @@
+; @example   cli-tool
+; @summary   A small CLI: read arguments from the environment, validate, process, exit with a code.
+; @teaches   env-get, exit, error, or, contains, while, CLI shape
+; @scope     portable
+; @expect    cleaned 3
+; @run       ainl run examples/corpus/cli-tool.ainl
+;
+; The smallest genuinely useful program: arguments in, work, output, exit code.
+;
+; HOW AN AINL CLI GETS ITS ARGUMENTS — the one thing that surprises everyone
+; coming from a language with an `argv`:
+;
+; AINL HAS NO `argv` BUILTIN. `env-get` is the only channel a program has to
+; its caller. So a "command-line tool" reads named environment variables and
+; treats each as an optional flag. This is a real trade, not an oversight: a
+; real argv would have to be threaded through the interpreter, the bytecode
+; VM, the AOT C runtime's `main`, and three transpiler targets, and every one
+; of them would have to agree on what "no arguments" means. Environment
+; variables are the one input channel that already works identically on all
+; four backends.
+;
+; The consequence to internalize: `env-get` returns `nil` when the variable is
+; unset, and nil is FALSEY — so every read needs a default. `(or (env-get "X")
+; "d")` is the idiom, and forgetting it is how a CLI ends up doing arithmetic
+; on nil. Note that an EMPTY variable and an UNSET one are different values;
+; a tool that must tell them apart tests `(= (env-get "X") "")` explicitly.
+;
+; Try it:
+;
+;     AINL_TOOL_DIR=examples/corpus ainl run examples/corpus/cli-tool.ainl
+;     AINL_TOOL_EXT=.tmp   ainl run examples/corpus/cli-tool.ainl
+;
+; The defaults below point at a directory this example controls, so the
+; program produces the same output on every machine. A CLI example whose
+; result depends on whatever happens to be in the working directory is not a
+; portable example, and this corpus is checked byte-for-byte on four backends.
+
+; --- argument parsing ------------------------------------------------------
+(def dir (or (env-get "AINL_TOOL_DIR") "examples/corpus/libmod"))
+(def ext (or (env-get "AINL_TOOL_EXT") ".ainl"))
+(def verbose (env-get "AINL_TOOL_VERBOSE"))
+
+; A missing directory is an error from `list-dir` itself, so a tool that wants
+; to report it nicely checks first. `file-exists` returns `nil` (not `false`)
+; for absence, and true for a file OR a directory.
+(if (= (file-exists dir) nil)
+  (do
+    (print "no such directory:" dir)
+    (exit 1))
+  nil)
+
+; --- list and filter -------------------------------------------------------
+; `list-dir` returns NAMES sorted by byte value, not by locale — that
+; ordering is guaranteed on every backend precisely so a program like this
+; produces the same output everywhere. (Byte order puts "Capital.txt" before
+; "beta.txt", where a locale-aware collation would not.)
+(def entries (list-dir dir))
+(if verbose (print "verbose: scanned" (len entries) "entries") nil)
+
+; AINL has no `map`/`filter` builtin, so filtering is a plain list walk with a
+; predicate. `contains hay needle` is a substring test, which is the right
+; tool for "does this name end in the extension I was asked for".
+(def keep-entry? (fn (name) (contains name ext)))
+
+(def matching (list))
+(def i 0)
+(while (< i (len entries))
+  (if (keep-entry? (nth entries i))
+    (def matching (push matching (nth entries i)))
+    nil)
+  (def i (+ i 1)))
+
+(print "scanned" (len entries) "entries in" dir)
+(print "matching" ext ":" matching)
+
+; --- exit codes are the contract -------------------------------------------
+; `exit` ends the process with that status, and it is the only way a program
+; tells a shell whether it succeeded:
+;
+;     if ainl run tool.ainl; then echo ok; fi
+;
+; A tool that prints an error and then returns NORMALLY exits 0, which tells
+; the shell everything worked — the single most common way a script goes wrong.
+; So every failure path here exits explicitly, and the success path exits 0.
+(if (= (len matching) 0)
+  (do
+    (print "nothing matched" ext "under" dir)
+    (exit 1))
+  nil)
+
+; What the tool would actually DO with the matches. This example only reports,
+; because deleting files is not something a teaching example should do to
+; whatever directory it was pointed at.
+(print "would process:" (join matching ", "))
+(print "cleaned" (len matching))
+(exit 0)

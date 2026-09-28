@@ -1,0 +1,53 @@
+; @example   run-tests
+; @summary   A module of pure functions with an accompanying test file, run by `ainl test`.
+; @teaches   test builtin, ainl test, modules, unit tests
+; @scope     interpreter-only
+; @expect    tested 3
+; @run       ainl run examples/corpus/testing/run-tests.ainl
+; @test      ainl test examples/corpus/testing/suite
+;
+; `test` is an ordinary builtin, not a special form and not a separate
+; language. `(test name expr expected)` evaluates `expr`, compares the result
+; against `expected` **as a string**, and returns `true` — or aborts with a
+; message naming the test, the expected value and the actual one.
+;
+; THE THREE RULES THAT MATTER:
+;
+;   1. The expectation is a STRING, written in quotes: `"3"`, not `3`. The
+;      comparison is textual, which means it works identically on every
+;      backend and for every value type — but it also means `"3"` and `3` are
+;      the same expectation, and `(test "x" 3.0 "3.0")` is the only way to
+;      assert on a float, since floats print with a mandatory `.0`.
+;
+;   2. A FAILURE IS AN ERROR, not a printed line. That is deliberate. A test
+;      that fails and keeps going can leave later assertions asserting on
+;      state the failure already invalidated, and it makes "how many passed"
+;      a number nobody can trust. The first failure in a file aborts that
+;      file; `ainl test` still runs the remaining files and reports the split.
+;
+;   3. A SUITE IS A DIRECTORY OR A FILE, and the exit code is the contract:
+;      0 when every test passed, non-zero otherwise. That is the whole reason
+;      the runner exists — a script needs a boolean, not a pretty summary.
+;
+; WHY THESE LIVE IN A SEPARATE DIRECTORY: the test file imports the module
+; under test, so it can exercise pure functions without any of the module's
+; I/O. And because `test` is portable, this suite runs on the interpreter,
+; the AOT binary and all three transpiler targets.
+
+(import "pure")
+
+; --- the module's own smoke check ------------------------------------------
+; A program can assert about itself at run time, not only under `ainl test`.
+; That is the difference between the two: `ainl test` is a development tool
+; that runs a whole suite and reports a summary; a `(test ...)` at the top
+; level is just a builtin call that guards a claim before the program uses it.
+(test "square 7" (square 7) "49")
+(test "append preserves order" (append (list 1 2) (list 3)) "(1 2 3)")
+(test "classify sorts a number" (classify 5) "positive")
+
+; The same module, exercised through the runner.
+(print "tested" 3 "assertions inline; the full suite is in suite/")
+
+; Point at the suite so a reader knows exactly what to run:
+;   ainl test examples/corpus/testing/suite
+(print "run the suite with:" "ainl test examples/corpus/testing/suite")

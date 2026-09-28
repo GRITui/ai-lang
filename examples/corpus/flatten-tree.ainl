@@ -1,0 +1,109 @@
+; @example   flatten-tree
+; @summary   A recursive function that flattens a nested list, plus map/filter/reduce written in AINL.
+; @teaches   recursion, higher-order, list, fn
+; @scope     portable
+; @expect    flattened: (1 2 3 4 5 6)
+; @run       ainl run examples/corpus/flatten-tree.ainl
+;
+; Two different recursion styles, side by side, because real AINL uses both:
+;
+;   1. `flatten` recurses on a *structurally recursive* value — a value that is
+;      either an atom or a list of such values, to any depth. A tree is not
+;      just "a list", and a shape that never nests needs no case for nesting.
+;
+;   2. `map1`/`filter1`/`reduce` recurse on a *flat* list with a base case on
+;      `(len l) = 0`. This is the shape you will write most often, and it is
+;      AINL's stand-in for the iteration a language with a `for` would give
+;      you. All three take a function as an argument, which is what makes
+;      them reusable instead of three hardcoded loops.
+;
+; THE ONE TRICK IN HERE, and the reason the tree below can hold bare numbers:
+; AINL has NO `list?` type predicate. `(len 5)` and `(has 5 "k")` are type
+; errors, not `false` — so the obvious generic walker, which asks "is this
+; element a list or a number?", cannot be written directly.
+;
+; What *does* work, and is exact on all four backends, is testing the JSON
+; spelling of the value: a list serializes to something starting with "[",
+; an atom to something starting with "{", a digit, a quote or a letter. So
+;
+;     (def listy? (fn (x) (= (first (split (json-serialize x) "[")) "")))
+;
+; is a working, portable `list?`. It costs a serialization per element, which
+; is why you should reach for it only when the shape genuinely is recursive —
+; for a flat list, `(len l)` is the whole story and you never need this.
+; (An AOT binary behaves the same here; note that `ainl compile` does not
+; type-check, it generates code that fails at run time, so "AOT compiled
+; successfully" is never evidence that a program is correct.)
+
+; --- 1. recursion over a nested structure ----------------------------------
+; A portable `list?`, built from the JSON spelling. Splitting on "[" is the
+; trick: for a list the string starts with the separator, so the part before
+; it is the empty string; for anything else it is the value's own text.
+(def listy?
+  (fn (x) (= (first (split (json-serialize x) "[")) "")))
+
+; AINL has no `append` builtin, and this is the one you will write first.
+; `cons` prepends and `push` appends *values* to a list, so neither can join
+; two lists of unknown length. This walks `a` and conses each element onto
+; the recursion, which puts the elements back in their original order.
+(def append
+  (fn (a b)
+    (if (= (len a) 0) b
+      (cons (first a) (append (rest a) b)))))
+
+(print "append:" (append (list 1 2) (list 3 4 5)))
+
+; The base case is "no elements left". Otherwise: if the head is itself a
+; list, flatten it and put it in front; if it is an atom, keep it in front.
+; Note the argument order: `cons` takes the VALUE first and the list second,
+; so everything here builds right-to-left.
+(def flatten
+  (fn (xs)
+    (if (= (len xs) 0) (list)
+      (if (listy? (first xs))
+        (append (flatten (first xs)) (flatten (rest xs)))
+        (cons (first xs) (flatten (rest xs)))))))
+
+; A mixed tree, exactly the shape that cannot be written without `listy?`:
+; atoms and lists side by side, nested three deep.
+(def tree (list 1 (list 2 3) (list (list 4) 5) 6))
+
+(print "tree:     " tree)
+(print "flattened:" (flatten tree))
+
+; A flat list is the same function with no nesting at all — which is why
+; `listy?` costs more than it looks, and why a flat list should just use it.
+(def flat (list 1 2 3))
+(print "flat:     " (flatten flat))
+
+; --- 2. map / filter / reduce, all in AINL ---------------------------------
+; Higher-order means a function is an ordinary value: it can be passed,
+; returned and stored. There is no lambda syntax to learn — `(fn (x) ...)` is
+; the value.
+(def map1
+  (fn (f xs)
+    (if (= (len xs) 0) (list)
+      (cons (f (first xs)) (map1 f (rest xs))))))
+
+(def filter1
+  (fn (pred xs)
+    (if (= (len xs) 0) (list)
+      (if (pred (first xs))
+        (cons (first xs) (filter1 pred (rest xs)))
+        (filter1 pred (rest xs))))))
+
+; `reduce` is the one with an accumulator, and the accumulator is an ordinary
+; second parameter — the starting value is the *argument*, not the parameter.
+(def reduce1
+  (fn (f init xs)
+    (if (= (len xs) 0) init
+      (reduce1 f (f init (first xs)) (rest xs)))))
+
+(def nums (list 1 2 3 4 5 6))
+(print "kept:    " (filter1 (fn (n) (= (mod n 2) 0)) nums))
+(print "doubled: " (map1 (fn (n) (* n 2)) nums))
+(print "total:   " (reduce1 (fn (acc n) (+ acc n)) 0 nums))
+
+; The three compose, which is the point of taking functions as arguments.
+(print "sum of the evens:" (reduce1 (fn (a n) (+ a n)) 0
+                                     (filter1 (fn (n) (= (mod n 2) 0)) nums)))
