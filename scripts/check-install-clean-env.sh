@@ -130,17 +130,20 @@ fi
 # The *build* target is baked in by build.rs from the Rust compile target, not
 # from `uname` — so it is whatever this binary was actually compiled for. The
 # asset *name* above comes from `uname` and can be faked (see
-# check-platform-matrix.sh); the build target cannot. Asserting it is one of the
-# real release targets therefore proves the bake-in works without pretending a
-# macOS binary can report itself as Linux.
-case "$ver" in
-  *aarch64-apple-darwin*|*x86_64-unknown-linux-musl*)
-    pass "reports a real build target"
-    ;;
-  *)
-    bad "no known build target in --version: $ver"
-    ;;
-esac
+# check-platform-matrix.sh); the build target cannot. So the assertion is that
+# it names a real Rust target triple, not that it equals the asset's target:
+# CI compiles a plain `x86_64-unknown-linux-gnu` binary (the musl artifact is
+# the *release* job's), and a source build on any host is legitimately neither
+# of the two shipped assets. What matters is that the field is populated with a
+# triple-shaped value rather than degrading to "unknown".
+TARGET_FIELD=$(printf '%s' "$ver" | sed -n 's/^ainl [^ ]* \([^ ]*\).*/\1/p')
+if [ -z "$TARGET_FIELD" ]; then
+  bad "no build target field in --version: $ver"
+elif printf '%s' "$TARGET_FIELD" | grep -Eq '^[a-z0-9_]+(-[a-z0-9_]+)+$'; then
+  pass "reports a Rust build target ($TARGET_FIELD)"
+else
+  bad "build target '$TARGET_FIELD' is not a target triple: $ver"
+fi
 if echo "$ver" | grep -qE '\([0-9a-f]{12}\)'; then pass "reports the source commit"; else bad "no commit in --version"; fi
 
 echo

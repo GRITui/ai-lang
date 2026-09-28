@@ -249,6 +249,12 @@ jobs:
       - name: platform matrix (packaging suite as macOS and as Linux)
         run: ./scripts/check-platform-matrix.sh
 
+      # The --version parser the clean-env test relies on, pinned against every
+      # shape the binary can print — including a degraded "unknown" target,
+      # which must be rejected rather than read as a triple.
+      - name: --version field parsing
+        run: ./scripts/check-version-field.sh
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest
