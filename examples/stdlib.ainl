@@ -160,3 +160,31 @@
 (def f (fn (n) (- (* 1.5 n) 1)))
 (def row (fn (i) (f (+ (* 2 i) 1))))
 (print "pipeline=" (list (row 0) (row 1) (row 2) (row 3)))
+
+; ---- json-parse / json-serialize ------------------------------------------
+; Reader and writer, both directions. Every number below is deliberately NOT a
+; bare integer: JS has a single number type, so `(json-serialize 1)` gives 1.0
+; there and 1 everywhere else (docs/NUMERIC_MODEL.md). Keeping whole numbers
+; out of this file is what lets the whole section be compared byte for byte
+; against all three transpiler targets. The integer cases are covered
+; case-by-case in crates/ainl-transpile/tests/json_parity.rs instead.
+(def doc (json-parse "{\"name\":\"ainl\",\"tags\":[\"a\",\"b\"],\"ok\":true,\"n\":null}"))
+(print "json-obj =" (json-serialize doc))
+(print "json-tag =" (json-serialize (get doc "tags")))
+(print "json-key =" (get doc "name") (get doc "ok") (get doc "n"))
+; key order is insertion order, not sorted
+(print "json-ord =" (json-serialize (hash "z" 1.5 "a" 2.5 "m" 3.5)))
+; a duplicate key keeps its first position and takes the last value, the same
+; rule (hash) and (assoc) use
+(print "json-dup =" (json-serialize (json-parse "{\"a\":1.5,\"b\":2.5,\"a\":9.5}")))
+; round trip: value identity, then byte stability
+(def rt (json-parse (json-serialize doc)))
+(print "json-rt  =" (json-serialize rt) (= doc rt))
+; escaping: only " \ \n \r \t and \u00xx for other controls; non-ASCII stays
+; literal (JSON.stringify would \u-escape it and every target would disagree)
+(print "json-str =" (json-serialize (json-parse "\"\\u00e9\\u4e2d\\ud83d\\ude00\\u0007\"")))
+(print "json-esc =" (json-serialize "\"") (json-serialize "\\") (json-serialize "\n\r\t")
+        (json-serialize "/"))
+; floats print fixed-point with a .0 on a whole value, never scientific
+(print "json-flt =" (json-serialize (/ 1.0 3)) (json-serialize 0.1))
+(print "json-sci =" (json-serialize 1e-7) (json-serialize 1e21))

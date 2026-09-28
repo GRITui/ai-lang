@@ -163,6 +163,63 @@ With four different answers, deferring to the host would mean the language behav
 
 **Why each of these has a hand-written rule per backend.** AINL has four execution backends — the interpreter/VM, the AOT-compiled C binary, and the Python, JavaScript and Ruby transpiler targets — and a builtin is only real when all five agree. Most of them do, because they map to the host's own facility. The ones above don't, and each of those cases has a test pinning the AINL answer: ASCII case folding and trimming, an empty split separator, an empty replace target, numeric-only `min`/`max`, the errors for a negative `sqrt` or `sleep`, **valid-UTF-8 `read-file`, and the whole path algebra** (the `path-*` builtins reimplement the rules rather than calling `os.path` / `path` / `File`, because the hosts give different answers for the same input — see the table above). `crates/ainl-core/src/eval.rs` is the normative implementation and the other four are written to match it; `crates/ainl-cc/tests/aot_stdlib.rs` and the three `*_stdlib.rs` transpiler suites are what keep them there.
 
+**JSON**: `(json-parse text)` → a value, `(json-serialize value)` → a string.
+
+The reader and writer are hand-written in every backend rather than mapped to
+the host's JSON library. Each host library is wrong here in a way that shows up
+in output bytes, not just in types: `json.loads`/`JSON.parse` return a `dict`/
+plain object rather than an AINL map (losing insertion order and the
+duplicate-key rule), `JSON.parse` accepts `NaN` and `Infinity`, and
+`JSON.stringify`/`JSON.generate`/`json.dumps` each print floats their own way
+and `\u`-escape non-ASCII. `crates/ainl-core/src/json_value.rs` is normative;
+`crates/ainl-transpile/tests/json_parity.rs` runs the same programs on all five
+backends and diffs the bytes.
+
+Type mapping, both directions:
+
+| JSON | AINL | notes |
+|---|---|---|
+| object | `hash` (map) | keys are `str` only; order is **insertion order** |
+| array | `list` | |
+| string | `str` | |
+| integer literal | `int` | a literal that fits `i64`; anything larger is a float |
+| `1.5`, `1e3` | `float` | any decimal or exponent form is a float |
+| `true` / `false` | `true` / `false` | |
+| `null` | `nil` | |
+
+Four rules a reader would not guess:
+
+- **Object keys must be `str`.** `(json-serialize (hash 1.5 "v"))` is an error
+  (`object keys must be str, got float`) rather than a coerced `"1.5"`, because
+  coercion cannot round-trip: AINL compares a string and a float as different
+  keys, so the re-parsed map would not be `=` to the original.
+- **Insertion order is preserved**, including for a duplicate key: `{"a":1.5,
+  "b":2.5, "a":9.5}` parses to a two-entry map holding `9.5` at `a`'s *first*
+  position. That is the same first-position/last-value rule `(hash)` and
+  `(assoc)` already use, so a parsed object and a hand-built one behave alike.
+- **Floats print fixed-point, never scientific**, using the shortest decimal
+  that reads back as the same number, with a mandatory `.0` on a whole value:
+  `1.0` → `1.0`, `1e-7` → `0.0000001`, `(/ 1 3.0)` → `0.3333333333333333`,
+  `1e21` → `1000000000000000000000.0`. The `.0` is what keeps a float
+  distinguishable from an int in the text — without it the two would be
+  indistinguishable to any reader. This is *not* `print`'s float rule, which
+  prints a whole float's exact binary expansion; see
+  [NUMERIC_MODEL.md](NUMERIC_MODEL.md#json-serialize-has-its-own-float-rule).
+- **Round trip means value identity, not text identity.** `1.50e2` reads back
+  as `150.0`, and re-serializing is then idempotent. Non-finite floats, symbols
+  and functions are errors — they have no JSON form.
+
+Rejected as malformed (all with a byte offset): trailing content, a leading
+zero, a bare `.5` or `1.`, a lone `+`, a control character inside a string, an
+unknown escape, a truncated or unpaired `\u` surrogate, nesting deeper than 512
+levels, and a duplicate key is fine but a non-string key is not.
+
+One documented divergence, in JS only: a JS `Number` is a single type, so
+`(json-serialize 1)` gives `1.0` there and `1` everywhere else, and an
+`int` inside a container likewise prints as `1.0`. Whole *floats* agree, and the
+output is valid JSON that re-parses to an equal value in both cases. This is
+the same int/float collapse the language already documents for `print`.
+
 ## 4. Canonical examples
 
 ```lisp

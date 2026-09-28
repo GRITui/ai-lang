@@ -611,6 +611,13 @@ fn install_stdlib(env: &Env) {
     b!("max", |a| builtin_minmax(a, true));
     b!("floor", builtin_floor);
     b!("sqrt", builtin_sqrt);
+
+    // JSON. The normative implementation lives in its own module because it
+    // is the longest single rule set in the language and has to be readable
+    // side-by-side with its three ports; see json_value.rs for the four design
+    // decisions (string keys only, insertion-order objects, one canonical
+    // float spelling, non-finite floats are an error).
+    crate::json_value::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------

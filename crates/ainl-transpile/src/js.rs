@@ -101,6 +101,25 @@ impl Js {
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
+        // Tier 1 JSON. The whole cluster is pulled in by either entry point,
+        // because `_ainl_tname` (json-parse's type error, and the "keys must be
+        // str, got t" message) branches on _Hash and _Sym, and _json_ser needs
+        // _Hash to tell a map from a list. The RUNTIME table is emitted in
+        // declaration order, so `_ainl_tname` precedes every helper that uses
+        // it and `_Hash`/`_Sym` precede `_json_ser`.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_json_parse_b" | "_json_serialize_b"))
+        {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_json_parse");
+            self.needed.insert("_json_ser");
+            self.needed.insert("_json_str");
+            self.needed.insert("_json_float");
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+        }
         let mut out = String::new();
         out.push_str("// Transpiled from AINL by `ainl transpile --to js`.\n");
         out.push_str("// Generated code: edit the .ainl source, not this file.\n\n");
@@ -353,6 +372,13 @@ impl Js {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 1 JSON ----
+                "json-parse" => {
+                    return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
+                }
+                "json-serialize" => {
+                    return self.call_builtin("_json_serialize_b", args, Some("_json_serialize_b"))
+                }
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -735,6 +761,69 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_ainl_tname",
         "function _ainl_tname(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (typeof x === \"boolean\") return \"bool\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  if (typeof x === \"string\") return \"str\";\n  if (Array.isArray(x)) return \"list\";\n  if (x instanceof _Hash) return \"hash\";\n  if (x instanceof _Sym) return \"sym\";\n  if (typeof x === \"function\") return \"fn\";\n  return \"?\";\n}",
+    ),
+    // ---- Tier 1 JSON ----
+    // JS is the hardest of the four for json-serialize, and the reason is
+    // structural rather than fixable: JS has ONE number type, so a parsed
+    // `1.0` and a parsed `1` are the same value (`1.0 === 1`), and there is no
+    // way to tell them apart at serialize time. So `_json_float` has to
+    // decide what to emit for a whole number without knowing which it was.
+    //
+    // AINL's answer — the one the other three backends also implement — is
+    // that a *whole* number always gets a ".0". That is well defined for a
+    // value that genuinely has no fractional part, and it means a JS program's
+    // json-serialize output is always valid JSON, always re-parses, and always
+    // agrees with the other backends for every value that is not the literal
+    // integer 1/2/3/... written as a whole number. The residual difference is
+    // documented in docs/SYNTAX.md and docs/NUMERIC_MODEL.md: `(json-parse
+    // "[1.0]")` is a float in the interpreter and the int 1 in JS, so
+    // re-serializing it gives `[1.0]` and `[1]`. That is the same int/float
+    // collapse the language already documents for `print` and `min`/`max`; it
+    // is a property of the target, not a bug in this builtin.
+    //
+    // JSON.parse/JSON.stringify are deliberately NOT used. JSON.stringify
+    // (a) drops the ".0" on a whole number, (b) emits scientific notation
+    // ("1e+300"), and (c) escapes non-ASCII as \uXXXX — each of which alone
+    // would break byte-identity with the other three backends.
+    (
+        "_json_float",
+        // Shortest round-trip digits via toPrecision(17) shrinking, then a
+        // shift out of scientific notation. `String(x)` is not usable: it
+        // gives "1e+300" and "1" (no ".0").
+        // Shortest representation that round-trips, as [digits, exponent10].
+        // NOT toFixed: that is only specified up to 1e21 and returns
+        // exponential form beyond it, so it cannot be the rule for a value
+        // that all four backends must print identically.
+        "function _json_float(x) {\n  if (!Number.isFinite(x)) {\n    const n = Number.isNaN(x) ? \"NaN\" : (x > 0 ? \"inf\" : \"-inf\");\n    throw new Error(`json-serialize: cannot serialize ${n} (not a finite number)`);\n  }\n  if (x === 0) return \"0.0\";\n  const neg = x < 0;\n  const ax = neg ? -x : x;\n  let s = \"\";\n  for (let p = 1; p <= 17; p++) {\n    s = ax.toPrecision(p);\n    if (Number(s) === ax) break;\n  }\n  // s looks like \"d.dddde+XX\" or \"d.dddd\" depending on magnitude.\n  const e = s.indexOf(\"e\");\n  let digits, point;\n  if (e === -1) {\n    digits = s.replace(\".\", \"\");\n    point = s.indexOf(\".\") === -1 ? digits.length : s.indexOf(\".\");\n  } else {\n    const mant = s.slice(0, e);\n    const exp = parseInt(s.slice(e + 1), 10);\n    digits = mant.replace(\".\", \"\");\n    point = mant.indexOf(\".\") === -1 ? mant.length : mant.indexOf(\".\");\n    point += exp;\n  }\n  // Trailing zeros beyond the significant digits are not printed.\n  digits = digits.replace(/0+$/, \"\");\n  if (digits === \"\") digits = \"0\";\n  let out;\n  if (point <= 0) out = \"0.\" + \"0\".repeat(-point) + digits;\n  else if (point >= digits.length) out = digits + \"0\".repeat(point - digits.length) + \".0\";\n  else out = digits.slice(0, point) + \".\" + digits.slice(point);\n  return (neg ? \"-\" : \"\") + out;\n}",
+    ),
+    (
+        "_json_str",
+        // One escaping rule, identical in all four backends: '\"', '\\\\', '\\n',
+        // '\\r', '\\t', and \\u00xx for every other C0 control. Never '\\b'/'\\f'
+        // (read on input, never written). Non-ASCII is emitted literally —
+        // JSON.stringify would emit \\uXXXX here and every non-ASCII program
+        // would then disagree with the other three backends.
+        "function _json_str(s) {\n  let out = '\"';\n  for (const ch of s) {\n    const o = ch.codePointAt(0);\n    if (ch === '\"') out += '\\\\\"';\n    else if (ch === '\\\\') out += '\\\\\\\\';\n    else if (ch === '\\n') out += '\\\\n';\n    else if (ch === '\\r') out += '\\\\r';\n    else if (ch === '\\t') out += '\\\\t';\n    else if (o < 0x20) out += '\\\\u' + o.toString(16).padStart(4, '0');\n    else out += ch;\n  }\n  return out + '\"';\n}",
+    ),
+    (
+        "_json_ser",
+        "function _json_ser(v, depth) {\n  if (depth === undefined) depth = 0;\n  if (depth > 512) throw new Error('json-serialize: nesting too deep (max 512 levels)');\n  if (v === null || v === undefined) return 'null';\n  if (v === true) return 'true';\n  if (v === false) return 'false';\n  if (typeof v === 'number') return _json_float(v);\n  if (typeof v === 'string') return _json_str(v);\n  // _Hash is not an Array subclass in this target, but keep the map branch\n  // first anyway so the two container kinds can never be confused.\n  if (v instanceof _Hash) {\n    const parts = [];\n    for (const p of v) {\n      if (typeof p[0] !== 'string' || p[0] instanceof _Sym) {\n        throw new Error('json-serialize: object keys must be str, got ' + _ainl_tname(p[0]));\n      }\n      parts.push(_json_str(p[0]) + ':' + _json_ser(p[1], depth + 1));\n    }\n    return '{' + parts.join(',') + '}';\n  }\n  if (Array.isArray(v)) return '[' + v.map((e) => _json_ser(e, depth + 1)).join(',') + ']';\n  if (v instanceof _Sym) throw new Error('json-serialize: cannot serialize a sym');\n  if (typeof v === 'function') throw new Error('json-serialize: cannot serialize a fn');\n  throw new Error('json-serialize: cannot serialize a ' + _ainl_tname(v));\n}",
+    ),
+    (
+        "_json_parse",
+        // A hand-written reader, not JSON.parse: JSON.parse would give a plain
+        // object (not a _Hash), would not implement AINL's first-position
+        // duplicate-key rule, would accept NaN/Infinity, and would not report
+        // a byte offset for an error message.
+        "function _json_parse(s) {\n  let i = 0;\n  const n = s.length;\n  const err = (m) => { throw new Error(`json-parse: ${m} at position ${i}`); };\n  const ws = () => { while (i < n && (s[i] === ' ' || s[i] === '\\t' || s[i] === '\\n' || s[i] === '\\r')) i++; };\n  const value = (depth) => {\n    if (depth > 512) throw new Error('json-parse: nesting too deep (max 512 levels)');\n    ws();\n    if (i >= n) err('unexpected end of input');\n    const c = s[i];\n    if (c === '{') return obj(depth);\n    if (c === '[') return arr(depth);\n    if (c === '\"') { i++; return string(); }\n    if (s.startsWith('true', i)) { i += 4; return true; }\n    if (s.startsWith('false', i)) { i += 5; return false; }\n    if (s.startsWith('null', i)) { i += 4; return null; }\n    if (c === '-' || (c >= '0' && c <= '9')) return number();\n    err('unexpected character');\n  };\n  const obj = (depth) => {\n    i++;\n    const m = new _Hash();\n    ws();\n    if (i < n && s[i] === '}') { i++; return m; }\n    for (;;) {\n      ws();\n      if (i >= n || s[i] !== '\"') err('expected a string key');\n      i++;\n      const k = string();\n      ws();\n      if (i >= n || s[i] !== ':') err(\"expected ':' after a key\");\n      i++;\n      const v = value(depth + 1);\n      // Last value wins, first position — as hash/assoc do.\n      let at = -1;\n      for (let q = 0; q < m.length; q++) if (m[q][0] === k) { at = q; break; }\n      if (at >= 0) m[at][1] = v; else m.push([k, v]);\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === '}') { i++; return m; }\n      err(\"expected ',' or '}'\");\n    }\n  };\n  const arr = (depth) => {\n    i++;\n    const items = [];\n    ws();\n    if (i < n && s[i] === ']') { i++; return items; }\n    for (;;) {\n      items.push(value(depth + 1));\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === ']') { i++; return items; }\n      err(\"expected ',' or ']'\");\n    }\n  };\n  const hex4 = () => {\n    if (i + 4 > n) err('truncated \\\\u escape');\n    const v = parseInt(s.slice(i, i + 4), 16);\n    if (isNaN(v)) err('invalid \\\\u escape');\n    i += 4;\n    return v;\n  };\n  const string = () => {\n    let out = '';\n    for (;;) {\n      if (i >= n) err('unterminated string');\n      const c = s[i];\n      if (c === '\"') { i++; return out; }\n      i++;\n      if (c === '\\\\') {\n        if (i >= n) err('unterminated escape');\n        const e = s[i++];\n        if (e === '\"') out += '\"';\n        else if (e === '\\\\') out += '\\\\';\n        else if (e === '/') out += '/';\n        else if (e === 'b') out += '\\b';\n        else if (e === 'f') out += '\\f';\n        else if (e === 'n') out += '\\n';\n        else if (e === 'r') out += '\\r';\n        else if (e === 't') out += '\\t';\n        else if (e === 'u') {\n          const hi = hex4();\n          if (hi >= 0xd800 && hi <= 0xdbff) {\n            if (!(i + 1 < n && s[i] === '\\\\' && s[i + 1] === 'u')) err('unpaired surrogate');\n            i += 2;\n            const lo = hex4();\n            if (lo < 0xdc00 || lo > 0xdfff) err('invalid low surrogate');\n            out += String.fromCodePoint(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));\n          } else if (hi >= 0xdc00 && hi <= 0xdfff) err('unpaired surrogate');\n          else out += String.fromCodePoint(hi);\n        } else err('invalid escape');\n      } else if (c.charCodeAt(0) < 0x20) err('control character in string');\n      else out += c;\n    }\n  };\n  const number = () => {\n    const start = i;\n    if (s[i] === '-') i++;\n    if (i >= n) err('expected a digit');\n    if (s[i] === '0') {\n      i++;\n      if (i < n && s[i] >= '0' && s[i] <= '9') err('leading zero in number');\n    } else if (s[i] >= '1' && s[i] <= '9') {\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    } else err('expected a digit');\n    let isFloat = false;\n    if (i < n && s[i] === '.') {\n      isFloat = true; i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err(\"expected a digit after '.'\");\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    if (i < n && (s[i] === 'e' || s[i] === 'E')) {\n      isFloat = true; i++;\n      if (i < n && (s[i] === '+' || s[i] === '-')) i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err('expected a digit in the exponent');\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    const t = s.slice(start, i);\n    // JS has one number type, so an int-looking literal is a Number too — the\n    // int/float distinction the other backends keep simply does not exist here.\n    return Number(t);\n  };\n  const v = value(0);\n  ws();\n  if (i !== n) err('trailing content after the value');\n  return v;\n}",
+    ),
+    (
+        "_json_parse_b",
+        "function _json_parse_b(s) {\n  if (typeof s !== 'string' || s instanceof _Sym) throw new TypeError('json-parse expects a str, got ' + _ainl_tname(s));\n  return _json_parse(s);\n}",
+    ),
+    (
+        "_json_serialize_b",
+        "function _json_serialize_b(v) {\n  return _json_ser(v, 0);\n}",
     ),
     (
         "_split",

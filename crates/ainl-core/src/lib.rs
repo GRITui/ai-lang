@@ -9,6 +9,7 @@ pub mod deserialize;
 pub mod error;
 pub mod eval;
 pub mod grammar;
+pub mod json_value;
 pub mod lexer;
 pub mod parser;
 pub mod serialize;

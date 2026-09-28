@@ -131,6 +131,9 @@ enum {
    * crates/ainl-cc/tests/aot_stdlib.rs. */
   B_FILE_EXISTS, B_DELETE_FILE, B_LIST_DIR,
   B_PATH_JOIN, B_PATH_BASE, B_PATH_DIR,
+  /* Tier 1 JSON. Appended at the end for the same reason as the Tier 1 file
+   * ids above: every earlier id keeps the value it has always had. */
+  B_JSON_PARSE, B_JSON_SERIALIZE,
   B_COUNT
 };
 
@@ -214,6 +217,21 @@ static void v_unref(Value *v) {
   default:
     break;
   }
+}
+
+/* Free a Map at refcount zero. json-parse builds Maps by hand while filling
+ * them, and a parse error part-way through has to release the partial map —
+ * v_unref can't be used there because the Value is never returned. */
+static void map_free(Map *m) {
+  if (!m)
+    return;
+  for (int i = 0; i < m->n; i++) {
+    v_unref(&m->keys[i]);
+    v_unref(&m->vals[i]);
+  }
+  free(m->keys);
+  free(m->vals);
+  free(m);
 }
 
 /* Free a cons chain iteratively (a derived recursive free would overflow the
@@ -2191,6 +2209,11 @@ static Value builtin_sqrt(Value *args, int nargs) {
   return v_float(sqrt(x));
 }
 
+/* Forward declarations: v_call's dispatch switch sits above the JSON
+ * implementation, which is grouped with the other Tier 1 code further down. */
+static Value builtin_json_parse(Value *args, int nargs);
+static Value builtin_json_serialize(Value *args, int nargs);
+
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
   tick(); /* bounds recursion / runaway calls */
@@ -2304,6 +2327,10 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_floor(args, nargs);
     case B_SQRT:
       return builtin_sqrt(args, nargs);
+    case B_JSON_PARSE:
+      return builtin_json_parse(args, nargs);
+    case B_JSON_SERIALIZE:
+      return builtin_json_serialize(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -2501,6 +2528,750 @@ static inline void slot_set(Value *locals, int i, Value val) {
   locals[i] = val;
 }
 
+/* ---- JSON --------------------------------------------------------------- */
+/* The normative implementation is crates/ainl-core/src/json_value.rs; this is
+ * a line-for-line port of it, including every error message. The four design
+ * decisions (string keys only, insertion-order objects, one canonical float
+ * spelling, non-finite floats are an error) are documented there and each is
+ * cited below where it is implemented.
+ *
+ * The parser walks raw bytes rather than UTF-8 code points so its error
+ * offsets are byte offsets, exactly like the Rust parser's `self.i`. */
+#define JSON_MAX_DEPTH 512
+
+typedef struct {
+  const char *b;
+  size_t len;
+  size_t i;
+} JParser;
+
+static Value jp_err(JParser *p, const char *msg) {
+  set_err("json-parse: %s at position %zu", msg, p->i);
+  return v_nil();
+}
+static void jp_ws(JParser *p) {
+  while (p->i < p->len) {
+    char c = p->b[p->i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+      p->i++;
+    else
+      break;
+  }
+}
+static int jp_hex4(JParser *p, unsigned int *out) {
+  if (p->i + 4 > p->len) {
+    set_err("json-parse: truncated \\u escape at position %zu", p->i);
+    return 0;
+  }
+  unsigned int v = 0;
+  for (int k = 0; k < 4; k++) {
+    char c = p->b[p->i + k];
+    unsigned int d;
+    if (c >= '0' && c <= '9')
+      d = (unsigned int)(c - '0');
+    else if (c >= 'a' && c <= 'f')
+      d = (unsigned int)(c - 'a') + 10;
+    else if (c >= 'A' && c <= 'F')
+      d = (unsigned int)(c - 'A') + 10;
+    else {
+      set_err("json-parse: invalid \\u escape at position %zu", p->i);
+      return 0;
+    }
+    v = v * 16 + d;
+  }
+  p->i += 4;
+  *out = v;
+  return 1;
+}
+/* Decode a code point to UTF-8 into `buf` (max 4 bytes); returns its length.
+ * Lone surrogates and out-of-range values are errors in the caller. */
+static size_t utf8_encode(unsigned int cp, char *buf) {
+  if (cp < 0x80) {
+    buf[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    buf[0] = (char)(0xC0 | (cp >> 6));
+    buf[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    buf[0] = (char)(0xE0 | (cp >> 12));
+    buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  buf[0] = (char)(0xF0 | (cp >> 18));
+  buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  buf[3] = (char)(0x80 | (cp & 0x3F));
+  return 4;
+}
+/* Read a JSON string body (the opening quote is already consumed). On success
+ * returns a malloc'd NUL-terminated UTF-8 buffer and sets *out_len. */
+static char *jp_string(JParser *p, size_t *out_len) {
+  size_t cap = 32, w = 0;
+  char *out = malloc(cap);
+  if (!out) {
+    set_err("json-parse: out of memory");
+    return NULL;
+  }
+  for (;;) {
+    if (p->i >= p->len) {
+      free(out);
+      set_err("json-parse: unterminated string at position %zu", p->i);
+      return NULL;
+    }
+    unsigned char c = (unsigned char)p->b[p->i];
+    if (c == '"') {
+      p->i++;
+      out[w] = 0;
+      *out_len = w;
+      return out;
+    }
+    /* Room for one more UTF-8 sequence (4 bytes) plus the terminator. */
+    if (w + 5 > cap) {
+      size_t ncap = cap * 2;
+      char *n = realloc(out, ncap);
+      if (!n) {
+        free(out);
+        set_err("json-parse: out of memory");
+        return NULL;
+      }
+      out = n;
+      cap = ncap;
+    }
+    p->i++;
+    if (c == '\\') {
+      if (p->i >= p->len) {
+        free(out);
+        set_err("json-parse: unterminated escape at position %zu", p->i);
+        return NULL;
+      }
+      char e = p->b[p->i++];
+      /* \b and \f are read (JSON allows both) but never written — see
+       * json_write_string in the Rust module for why one spelling wins. */
+      switch (e) {
+      case '"': out[w++] = '"'; break;
+      case '\\': out[w++] = '\\'; break;
+      case '/': out[w++] = '/'; break;
+      case 'b': out[w++] = '\b'; break;
+      case 'f': out[w++] = '\f'; break;
+      case 'n': out[w++] = '\n'; break;
+      case 'r': out[w++] = '\r'; break;
+      case 't': out[w++] = '\t'; break;
+      case 'u': {
+        unsigned int hi;
+        if (!jp_hex4(p, &hi)) {
+          free(out);
+          return NULL;
+        }
+        unsigned int cp;
+        if (hi >= 0xD800 && hi <= 0xDBFF) {
+          /* High surrogate: must be followed by \uDC00..\uDFFF. */
+          if (!(p->i + 1 < p->len && p->b[p->i] == '\\' && p->b[p->i + 1] == 'u')) {
+            free(out);
+            jp_err(p, "unpaired surrogate");
+            return NULL;
+          }
+          p->i += 2;
+          unsigned int lo;
+          if (!jp_hex4(p, &lo)) {
+            free(out);
+            return NULL;
+          }
+          if (lo < 0xDC00 || lo > 0xDFFF) {
+            free(out);
+            jp_err(p, "invalid low surrogate");
+            return NULL;
+          }
+          cp = 0x10000u + ((hi - 0xD800u) << 10) + (lo - 0xDC00u);
+        } else if (hi >= 0xDC00 && hi <= 0xDFFF) {
+          free(out);
+          jp_err(p, "unpaired surrogate");
+          return NULL;
+        } else {
+          cp = hi;
+        }
+        w += utf8_encode(cp, out + w);
+        break;
+      }
+      default:
+        free(out);
+        jp_err(p, "invalid escape");
+        return NULL;
+      } /* end switch (e) */
+    } else if (c < 0x20) {
+      /* A raw control character is not legal inside a JSON string. Rejecting
+       * it is what makes a serialize/parse round-trip always produce a
+       * document a parser accepts. */
+      free(out);
+      jp_err(p, "control character in string");
+      return NULL;
+    } else if (c < 0x80) {
+      out[w++] = (char)c;
+    } else {
+      /* Literal UTF-8: copy the whole sequence. AINL strings are validated
+       * UTF-8 at creation, so a lead byte here always starts a character. */
+      size_t start = p->i - 1;
+      size_t end = p->i;
+      while (end < p->len && ((unsigned char)p->b[end] & 0xC0) == 0x80)
+        end++;
+      size_t n = end - start;
+      while (w + n + 1 > cap) {
+        size_t ncap = cap * 2;
+        char *nn = realloc(out, ncap);
+        if (!nn) {
+          free(out);
+          set_err("json-parse: out of memory");
+          return NULL;
+        }
+        out = nn;
+        cap = ncap;
+      }
+      memcpy(out + w, p->b + start, n);
+      w += n;
+      p->i = end;
+    }
+  }
+}
+static Value jp_value(JParser *p, int depth);
+
+static Value jp_object(JParser *p, int depth) {
+  p->i++; /* '{' */
+  Map *m = malloc(sizeof(Map));
+  m->ref = 1;
+  m->n = 0;
+  m->keys = malloc(sizeof(Value));
+  m->vals = malloc(sizeof(Value));
+  jp_ws(p);
+  if (p->i < p->len && p->b[p->i] == '}') {
+    p->i++;
+    Value r;
+    r.tag = V_MAP;
+    r.u.m = m;
+    return r;
+  }
+  for (;;) {
+    jp_ws(p);
+    if (p->i >= p->len || p->b[p->i] != '"') {
+      map_free(m);
+      return jp_err(p, "expected a string key");
+    }
+    p->i++;
+    size_t klen;
+    char *kdata = jp_string(p, &klen);
+    if (!kdata) {
+      map_free(m);
+      return v_nil();
+    }
+    Str *kst = malloc(sizeof(Str));
+    kst->ref = 1;
+    kst->len = klen;
+    kst->data = kdata;
+    Value kv;
+    kv.tag = V_STR;
+    kv.u.s = kst;
+    jp_ws(p);
+    if (p->i >= p->len || p->b[p->i] != ':') {
+      v_unref(&kv);
+      map_free(m);
+      return jp_err(p, "expected ':' after a key");
+    }
+    p->i++;
+    Value v = jp_value(p, depth + 1);
+    if (g_err) {
+      v_unref(&kv);
+      map_free(m);
+      return v_nil();
+    }
+    /* Same "last value wins, first position" rule as hash/assoc. */
+    int found = -1;
+    for (int i = 0; i < m->n; i++) {
+      if (values_eq(&m->keys[i], &kv)) {
+        found = i;
+        break;
+      }
+    }
+    if (found >= 0) {
+      v_unref(&m->vals[found]);
+      m->vals[found] = v;
+      v_unref(&kv);
+    } else {
+      m->keys = realloc(m->keys, (size_t)(m->n + 1) * sizeof(Value));
+      m->vals = realloc(m->vals, (size_t)(m->n + 1) * sizeof(Value));
+      m->keys[m->n] = kv;
+      m->vals[m->n] = v;
+      m->n++;
+    }
+    jp_ws(p);
+    if (p->i < p->len && p->b[p->i] == ',') {
+      p->i++;
+      continue;
+    }
+    if (p->i < p->len && p->b[p->i] == '}') {
+      p->i++;
+      Value r;
+      r.tag = V_MAP;
+      r.u.m = m;
+      return r;
+    }
+    map_free(m);
+    return jp_err(p, "expected ',' or '}'");
+  }
+}
+static Value jp_array(JParser *p, int depth) {
+  p->i++; /* '[' */
+  Value *items = NULL;
+  int n = 0, cap = 0;
+  jp_ws(p);
+  if (p->i < p->len && p->b[p->i] == ']') {
+    p->i++;
+    return v_list_empty();
+  }
+  for (;;) {
+    if (n == cap) {
+      cap = cap ? cap * 2 : 8;
+      Value *ni = realloc(items, (size_t)cap * sizeof(Value));
+      if (!ni) {
+        for (int i = 0; i < n; i++)
+          v_unref(&items[i]);
+        free(items);
+        set_err("json-parse: out of memory");
+        return v_nil();
+      }
+      items = ni;
+    }
+    Value v = jp_value(p, depth + 1);
+    if (g_err) {
+      for (int i = 0; i < n; i++)
+        v_unref(&items[i]);
+      free(items);
+      return v_nil();
+    }
+    items[n++] = v;
+    jp_ws(p);
+    if (p->i < p->len && p->b[p->i] == ',') {
+      p->i++;
+      continue;
+    }
+    if (p->i < p->len && p->b[p->i] == ']') {
+      p->i++;
+      return v_list_from_array(items, n);
+    }
+    for (int i = 0; i < n; i++)
+      v_unref(&items[i]);
+    free(items);
+    return jp_err(p, "expected ',' or ']'");
+  }
+}
+static Value jp_number(JParser *p) {
+  size_t start = p->i;
+  if (p->i < p->len && p->b[p->i] == '-')
+    p->i++;
+  if (p->i >= p->len) {
+    set_err("json-parse: expected a digit at position %zu", p->i);
+    return v_nil();
+  }
+  if (p->b[p->i] == '0') {
+    p->i++;
+    if (p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9') {
+      set_err("json-parse: leading zero in number at position %zu", p->i);
+      return v_nil();
+    }
+  } else if (p->b[p->i] >= '1' && p->b[p->i] <= '9') {
+    while (p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9')
+      p->i++;
+  } else {
+    set_err("json-parse: expected a digit at position %zu", p->i);
+    return v_nil();
+  }
+  int is_float = 0;
+  if (p->i < p->len && p->b[p->i] == '.') {
+    is_float = 1;
+    p->i++;
+    if (!(p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9')) {
+      set_err("json-parse: expected a digit after '.' at position %zu", p->i);
+      return v_nil();
+    }
+    while (p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9')
+      p->i++;
+  }
+  if (p->i < p->len && (p->b[p->i] == 'e' || p->b[p->i] == 'E')) {
+    is_float = 1;
+    p->i++;
+    if (p->i < p->len && (p->b[p->i] == '+' || p->b[p->i] == '-'))
+      p->i++;
+    if (!(p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9')) {
+      set_err("json-parse: expected a digit in the exponent at position %zu", p->i);
+      return v_nil();
+    }
+    while (p->i < p->len && p->b[p->i] >= '0' && p->b[p->i] <= '9')
+      p->i++;
+  }
+  size_t n = p->i - start;
+  char *text = malloc(n + 1);
+  memcpy(text, p->b + start, n);
+  text[n] = 0;
+  if (!is_float) {
+    /* An integer literal that fits i64 becomes Value::Int, so `(get (json-parse
+     * "{\"a\":1}") "a")` is an int and prints `1`. Anything larger becomes an
+     * f64 — the same i64-range rule the rest of AINL uses, and what the Rust
+     * parser's `text.parse::<i64>()` does.
+     *
+     * Overflow is detected by digit count rather than by inspecting strtoll's
+     * return: strtoll *saturates* on overflow (returning LLONG_MAX/MIN with
+     * errno set), so "did it parse everything" and "is it in range" would be
+     * two different checks on a value that already lost information. Counting
+     * digits answers the range question directly. */
+    const char *d = text;
+    int neg = (*d == '-');
+    if (neg)
+      d++;
+    size_t ndigits = strlen(d);
+    /* i64: at most 19 digits, or exactly 19 starting with '1'..'8' (or '9' with
+     * no more digits, for INT64_MAX). INT64_MIN has 19 digits starting '9'. */
+    int fits = 0;
+    if (ndigits <= 18) {
+      fits = 1;
+    } else if (ndigits == 19) {
+      /* 19 digits: compare against the 19-digit bounds, ignoring the sign for
+       * the magnitude (the magnitude bound is 2^63 for the negative side). */
+      static const char *max19 = "9223372036854775807";
+      static const char *minmag19 = "9223372036854775808";
+      fits = neg ? (strcmp(d, minmag19) <= 0) : (strcmp(d, max19) <= 0);
+    }
+    if (fits) {
+      char *endp = NULL;
+      long long ll = strtoll(text, &endp, 10);
+      if (endp && *endp == 0) {
+        free(text);
+        return v_int((int64_t)ll);
+      }
+    }
+  }
+  double dv = strtod(text, NULL);
+  free(text);
+  return v_float(dv);
+}
+static Value jp_value(JParser *p, int depth) {
+  if (depth > JSON_MAX_DEPTH) {
+    set_err("json-parse: nesting too deep (max %d levels)", JSON_MAX_DEPTH);
+    return v_nil();
+  }
+  jp_ws(p);
+  if (p->i >= p->len) {
+    set_err("json-parse: unexpected end of input at position %zu", p->i);
+    return v_nil();
+  }
+  char c = p->b[p->i];
+  if (c == '{')
+    return jp_object(p, depth);
+  if (c == '[')
+    return jp_array(p, depth);
+  if (c == '"') {
+    p->i++;
+    size_t slen;
+    char *s = jp_string(p, &slen);
+    if (!s)
+      return v_nil();
+    Str *st = malloc(sizeof(Str));
+    st->ref = 1;
+    st->len = slen;
+    st->data = s;
+    Value r;
+    r.tag = V_STR;
+    r.u.s = st;
+    return r;
+  }
+  if (c == 't') {
+    if (p->i + 4 <= p->len && memcmp(p->b + p->i, "true", 4) == 0) {
+      p->i += 4;
+      return v_bool(1);
+    }
+    return jp_err(p, "expected 'true'");
+  }
+  if (c == 'f') {
+    if (p->i + 5 <= p->len && memcmp(p->b + p->i, "false", 5) == 0) {
+      p->i += 5;
+      return v_bool(0);
+    }
+    return jp_err(p, "expected 'false'");
+  }
+  if (c == 'n') {
+    if (p->i + 4 <= p->len && memcmp(p->b + p->i, "null", 4) == 0) {
+      p->i += 4;
+      return v_nil();
+    }
+    return jp_err(p, "expected 'null'");
+  }
+  if (c == '-' || (c >= '0' && c <= '9'))
+    return jp_number(p);
+  return jp_err(p, "unexpected character");
+}
+
+/* (json-parse string) -> value */
+static Value builtin_json_parse(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("json-parse expects (json-parse string)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "json-parse");
+  if (!s)
+    return v_nil();
+  JParser p;
+  p.b = s;
+  p.len = args[0].u.s->len; /* byte length, not strlen: a NUL is possible */
+  p.i = 0;
+  Value v = jp_value(&p, 0);
+  if (g_err)
+    return v_nil();
+  jp_ws(&p);
+  if (p.i != p.len) {
+    return jp_err(&p, "trailing content after the value");
+  }
+  return v;
+}
+
+/* ---- json-serialize --------------------------------------------------- */
+/* A growable byte buffer. json-serialize output can be much larger than its
+ * input (1e300 is a 303-byte literal), so nothing here can be a fixed size. */
+typedef struct {
+  char *p;
+  size_t len;
+  size_t cap;
+} Buf;
+static int buf_reserve(Buf *b, size_t extra) {
+  if (b->len + extra + 1 <= b->cap)
+    return 1;
+  size_t ncap = b->cap ? b->cap : 128;
+  while (ncap < b->len + extra + 1)
+    ncap *= 2;
+  char *np = realloc(b->p, ncap);
+  if (!np)
+    return 0;
+  b->p = np;
+  b->cap = ncap;
+  return 1;
+}
+static int buf_put(Buf *b, const char *s, size_t n) {
+  if (!buf_reserve(b, n))
+    return 0;
+  memcpy(b->p + b->len, s, n);
+  b->len += n;
+  b->p[b->len] = 0;
+  return 1;
+}
+static int buf_putc(Buf *b, char c) { return buf_put(b, &c, 1); }
+
+/* Write a JSON string literal. One spelling per escape, matching the Rust
+ * module: `"` `\\` `\n` `\r` `\t`, and `\u00xx` for every other C0 control —
+ * notably NOT `\b` or `\f`, which the reader accepts but the writer never
+ * emits, so all four backends produce identical bytes. Non-ASCII is emitted as
+ * literal UTF-8. */
+static int json_write_string(Buf *b, Str *s) {
+  if (!buf_putc(b, '"'))
+    return 0;
+  for (size_t i = 0; i < s->len; i++) {
+    unsigned char c = (unsigned char)s->data[i];
+    switch (c) {
+    case '"': if (!buf_put(b, "\\\"", 2)) return 0; break;
+    case '\\': if (!buf_put(b, "\\\\", 2)) return 0; break;
+    case '\n': if (!buf_put(b, "\\n", 2)) return 0; break;
+    case '\r': if (!buf_put(b, "\\r", 2)) return 0; break;
+    case '\t': if (!buf_put(b, "\\t", 2)) return 0; break;
+    default:
+      if (c < 0x20) {
+        char esc[7];
+        snprintf(esc, sizeof(esc), "\\u%04x", c);
+        if (!buf_put(b, esc, 6))
+          return 0;
+      } else {
+        /* Copy the whole UTF-8 sequence verbatim. */
+        size_t n = 1;
+        if (c >= 0xF0)
+          n = 4;
+        else if (c >= 0xE0)
+          n = 3;
+        else if (c >= 0xC0)
+          n = 2;
+        if (i + n > s->len)
+          n = 1;
+        if (!buf_put(b, s->data + i, n))
+          return 0;
+        i += n - 1;
+      }
+    }
+  }
+  return buf_putc(b, '"');
+}
+
+/* Decision 3: the one canonical float spelling — the *shortest* decimal that
+ * round-trips, in fixed-point notation, with a mandatory ".0" on a whole
+ * value.
+ *
+ * NOT format_float() above: that is a port of `Value`'s Display, which prints
+ * a whole float's exact binary expansion (303 characters for 1e300) rather
+ * than the shortest form. The shortest form is what all four backends can
+ * actually compute — JS's toFixed is undefined above 1e21 and returns
+ * exponential form there — so it is the rule. The digits come from the same
+ * %.{p}e shortening loop format_float uses, but the trailing ".0" is appended
+ * to the shortest form rather than expanded exactly. */
+static int json_write_float(Buf *b, double x) {
+  if (isnan(x)) {
+    set_err("json-serialize: cannot serialize NaN (not a finite number)");
+    return 0;
+  }
+  if (x == INFINITY || x == -INFINITY) {
+    set_err("json-serialize: cannot serialize %s (not a finite number)",
+            x == INFINITY ? "inf" : "-inf");
+    return 0;
+  }
+  if (x == 0.0)
+    return buf_put(b, "0.0", 3); /* also normalizes -0.0 */
+  int neg = signbit(x);
+  double ax = neg ? -x : x;
+  /* Shortest round-tripping significant digits. */
+  char tmp[64];
+  int best_p = 16;
+  for (int p = 0; p <= 16; p++) {
+    snprintf(tmp, sizeof(tmp), "%.*e", p, ax);
+    if (strtod(tmp, NULL) == ax) {
+      best_p = p;
+      break;
+    }
+  }
+  snprintf(tmp, sizeof(tmp), "%.*e", best_p, ax);
+  /* tmp is "d[.ddd]e±NN" — split it into digits and a decimal-point position. */
+  char *e = strchr(tmp, 'e');
+  int exp10 = (int)strtol(e + 1, NULL, 10);
+  char digits[32];
+  int nd = 0;
+  for (char *q = tmp; q < e; q++) {
+    if (*q != '.')
+      digits[nd++] = *q;
+  }
+  digits[nd] = 0;
+  /* value = 0.digits * 10^point */
+  int point = exp10 + 1;
+  char out[4096];
+  int oi = 0;
+  if (point <= 0) {
+    out[oi++] = '0';
+    out[oi++] = '.';
+    for (int k = 0; k < -point; k++)
+      out[oi++] = '0';
+    for (int k = 0; k < nd; k++)
+      out[oi++] = digits[k];
+  } else if (point >= nd) {
+    for (int k = 0; k < nd; k++)
+      out[oi++] = digits[k];
+    for (int k = 0; k < point - nd; k++)
+      out[oi++] = '0';
+    out[oi++] = '.';
+    out[oi++] = '0'; /* the ".0" that marks it a float */
+  } else {
+    for (int k = 0; k < point; k++)
+      out[oi++] = digits[k];
+    out[oi++] = '.';
+    for (int k = point; k < nd; k++)
+      out[oi++] = digits[k];
+  }
+  out[oi] = 0;
+  if (neg) {
+    memmove(out + 1, out, (size_t)oi);
+    out[0] = '-';
+    out[oi + 1] = 0;
+  }
+  return buf_put(b, out, strlen(out));
+}
+
+static int json_write_value(Buf *b, Value *v, int depth) {
+  if (depth > JSON_MAX_DEPTH) {
+    set_err("json-serialize: nesting too deep (max %d levels)", JSON_MAX_DEPTH);
+    return 0;
+  }
+  switch (v->tag) {
+  case V_NIL: return buf_put(b, "null", 4);
+  case V_BOOL: return buf_put(b, v->u.b ? "true" : "false", v->u.b ? 4 : 5);
+  case V_INT: {
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "%lld", (long long)v->u.i);
+    return buf_put(b, tmp, strlen(tmp));
+  }
+  case V_FLOAT: return json_write_float(b, v->u.f);
+  case V_STR: return json_write_string(b, v->u.s);
+  case V_LIST: {
+    if (!buf_putc(b, '['))
+      return 0;
+    ConsCell *c = v->u.l;
+    int first = 1;
+    while (c && c->len > 0) {
+      if (!first && !buf_putc(b, ','))
+        return 0;
+      first = 0;
+      if (!json_write_value(b, &c->head, depth + 1))
+        return 0;
+      c = c->tail;
+    }
+    return buf_putc(b, ']');
+  }
+  case V_MAP: {
+    if (!buf_putc(b, '{'))
+      return 0;
+    Map *m = v->u.m;
+    for (int i = 0; i < m->n; i++) {
+      if (i > 0 && !buf_putc(b, ','))
+        return 0;
+      /* Decision 1: a non-string key has no faithful JSON form. */
+      if (m->keys[i].tag != V_STR) {
+        set_err("json-serialize: object keys must be str, got %s",
+                type_name(&m->keys[i]));
+        return 0;
+      }
+      if (!json_write_string(b, m->keys[i].u.s))
+        return 0;
+      if (!buf_putc(b, ':'))
+        return 0;
+      if (!json_write_value(b, &m->vals[i], depth + 1))
+        return 0;
+    }
+    return buf_putc(b, '}');
+  }
+  case V_SYM:
+    set_err("json-serialize: cannot serialize a sym");
+    return 0;
+  default:
+    set_err("json-serialize: cannot serialize a %s", type_name(v));
+    return 0;
+  }
+}
+
+/* (json-serialize value) -> str */
+static Value builtin_json_serialize(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("json-serialize expects (json-serialize value)");
+    return v_nil();
+  }
+  Buf b;
+  b.p = NULL;
+  b.len = 0;
+  b.cap = 0;
+  if (!json_write_value(&b, &args[0], 0)) {
+    free(b.p);
+    if (!g_err)
+      set_err("json-serialize: out of memory");
+    return v_nil();
+  }
+  if (!b.p) {
+    /* An empty output cannot happen (every value writes at least one byte),
+     * but v_str_take would take a NULL. */
+    b.p = malloc(1);
+    b.p[0] = 0;
+  }
+  return v_str_take(b.p);
+}
+
 /* ---- prelude ----------------------------------------------------------- */
 static void scope_install_prelude(Scope *env) {
   struct {
@@ -2526,6 +3297,8 @@ static void scope_install_prelude(Scope *env) {
       {"file-exists", B_FILE_EXISTS}, {"delete-file", B_DELETE_FILE},
       {"list-dir", B_LIST_DIR}, {"path-join", B_PATH_JOIN},
       {"path-base", B_PATH_BASE}, {"path-dir", B_PATH_DIR},
+      /* Tier 1 JSON */
+      {"json-parse", B_JSON_PARSE}, {"json-serialize", B_JSON_SERIALIZE},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

@@ -118,6 +118,24 @@ impl Py {
                 self.needed.insert("_Sym");
             }
         }
+        // Tier 1 JSON. Both entry points pull in the whole cluster, because
+        // `_ainl_tname` (needed for json-parse's type error) branches on
+        // `_Sym` and `_Hash`, and the RUNTIME table is emitted in declaration
+        // order — so `_Sym`/`_Hash` must be emitted before the first helper
+        // that mentions them by name.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_json_parse_b" | "_json_serialize_b"))
+        {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_json_parse");
+            self.needed.insert("_json_ser");
+            self.needed.insert("_json_str");
+            self.needed.insert("_json_float");
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to python`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -382,6 +400,13 @@ impl Py {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 1 JSON ----
+                "json-parse" => {
+                    return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
+                }
+                "json-serialize" => {
+                    return self.call_builtin("_json_serialize_b", args, Some("_json_serialize_b"))
+                }
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -712,6 +737,61 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_keys", "def _keys(h):\n    return [pair[0] for pair in h]"),
     ("_vals", "def _vals(h):\n    return [pair[1] for pair in h]"),
     ("_error", "def _error(*xs):\n    raise RuntimeError(' '.join(_disp(x) for x in xs))"),
+    // ---- Tier 1 JSON ----
+    // Python is the one host with a real JSON parser, but `json.loads` cannot
+    // be used directly: it returns dicts (unordered-by-contract, and the
+    // equality/round-trip rules are AINL's own), and `json.dumps` emits
+    // scientific notation for some floats plus its own key order. Both are
+    // replaced by hand-written code that follows
+    // crates/ainl-core/src/json_value.rs — the normative spec — for the four
+    // documented decisions: str keys only, insertion-order objects, one
+    // canonical float spelling, non-finite floats are an error.
+    //
+    // The parser is hand-written rather than json.loads for one more reason:
+    // a map is a _Hash (a list of pairs) in this target, and `json.loads` would
+    // silently change duplicate-key behavior (Python keeps the last value but
+    // not AINL's first-position rule) and produce plain dicts that _disp
+    // couldn't tell from a list.
+    (
+        // The AINL type name for a value, for json-parse's type error and
+        // json-serialize's "keys must be str, got t" message. The bool checks
+        // come before the int check because Python's bool is a subclass of
+        // int — `isinstance(True, int)` is True, and "got int" for a bool
+        // would be a wrong error message in the one backend that can express
+        // the mistake.
+        "_ainl_tname",
+        "def _ainl_tname(x):\n    if x is None: return 'nil'\n    if x is True or x is False: return 'bool'\n    if isinstance(x, _Sym): return 'sym'\n    if isinstance(x, str): return 'str'\n    if isinstance(x, _Hash): return 'hash'\n    if isinstance(x, list): return 'list'\n    if isinstance(x, float): return 'float'\n    if isinstance(x, int): return 'int'\n    if callable(x): return 'fn'\n    return '?'",
+    ),
+    (
+        "_json_float",
+        // The canonical float spelling: plain fixed-point, never scientific,
+        // with a mandatory '.0' on a whole value. The digits are the shortest
+        // that round-trip. NOT '%.1f' on a whole value (that is `Value`'s
+        // Display rule, which prints the exact binary expansion) and NOT
+        // repr() (which emits '1e+300'). The shortest form is the rule because
+        // it is the one all four backends can compute — JS `toFixed` is
+        // undefined above 1e21 and returns exponential form there.
+        "def _json_float(x):\n    if x != x or x in (float('inf'), float('-inf')):\n        raise ValueError('json-serialize: cannot serialize %s (not a finite number)' % ('NaN' if x != x else ('inf' if x > 0 else '-inf')))\n    if x == 0.0: return '0.0'\n    # Shortest round-trip digits, then shifted out of scientific notation.\n    r = repr(x)\n    if 'e' not in r and 'E' not in r: return r\n    mant, exp = r.lower().split('e')\n    exp = int(exp)\n    neg = mant.startswith('-')\n    if neg: mant = mant[1:]\n    if '.' in mant: ip, fp = mant.split('.')\n    else: ip, fp = mant, ''\n    digits = ip + fp\n    point = len(ip) + exp\n    if point <= 0: out = '0.' + '0' * (-point) + digits\n    elif point >= len(digits): out = digits + '0' * (point - len(digits)) + '.0'\n    else: out = digits[:point] + '.' + digits[point:]\n    return ('-' + out) if neg else out",
+    ),
+    (
+        "_json_str",
+        // One escaping rule, shared with every other backend: '\"', '\\\\',
+        // '\\n', '\\r', '\\t', and \\u00xx for every other C0 control. Notably
+        // never '\\b' or '\\f' (read on input, never written), so a Python
+        // program and an AOT one emit the same bytes. Non-ASCII stays literal
+        // UTF-8; json.dumps' default ensure_ascii=True is deliberately not used.
+        "def _json_str(s):\n    out = ['\"']\n    for ch in s:\n        o = ord(ch)\n        if ch == '\"': out.append('\\\\\"')\n        elif ch == '\\\\': out.append('\\\\\\\\')\n        elif ch == '\\n': out.append('\\\\n')\n        elif ch == '\\r': out.append('\\\\r')\n        elif ch == '\\t': out.append('\\\\t')\n        elif o < 0x20: out.append('\\\\u%04x' % o)\n        else: out.append(ch)\n    out.append('\"')\n    return ''.join(out)",
+    ),
+    (
+        "_json_ser",
+        "def _json_ser(v, depth=0):\n    if depth > 512: raise ValueError('json-serialize: nesting too deep (max 512 levels)')\n    if v is None: return 'null'\n    if v is True: return 'true'\n    if v is False: return 'false'\n    if isinstance(v, float): return _json_float(v)\n    if isinstance(v, bool): return 'true' if v else 'false'\n    if isinstance(v, int): return str(v)\n    if isinstance(v, str) and not isinstance(v, _Sym): return _json_str(v)\n    if isinstance(v, _Hash):\n        parts = []\n        for k, e in v:\n            if isinstance(k, _Sym) or not isinstance(k, str):\n                raise ValueError('json-serialize: object keys must be str, got %s' % _ainl_tname(k))\n            parts.append(_json_str(str.__str__(k)) + ':' + _json_ser(e, depth + 1))\n        return '{' + ','.join(parts) + '}'\n    # _Hash is a list subclass, so the _Hash branch above MUST come first —\n    # a map checked against `isinstance(v, list)` first would serialize as an\n    # array of [k, v] pairs.\n    if isinstance(v, list): return '[' + ','.join(_json_ser(e, depth + 1) for e in v) + ']'\n    if isinstance(v, _Sym): raise ValueError('json-serialize: cannot serialize a sym')\n    if callable(v): raise ValueError('json-serialize: cannot serialize a fn')\n    raise ValueError('json-serialize: cannot serialize a %s' % _ainl_tname(v))",
+    ),
+    (
+        "_json_parse",
+        "def _json_parse(s):\n    p = [0]\n    b = s\n    def err(m): raise ValueError('json-parse: %s at position %d' % (m, p[0]))\n    def ws():\n        while p[0] < len(b) and b[p[0]] in ' \\t\\n\\r': p[0] += 1\n    def value(depth):\n        if depth > 512: raise ValueError('json-parse: nesting too deep (max 512 levels)')\n        ws()\n        if p[0] >= len(b): err('unexpected end of input')\n        c = b[p[0]]\n        if c == '{': return obj(depth)\n        if c == '[': return arr(depth)\n        if c == '\"':\n            p[0] += 1\n            return string()\n        if b.startswith('true', p[0]): p[0] += 4; return True\n        if b.startswith('false', p[0]): p[0] += 5; return False\n        if b.startswith('null', p[0]): p[0] += 4; return None\n        if c == '-' or c.isdigit(): return number()\n        err('unexpected character')\n    def obj(depth):\n        p[0] += 1\n        m = _Hash()\n        ws()\n        if p[0] < len(b) and b[p[0]] == '}': p[0] += 1; return m\n        while True:\n            ws()\n            if p[0] >= len(b) or b[p[0]] != '\"': err('expected a string key')\n            p[0] += 1\n            k = string()\n            ws()\n            if p[0] >= len(b) or b[p[0]] != ':': err(\"expected ':' after a key\")\n            p[0] += 1\n            v = value(depth + 1)\n            # Last value wins, first position — as hash/assoc do.\n            for pair in m:\n                if pair[0] == k: pair[1] = v; break\n            else: m.append([k, v])\n            ws()\n            if p[0] < len(b) and b[p[0]] == ',': p[0] += 1; continue\n            if p[0] < len(b) and b[p[0]] == '}': p[0] += 1; return m\n            err(\"expected ',' or '}'\")\n    def arr(depth):\n        p[0] += 1\n        items = []\n        ws()\n        if p[0] < len(b) and b[p[0]] == ']': p[0] += 1; return items\n        while True:\n            items.append(value(depth + 1))\n            ws()\n            if p[0] < len(b) and b[p[0]] == ',': p[0] += 1; continue\n            if p[0] < len(b) and b[p[0]] == ']': p[0] += 1; return items\n            err(\"expected ',' or ']'\")\n    def hex4():\n        if p[0] + 4 > len(b): err('truncated \\\\u escape')\n        v = int(b[p[0]:p[0] + 4], 16)\n        p[0] += 4\n        return v\n    def string():\n        out = []\n        while True:\n            if p[0] >= len(b): err('unterminated string')\n            c = b[p[0]]\n            if c == '\"': p[0] += 1; return ''.join(out)\n            p[0] += 1\n            if c == '\\\\':\n                if p[0] >= len(b): err('unterminated escape')\n                e = b[p[0]]; p[0] += 1\n                if e == '\"': out.append('\"')\n                elif e == '\\\\': out.append('\\\\')\n                elif e == '/': out.append('/')\n                elif e == 'b': out.append('\\b')\n                elif e == 'f': out.append('\\f')\n                elif e == 'n': out.append('\\n')\n                elif e == 'r': out.append('\\r')\n                elif e == 't': out.append('\\t')\n                elif e == 'u':\n                    hi = hex4()\n                    if 0xD800 <= hi <= 0xDBFF:\n                        if not (p[0] + 1 < len(b) and b[p[0]] == '\\\\' and b[p[0] + 1] == 'u'): err('unpaired surrogate')\n                        p[0] += 2\n                        lo = hex4()\n                        if not (0xDC00 <= lo <= 0xDFFF): err('invalid low surrogate')\n                        out.append(chr(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)))\n                    elif 0xDC00 <= hi <= 0xDFFF: err('unpaired surrogate')\n                    else: out.append(chr(hi))\n                else: err('invalid escape')\n            elif ord(c) < 0x20: err('control character in string')\n            else: out.append(c)\n    def number():\n        start = p[0]\n        if b[p[0]] == '-': p[0] += 1\n        if p[0] >= len(b): err('expected a digit')\n        if b[p[0]] == '0':\n            p[0] += 1\n            if p[0] < len(b) and b[p[0]].isdigit(): err('leading zero in number')\n        elif b[p[0]].isdigit():\n            while p[0] < len(b) and b[p[0]].isdigit(): p[0] += 1\n        else: err('expected a digit')\n        is_float = False\n        if p[0] < len(b) and b[p[0]] == '.':\n            is_float = True; p[0] += 1\n            if not (p[0] < len(b) and b[p[0]].isdigit()): err(\"expected a digit after '.'\")\n            while p[0] < len(b) and b[p[0]].isdigit(): p[0] += 1\n        if p[0] < len(b) and b[p[0]] in 'eE':\n            is_float = True; p[0] += 1\n            if p[0] < len(b) and b[p[0]] in '+-': p[0] += 1\n            if not (p[0] < len(b) and b[p[0]].isdigit()): err('expected a digit in the exponent')\n            while p[0] < len(b) and b[p[0]].isdigit(): p[0] += 1\n        t = b[start:p[0]]\n        if not is_float:\n            try:\n                return int(t)\n            except ValueError:\n                pass\n        return float(t)\n    v = value(0)\n    ws()\n    if p[0] != len(b): err('trailing content after the value')\n    return v",
+    ),
+    ("_json_parse_b", "def _json_parse_b(s):\n    if isinstance(s, _Sym) or not isinstance(s, str): raise TypeError('json-parse expects a str, got %s' % _ainl_tname(s))\n    return _json_parse(s)"),
+    ("_json_serialize_b", "def _json_serialize_b(v):\n    return _json_ser(v)"),
     // ---- Stage 3.1 stdlib ----
     // Each helper re-establishes the *interpreter's* rule where Python's own
     // behavior would differ, so all four backends agree:

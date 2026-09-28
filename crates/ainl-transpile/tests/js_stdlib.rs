@@ -26,7 +26,47 @@ fn file_builtins_map_to_node_fs_synchronously() {
 }
 
 #[test]
-fn string_builtins_map_to_str_methods() {
+fn json_builtins_do_not_reach_for_the_host_json_library() {
+    // JSON.parse / JSON.stringify are the obvious mapping and are wrong here on
+    // three counts: the result is a plain object rather than a _Hash, so AINL
+    // key order and the first-position duplicate-key rule are lost; JSON.parse
+    // accepts NaN and Infinity, which AINL must reject; and JSON.stringify
+    // prints floats its own way ("1e+300", and no ".0" on a whole number) and
+    // escapes every non-ASCII character as \uXXXX, so any program with a
+    // non-ASCII string in it would disagree with the other three backends.
+    let out = js(r#"(do (json-parse "[1]") (json-serialize (list 1 2)))"#);
+    assert!(out.contains("_json_parse("), "got:\n{out}");
+    assert!(out.contains("_json_ser("), "got:\n{out}");
+    for helper in [
+        "_json_parse",
+        "_json_ser",
+        "_json_str",
+        "_json_float",
+        "_json_parse_b",
+        "_json_serialize_b",
+    ] {
+        assert!(
+            out.contains(&format!("function {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    for forbidden in ["JSON.parse", "JSON.stringify"] {
+        assert!(
+            !out.contains(forbidden),
+            "the host JSON library must not be used ({forbidden}):\n{out}"
+        );
+    }
+    // A whole number gets a ".0" that JSON.stringify would not emit, and
+    // toFixed is not usable as the rule (undefined above 1e21).
+    assert!(out.contains("return \"0.0\";"), "got:\n{out}");
+    assert!(
+        !out.contains("toFixed"),
+        "_json_float must not use toFixed (only defined up to 1e21):\n{out}"
+    );
+}
+
+#[test]
+fn string_builtins_map_to_string_methods() {
     let out = js(r#"(do (split "a,b" ",") (join (list "a") ",") (trim " x ")
             (replace "a" "a" "b") (upcase "a") (downcase "A")
             (contains "ab" "a"))"#);

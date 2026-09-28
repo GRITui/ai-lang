@@ -31,6 +31,43 @@ fn file_builtins_map_to_open() {
 }
 
 #[test]
+fn json_builtins_do_not_reach_for_the_host_json_library() {
+    // json.loads / json.dumps would be the obvious mapping and are wrong here
+    // on three counts: a dict is not an AINL map, it re-orders keys and does not
+    // implement AINL's first-position duplicate-key rule, and it prints floats
+    // with the host's own spelling ("1e+300", no ".0" on a whole number). The
+    // check is that a hand-written reader/writer is emitted instead.
+    let out = py(r#"(do (json-parse "[1]") (json-serialize (list 1 2)))"#);
+    assert!(out.contains("_json_parse("), "got:\n{out}");
+    assert!(out.contains("_json_ser("), "got:\n{out}");
+    for helper in [
+        "_json_parse",
+        "_json_ser",
+        "_json_str",
+        "_json_float",
+        "_json_parse_b",
+        "_json_serialize_b",
+    ] {
+        assert!(
+            out.contains(&format!("def {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    for forbidden in ["json.loads", "json.dumps", "import json"] {
+        assert!(
+            !out.contains(forbidden),
+            "the host JSON library must not be used ({forbidden}):\n{out}"
+        );
+    }
+    // The canonical float spelling is hand-computed, not repr().
+    assert!(out.contains("def _json_float("), "got:\n{out}");
+    assert!(
+        !out.contains("return repr("),
+        "_json_float must not delegate to repr:\n{out}"
+    );
+}
+
+#[test]
 fn string_builtins_map_to_str_methods() {
     let out = py(r#"(do (split "a,b" ",") (join (list "a") ",") (trim " x ")
                  (replace "a" "a" "b") (upcase "a") (downcase "A")

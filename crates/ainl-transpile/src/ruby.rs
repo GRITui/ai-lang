@@ -85,6 +85,23 @@ impl Rb {
             self.needed.insert("_ainl_tname");
             self.needed.insert("AHash");
         }
+        // Tier 1 JSON. The whole cluster is pulled in by either entry point,
+        // because `_ainl_tname` (json-parse's type error and the "keys must be
+        // str, got t" message) and `_json_ser` both branch on AHash, and
+        // `_json_ser` also needs _ainl_tname. The RUNTIME table is emitted in
+        // declaration order, so _ainl_tname and AHash come first.
+        if self
+            .needed
+            .iter()
+            .any(|n| matches!(*n, "_json_parse_b" | "_json_serialize_b"))
+        {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_json_parse");
+            self.needed.insert("_json_ser");
+            self.needed.insert("_json_str");
+            self.needed.insert("_json_float");
+            self.needed.insert("AHash");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to ruby`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -320,6 +337,13 @@ impl Rb {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 1 JSON ----
+                "json-parse" => {
+                    return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
+                }
+                "json-serialize" => {
+                    return self.call_builtin("_json_serialize_b", args, Some("_json_serialize_b"))
+                }
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -686,6 +710,43 @@ const RUNTIME: &[(&str, &str)] = &[
         "_ainl_tname",
         "def _ainl_tname(x)\n  case x\n  when nil then 'nil'\n  when true, false then 'bool'\n  when Integer then 'int'\n  when Float then 'float'\n  when Symbol then 'sym'\n  when String then 'str'\n  when AHash then 'hash'\n  when Array then 'list'\n  when Proc then 'fn'\n  else '?'\n  end\nend",
     ),
+    // ---- Tier 1 JSON ----
+    // Ruby's JSON library is deliberately not used, for the same reasons as
+    // the other two targets: JSON.generate emits its own float spelling
+    // ("1.0e+300", and no ".0" on a whole number) and JSON.parse returns a
+    // Hash that would not be an AHash, would not implement AINL's
+    // first-position duplicate-key rule, and would accept NaN/Infinity.
+    // crates/ainl-core/src/json_value.rs is normative.
+    (
+        "_json_float",
+        // Shortest round-tripping digits in plain fixed-point notation, with a
+        // mandatory '.0' on a whole value. Ruby's Float#to_s is NOT usable:
+        // it emits '1.0e+300'. sprintf('%.17g') gives all 17 digits, so the
+        // shortening loop below is what finds the shortest form that still
+        // reads back as the same Float.
+        "def _json_float(x)\n  if x.nan? || x.infinite?\n    n = x.nan? ? 'NaN' : (x > 0 ? 'inf' : '-inf')\n    raise ArgumentError, \"json-serialize: cannot serialize #{n} (not a finite number)\"\n  end\n  return '0.0' if x == 0.0\n  neg = x < 0\n  ax = neg ? -x : x\n  # Shortest round-tripping significant digits. The format string is built\n  # with the % sign first and the precision interpolated after it, because\n  # Ruby's Kernel#format rejects a precision that precedes the flag.\n  s = nil\n  (0..16).each do |p|\n    s = format('%.' + p.to_s + 'e', ax)\n    break if Float(s) == ax\n  end\n  mant, exp = s.split('e')\n  exp = exp.to_i\n  digits = mant.delete('.')\n  point = mant.index('.') || mant.length\n  point += exp\n  out = if point <= 0\n    '0.' + ('0' * -point) + digits\n  elsif point >= digits.length\n    digits + ('0' * (point - digits.length)) + '.0'\n  else\n    digits[0...point] + '.' + digits[point..-1]\n  end\n  neg ? '-' + out : out\nend",
+    ),
+    (
+        "_json_str",
+        // One escaping rule, identical in all four backends: '\"', '\\\\', '\\n',
+        // '\\r', '\\t', and \\u00xx for every other C0 control. Never '\\b'/'\\f'.
+        // Non-ASCII is emitted literally (JSON.generate would \\u-escape it,
+        // and every non-ASCII program would then disagree with the others).
+        "def _json_str(s)\n  out = '\"'\n  s.each_char do |ch|\n    o = ch.ord\n    if ch == '\"' then out << '\\\\\"'\n    elsif ch == '\\\\' then out << '\\\\\\\\'\n    elsif ch == \"\\n\" then out << '\\\\n'\n    elsif ch == \"\\r\" then out << '\\\\r'\n    elsif ch == \"\\t\" then out << '\\\\t'\n    elsif o < 0x20 then out << format('\\\\u%04x', o)\n    else out << ch\n    end\n  end\n  out + '\"'\nend",
+    ),
+    (
+        "_json_ser",
+        "def _json_ser(v, depth = 0)\n  raise ArgumentError, 'json-serialize: nesting too deep (max 512 levels)' if depth > 512\n  case v\n  when nil then 'null'\n  when true then 'true'\n  when false then 'false'\n  when Float then _json_float(v)\n  when Integer then v.to_s\n  when String then _json_str(v)\n  when AHash\n    parts = []\n    v.each do |p|\n      k = p[0]\n      raise ArgumentError, \"json-serialize: object keys must be str, got #{_ainl_tname(k)}\" unless k.is_a?(String)\n      parts << _json_str(k) + ':' + _json_ser(p[1], depth + 1)\n    end\n    '{' + parts.join(',') + '}'\n  when Array then '[' + v.map { |e| _json_ser(e, depth + 1) }.join(',') + ']'\n  when Symbol then raise ArgumentError, 'json-serialize: cannot serialize a sym'\n  when Proc then raise ArgumentError, 'json-serialize: cannot serialize a fn'\n  else raise ArgumentError, \"json-serialize: cannot serialize a #{_ainl_tname(v)}\"\n  end\nend",
+    ),
+    (
+        "_json_parse",
+        "def _json_parse(s)\n  i = 0\n  n = s.bytesize\n  b = s\n  err = lambda do |m|\n    raise ArgumentError, \"json-parse: #{m} at position #{i}\"\n  end\n  ws = lambda do\n    while i < n && [' ', \"\\t\", \"\\n\", \"\\r\"].include?(b[i]) do i += 1 end\n  end\n  number = nil\n  string = nil\n  value = nil\n  arr = nil\n  obj = nil\n  number = lambda do\n    start = i\n    i += 1 if b[i] == '-'\n    err.call('expected a digit') if i >= n\n    if b[i] == '0'\n      i += 1\n      err.call('leading zero in number') if i < n && b[i] >= '0' && b[i] <= '9'\n    elsif b[i] >= '1' && b[i] <= '9'\n      i += 1 while i < n && b[i] >= '0' && b[i] <= '9'\n    else\n      err.call('expected a digit')\n    end\n    is_float = false\n    if i < n && b[i] == '.'\n      is_float = true\n      i += 1\n      err.call(\"expected a digit after '.'\") unless i < n && b[i] >= '0' && b[i] <= '9'\n      i += 1 while i < n && b[i] >= '0' && b[i] <= '9'\n    end\n    if i < n && (b[i] == 'e' || b[i] == 'E')\n      is_float = true\n      i += 1\n      i += 1 if i < n && (b[i] == '+' || b[i] == '-')\n      err.call('expected a digit in the exponent') unless i < n && b[i] >= '0' && b[i] <= '9'\n      i += 1 while i < n && b[i] >= '0' && b[i] <= '9'\n    end\n    t = b[start...i]\n    is_float ? Float(t) : Integer(t, 10)\n  end\n  hex4 = lambda do\n    err.call('truncated \\\\u escape') if i + 4 > n\n    v = b[i, 4].to_i(16)\n    err.call('invalid \\\\u escape') if v.to_s(16).length < 4 && b[i, 4] !~ /\\A[0-9a-fA-F]{4}\\z/\n    i += 4\n    v\n  end\n  string = lambda do\n    out = ''\n    loop do\n      err.call('unterminated string') if i >= n\n      c = b[i]\n      if c == '\"'\n        i += 1\n        return out\n      end\n      i += 1\n      if c == '\\\\'\n        err.call('unterminated escape') if i >= n\n        e = b[i]\n        i += 1\n        if e == '\"' then out << '\"'\n        elsif e == '\\\\' then out << '\\\\'\n        elsif e == '/' then out << '/'\n        elsif e == 'b' then out << \"\\b\"\n        elsif e == 'f' then out << \"\\f\"\n        elsif e == 'n' then out << \"\\n\"\n        elsif e == 'r' then out << \"\\r\"\n        elsif e == 't' then out << \"\\t\"\n        elsif e == 'u'\n          hi = hex4.call\n          if hi >= 0xd800 && hi <= 0xdbff\n            unless i + 1 < n && b[i] == '\\\\' && b[i + 1] == 'u'\n              err.call('unpaired surrogate')\n            end\n            i += 2\n            lo = hex4.call\n            err.call('invalid low surrogate') if lo < 0xdc00 || lo > 0xdfff\n            out << [0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)].pack('U')\n          elsif hi >= 0xdc00 && hi <= 0xdfff\n            err.call('unpaired surrogate')\n          else\n            out << [hi].pack('U')\n          end\n        else\n          err.call('invalid escape')\n        end\n      elsif c.ord < 0x20\n        err.call('control character in string')\n      else\n        out << c\n      end\n    end\n  end\n  arr = lambda do |depth|\n    i += 1\n    items = []\n    ws.call\n    if i < n && b[i] == ']'\n      i += 1\n      return items\n    end\n    loop do\n      items << value.call(depth + 1)\n      ws.call\n      if i < n && b[i] == ','\n        i += 1\n        next\n      end\n      if i < n && b[i] == ']'\n        i += 1\n        return items\n      end\n      err.call(\"expected ',' or ']'\")\n    end\n  end\n  obj = lambda do |depth|\n    i += 1\n    m = AHash.new\n    ws.call\n    if i < n && b[i] == '}'\n      i += 1\n      return m\n    end\n    loop do\n      ws.call\n      err.call('expected a string key') unless i < n && b[i] == '\"'\n      i += 1\n      k = string.call\n      ws.call\n      err.call(\"expected ':' after a key\") unless i < n && b[i] == ':'\n      i += 1\n      v = value.call(depth + 1)\n      # Last value wins, first position — as hash/assoc do. AHash is an Array\n      # of [k, v] pairs, so `m[k] = v` is wrong (that is Array#[]= on an\n      # integer index); the pair is located and updated like _hash does.\n      pair = m.find { |p| p[0] == k }\n      if pair\n        pair[1] = v\n      else\n        m << [k, v]\n      end\n      ws.call\n      if i < n && b[i] == ','\n        i += 1\n        next\n      end\n      if i < n && b[i] == '}'\n        i += 1\n        return m\n      end\n      err.call(\"expected ',' or '}'\")\n    end\n  end\n  value = lambda do |depth|\n    raise ArgumentError, 'json-parse: nesting too deep (max 512 levels)' if depth > 512\n    ws.call\n    err.call('unexpected end of input') if i >= n\n    c = b[i]\n    return obj.call(depth) if c == '{'\n    return arr.call(depth) if c == '['\n    if c == '\"'\n      i += 1\n      return string.call\n    end\n    return true if b[i, 4] == 'true' && (i += 4)\n    return false if b[i, 5] == 'false' && (i += 5)\n    return nil if b[i, 4] == 'null' && (i += 4)\n    return number.call if c == '-' || (c >= '0' && c <= '9')\n    err.call('unexpected character')\n  end\n  v = value.call(0)\n  ws.call\n  err.call('trailing content after the value') if i != n\n  v\nend",
+    ),
+    (
+        "_json_parse_b",
+        "def _json_parse_b(s)\n  raise TypeError, \"json-parse expects a str, got #{_ainl_tname(s)}\" unless s.is_a?(String)\n  _json_parse(s)\nend",
+    ),
+    ("_json_serialize_b", "def _json_serialize_b(v)\n  _json_ser(v, 0)\nend"),
     (
         "_split",
         "def _split(s, sep)\n  raise TypeError, 'split expects a str' unless s.is_a?(String) && sep.is_a?(String)\n  raise ArgumentError, 'split expects a non-empty separator' if sep.empty?\n  # The -1 limit keeps trailing empty fields, which AINL's split does\n  # (\"a,b,\" -> [\"a\" \"b\" \"\"]); Ruby's default limit drops them, which would\n  # disagree with the interpreter and with the Python/JS targets.\n  s.split(sep, -1)\nend",

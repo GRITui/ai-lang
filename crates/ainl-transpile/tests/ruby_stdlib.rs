@@ -31,7 +31,64 @@ fn file_builtins_map_to_file_read_and_write() {
 }
 
 #[test]
-fn string_builtins_map_to_str_methods() {
+fn json_builtins_do_not_reach_for_the_host_json_library() {
+    // JSON.generate / JSON.parse are the obvious mapping and are wrong here on
+    // three counts: a Hash is not an AHash, so AINL's insertion order and
+    // first-position duplicate-key rule are lost; JSON.parse accepts NaN and
+    // Infinity, which AINL must reject; and JSON.generate prints floats its
+    // own way ("1.0e+300") and \u-escapes every non-ASCII character, so any
+    // program with a non-ASCII string in it would disagree with the others.
+    // Ruby's own Float#to_s is equally unusable for the same reason.
+    let out = rb(r#"(do (json-parse "[1]") (json-serialize (list 1 2)))"#);
+    assert!(out.contains("_json_parse("), "got:\n{out}");
+    assert!(out.contains("_json_ser("), "got:\n{out}");
+    for helper in [
+        "_json_parse",
+        "_json_ser",
+        "_json_str",
+        "_json_float",
+        "_json_parse_b",
+        "_json_serialize_b",
+    ] {
+        assert!(
+            out.contains(&format!("def {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    for forbidden in [
+        "JSON.generate",
+        "JSON.parse",
+        "require 'json'",
+        "require \"json\"",
+    ] {
+        assert!(
+            !out.contains(forbidden),
+            "the host JSON library must not be used ({forbidden}):\n{out}"
+        );
+    }
+    // AHash is an Array of [k, v] pairs, so the map branch must come before the
+    // plain-Array branch and must iterate pairs, not destructure them as
+    // k/v — `each { |k, v| }` on an AHash of pairs silently yields the pair
+    // arrays themselves.
+    let ser = out
+        .split("def _json_ser(")
+        .nth(1)
+        .expect("_json_ser is missing")
+        .split("\nend")
+        .next()
+        .expect("unterminated _json_ser");
+    assert!(
+        ser.find("when AHash").unwrap() < ser.find("when Array").unwrap(),
+        "AHash must be matched before Array (it is an Array subclass):\n{ser}"
+    );
+    assert!(
+        ser.contains("v.each do |p|"),
+        "_json_ser must iterate AHash pairs, not destructure them:\n{ser}"
+    );
+}
+
+#[test]
+fn string_builtins_map_to_ruby_string_methods() {
     let out = rb(r#"(do (split "a,b" ",") (join (list "a") ",") (trim " x ")
             (replace "a" "a" "b") (upcase "a") (downcase "A")
             (contains "ab" "a"))"#);

@@ -79,6 +79,11 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("path-join", 49),
     ("path-base", 50),
     ("path-dir", 51),
+    // Tier 1 JSON. Appended at the end so every Stage 3.1 id keeps its
+    // value; the `enum` in runtime.c must be extended in exactly the same
+    // order, and crates/ainl-cc/tests/aot_stdlib.rs checks both directions.
+    ("json-parse", 52),
+    ("json-serialize", 53),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

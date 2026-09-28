@@ -738,6 +738,8 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         "path-join",
         "path-base",
         "path-dir",
+        "json-parse",
+        "json-serialize",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -760,5 +762,5 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 52, "update this list when the prelude changes");
+    assert_eq!(names.len(), 54, "update this list when the prelude changes");
 }

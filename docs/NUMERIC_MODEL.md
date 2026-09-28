@@ -90,6 +90,51 @@ targets; within the AINL toolchain (interpreter, bytecode VM, and AOT binary)
 the numeric model is identical, and there is a test that fails if it stops being
 so.
 
+## `json-serialize` has its own float rule
+
+`json-serialize` prints floats in **plain fixed-point notation, never
+scientific**, using the shortest decimal that reads back as the same `f64`,
+with a mandatory `.0` on a whole value. That is *not* the rule `(print 1e300)`
+uses, and the difference is deliberate.
+
+`Value`'s `Display` — which is what `print` goes through — branches to `{:.1}`
+for a whole float, which prints the **exact binary expansion**: `(print 1e300)`
+emits 303 characters, the full exact value. `json-serialize` emits the
+shortest round-tripping form instead (301 characters: a `1` and 300 zeros, plus
+the `.0`). Both read back as the same `f64`; they differ only in which decimal
+is chosen.
+
+Following `Display` would have been the obvious move — it is the rule the rest
+of the language uses, and the AOT C runtime's `format_float` is already a
+hand-port of it, so reusing it would have saved a second float routine. Two
+things say no:
+
+- **The JS target could not follow it.** `toFixed` is specified only up to 1e21
+  and falls back to exponential form beyond, so `(1e300).toFixed(1)` is the
+  six-character string `"1e+300"`. Producing a 303-digit exact expansion from a
+  JS `Number` needs arbitrary-precision decimal arithmetic that does not exist
+  there. The shortest form is computable in all four backends from
+  significant digits each of them can already produce, which is why it is the
+  rule.
+- **A second float routine would be untested by anything else.** The C runtime
+  already has one correct shortest-form routine inside `format_float`; adding a
+  near-duplicate for JSON means a second implementation that only the JSON tests
+  exercise.
+
+The `.0` suffix is the part with actual semantic weight: it is what keeps a
+float distinguishable from an int in the output text. `(json-serialize 1.0)` is
+`1.0` and `(json-serialize 1)` is `1`; drop the suffix and a reader could not
+tell a float from an int at all, and `parse(serialize(v))` would stop being an
+identity on floats.
+
+This is also why the JS divergence for JSON is one-directional. JS has one
+number type, so an AINL `int` arrives as a `Number` and comes back out as
+`1.0` — but a whole *float* agrees, because `1.0` and `1` are the same JS value
+and emitting `1.0` is what every backend does anyway. The output is valid JSON
+that re-parses to an equal value in both cases;
+`crates/ainl-transpile/tests/json_parity.rs` pins both halves so neither can
+drift.
+
 ## Options if this needs to be closed (not done — tracked here for whoever picks it up)
 
 1. **Make the interpreter arbitrary-precision too**, matching Python/Ruby.
