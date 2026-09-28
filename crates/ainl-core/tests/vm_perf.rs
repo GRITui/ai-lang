@@ -53,3 +53,39 @@ fn vm_is_faster_than_tree_walk_on_40k_loop() {
          (tree-walk {tw_dur:?}, vm {vm_dur:?})"
     );
 }
+
+#[test]
+fn the_vm_and_the_tree_walk_agree_on_json() {
+    // The two in-process evaluators are separate code paths: the VM dispatches
+    // a `Value::Builtin` by calling the stored closure, while the tree-walk
+    // resolves the name in the environment. A builtin that only worked in one
+    // of them would pass a perf test and fail a program, so the JSON pair is
+    // checked on both.
+    let cases = [
+        r#"(json-parse "[1.5,2.5,true,null]")"#,
+        r#"(json-parse "{\"b\":1.5,\"a\":[2.25]}")"#,
+        r#"(json-serialize (list 1.5 2.5 "s" true nil))"#,
+        r#"(json-serialize (hash "z" 1.5 "a" 2.5))"#,
+        r#"(json-serialize (/ 1.0 3))"#,
+        r#"(json-serialize 1e-7)"#,
+        r#"(json-serialize (json-parse "\"\\u00e9\\ud83d\\ude00\\u0007\""))"#,
+        // Errors agree too, by message — the stdlib rule covers stderr.
+        r#"(json-parse "{")"#,
+        r#"(json-serialize (hash 1.5 "v"))"#,
+    ];
+    for case in cases {
+        let vm = ainl_core::run_str(case);
+        let tw = ainl_core::run_in_tree_walk(case);
+        match (&vm, &tw) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "`{case}` differs between the VM and the tree-walk"),
+            (Err(a), Err(b)) => {
+                let (a, b) = (a.to_string(), b.to_string());
+                assert_eq!(a, b, "`{case}` fails differently in the two evaluators");
+            }
+            (v, t) => panic!(
+                "`{case}` succeeded in one evaluator and failed in the other:\n\
+                 vm={v:?}\ntree-walk={t:?}"
+            ),
+        }
+    }
+}
