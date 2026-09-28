@@ -5,13 +5,34 @@
 //!   repl           interactive read-eval-print loop
 //!   ast <file>     print the parsed AST (with spans) for tooling / source maps
 //!   eval <code>    evaluate a snippet passed on the command line
-//!   version        print version
+//!   compile <file> AOT-compile to a standalone C binary (AINL -> C -> cc)
+//!   transpile <f>  project AINL into Python / JS / Ruby
+//!   grammar        print the AINL grammar (GBNF, for constrained decoding)
+//!   doctor         verify this install end to end (exit 0 only if all pass)
+//!   version        print version, build target, and source commit
+
+mod doctor;
 
 use ainl_core::{parser::Node, Env};
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The one-line provenance string, shared by `version` and `doctor` so the two
+/// can never disagree about what binary is running.
+fn version_line() -> String {
+    let commit = env!("AINL_GIT_COMMIT");
+    let dirty = match env!("AINL_GIT_DIRTY") {
+        "true" => " (dirty tree)",
+        "false" => "",
+        _ => " (tree state unknown)",
+    };
+    format!(
+        "ainl {VERSION} {target}{dirty} ({commit})",
+        target = env!("AINL_TARGET"),
+    )
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,8 +44,9 @@ fn main() -> ExitCode {
         Some("transpile") => cmd_transpile(&args[1..]),
         Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(),
+        Some("doctor") => cmd_doctor(&args[1..]),
         Some("version") | Some("--version") | Some("-v") => {
-            println!("ainl {VERSION}");
+            println!("{}", version_line());
             ExitCode::SUCCESS
         }
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -48,13 +70,31 @@ fn print_help() {
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
          ainl ast <file> --json-out <f>  read a JSON AST back (inverse of --json)\n  \
-         ainl compile <file.ainl> -o <out>   AOT-compile to a standalone C binary (via cc)\n\
-         ainl compile <file.ainl> -o <out> --keep-c <file.c>   keep the generated C\n\
+         ainl compile <file.ainl> -o <out>   AOT-compile to a standalone C binary (via cc)\n  \
+         ainl compile <file.ainl> -o <out> --keep-c <file.c>   keep the generated C\n  \
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                start an interactive REPL\n  \
-         ainl version             print version\n"
+         ainl doctor              self-test this install (exit 0 only if all pass)\n  \
+         ainl version             print version, build target, and source commit\n"
     );
+}
+
+/// `ainl doctor` — self-diagnostic. Rejects unknown flags rather than ignoring
+/// them, so a typo like `--verbose` is a visible error instead of a silently
+/// different run.
+fn cmd_doctor(rest: &[String]) -> ExitCode {
+    let mut quiet = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--quiet" | "-q" => quiet = true,
+            other => {
+                eprintln!("unknown flag '{other}' (supported: --quiet, -q)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    doctor::run(quiet)
 }
 
 fn cmd_run(path: Option<&String>) -> ExitCode {
