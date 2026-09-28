@@ -16,6 +16,18 @@ Python, JavaScript, and Ruby when you want out.
 (print (fib 10))          ; 55
 ```
 
+## Project status
+
+**AINL is an educational project.** It was built to explore, from first
+principles, what a language designed *for* AI-constrained generation looks like
+when the constraint is the reason the language exists at all — the measurements
+above are the argument, and the negative ones are part of it. Every stage that
+was planned is built and CI-green: the bytecode VM, the AOT compiler, the
+standard library, packaging, and the generation experiments. **No further
+feature development is planned**; the repository is kept as a reference, and
+readers are welcome to take the findings and the grammar and build something
+else with them.
+
 ## The proof
 
 Two independent runs, each comparing the **same model, same prompts, same
@@ -282,8 +294,8 @@ The language, the AOT backend, the stdlib, packaging, and the generation
 experiments are implemented and CI-green. What is **not** claimed: that AINL
 programs are more token-efficient than Python (they are not), that the
 constraint makes a model write *correct* code (it does not), or that a small
-local model can write AINL (it cannot — use a 27B-class model). See
-[docs/BACKLOG.md](docs/BACKLOG.md) for what is open.
+local model can write AINL (it cannot — use a 27B-class model). The open items
+in [docs/BACKLOG.md](docs/BACKLOG.md) are recorded as notes, not as commitments.
 
 ## License
 
