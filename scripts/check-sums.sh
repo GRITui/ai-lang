@@ -36,6 +36,16 @@ A_MAC="ainl-${VERSION}-aarch64-apple-darwin.tar.gz"
 TARGET=$(detect_target) || { echo "FAIL: cannot detect host target"; exit 1; }
 echo "== this host's target: $TARGET =="
 
+# CI runs the SHA256SUMS step on ubuntu, where `sha256sum` is the GNU tool and
+# the step's own `sha256sum -c` self-check applies verbatim. On a stock macOS
+# only `shasum` exists, so the fixture generation falls back to it — the step
+# under test still uses the GNU spelling, which is what CI executes.
+if command -v sha256sum >/dev/null 2>&1; then
+  shasum_tool() { sha256sum "$@"; }
+else
+  shasum_tool() { shasum -a 256 "$@"; }
+fi
+
 fail=0
 pass() { echo "ok   $1"; }
 bad()  { echo "FAIL $1"; fail=1; }
@@ -111,7 +121,7 @@ for pair in "ainl-$VERSION-x86_64-unknown-linux-musl:$A_LIN" \
   ( cd "$WORK/stage/$art" && tar czf "$REL/$file" "ainl-${VERSION}-${TARGET}" )
 done
 # Regenerate the sums over the *real* assets, exactly as the release job does.
-( cd "$REL" && sha256sum "$A_LIN" "$A_MAC" > SHA256SUMS )
+( cd "$REL" && shasum_tool "$A_LIN" "$A_MAC" > SHA256SUMS )
 out=$(env AINL_BIN_DIR="$WORK/inst" AINL_VERSION="$VERSION" \
         AINL_RELEASE_BASE="file://$WORK/rel" \
         sh scripts/install.sh 2>&1); rc=$?
@@ -134,7 +144,7 @@ echo "== 4: a missing asset is caught by the count assertion =="
 HALF="$WORK/half"
 mkdir -p "$HALF"
 cp "$WORK/dist/ainl-$VERSION-x86_64-unknown-linux-musl/$A_LIN" "$HALF/"
-( cd "$HALF" && sha256sum "$A_LIN" > SHA256SUMS.only1 )
+( cd "$HALF" && shasum_tool "$A_LIN" > SHA256SUMS.only1 )
 # The CI assertion compares asset count to sum-line count, so a release with
 # fewer assets than the sum file would be caught. Reconstruct that case:
 mkdir -p "$WORK/half2"

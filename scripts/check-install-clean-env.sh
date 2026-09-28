@@ -59,10 +59,34 @@ mkdir -p "$CLEAN/home" "$CLEAN/bin"
 # succeed. The list is derived from what install.sh actually invokes;
 # mktemp, find and head are load-bearing and easy to forget, which is exactly
 # the class of thing a minimal environment breaks.
-for t in sh tar awk sed uname id mkdir cp mv chmod rm dirname cat find head \
-         mktemp grep cut ls printf curl sha256sum; do
+#
+# `gzip` earns its place: GNU tar shells out to it for `-z`, so a PATH without
+# it fails at unpack time with "gzip: Cannot exec". macOS tar decompresses
+# natively, which is why this only ever showed up on Linux CI.
+for t in sh tar gzip awk sed uname id mkdir cp mv chmod rm dirname cat find head \
+         mktemp grep cut ls printf curl sha256sum shasum; do
   p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$CLEAN/bin/$t"
 done
+
+# Every shimmed tool must actually be present, or this test would silently
+# degrade into a weaker one on a host that lacks one of them. `sha256sum` and
+# `shasum` are alternatives — either satisfies the installer — so they are
+# reported only when BOTH are missing.
+missing=""
+# `printf` is deliberately absent from this list: it is a shell builtin in
+# dash/bash/ash, not a separate executable, so `command -v` finds it only as a
+# builtin and there is nothing to shim.
+for t in sh tar gzip awk sed uname id mkdir cp mv chmod rm dirname cat find head \
+         mktemp grep cut ls curl; do
+  [ -e "$CLEAN/bin/$t" ] || missing="$missing $t"
+done
+if [ ! -e "$CLEAN/bin/sha256sum" ] && [ ! -e "$CLEAN/bin/shasum" ]; then
+  missing="$missing (no SHA256 tool)"
+fi
+if [ -n "$missing" ]; then
+  echo "note: this host lacks:$missing"
+  echo "      (the installer will report the first one it needs)"
+fi
 echo "== clean env =="
 echo "    HOME=$CLEAN/home"
 echo "    PATH=$CLEAN/bin (no cc: $(PATH="$CLEAN/bin" command -v cc || echo 'absent, as intended'))"
