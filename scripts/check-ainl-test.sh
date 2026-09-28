@@ -82,6 +82,40 @@ for want in "deliberately wrong" "expected 4" "got 3" "1 failed"; do
   fi
 done
 
+# The pass/fail split must be exact. A runner that counted the *failing* test as
+# passed would report "1 passed, 1 failed" here, for a file whose only test
+# failed — a count that reads as if something had succeeded.
+"$BIN" test "$WORK/bad.ainl" > "$WORK/out" 2>&1
+if grep -q "^0 passed, 1 failed" "$WORK/out"; then
+  echo "ok   a file whose only test failed reports 0 passed, 1 failed"
+else
+  echo "FAIL the pass/fail split is wrong:"
+  sed 's/^/    /' "$WORK/out"
+  fail=1
+fi
+if grep -q "every test failed" "$WORK/out"; then
+  echo "ok   an all-failing suite says so, rather than blaming an empty suite"
+else
+  echo "FAIL an all-failing suite reported the wrong cause:"
+  sed 's/^/    /' "$WORK/out"
+  fail=1
+fi
+
+# A file whose second test fails must report exactly 1 passed — the one before it.
+cat > "$WORK/second.ainl" <<'EOF'
+(test "first is fine" 1 "1")
+(test "second is wrong" 2 "3")
+(test "third never runs" 3 "3")
+EOF
+"$BIN" test "$WORK/second.ainl" > "$WORK/out" 2>&1
+if grep -q "^1 passed, 1 failed" "$WORK/out"; then
+  echo "ok   a later failure counts the tests before it"
+else
+  echo "FAIL a later failure was miscounted:"
+  sed 's/^/    /' "$WORK/out"
+  fail=1
+fi
+
 # ---- one broken file does not hide the others ------------------------------
 # The first failing test aborts its file, but the runner must keep going: a
 # suite that stops at the first failure reports one problem per run and hides

@@ -115,18 +115,14 @@ fn run_file(path: &Path) -> FileResult {
     match ainl_core::run_named_in(&src, path, &ainl_core::Env::with_prelude()) {
         Ok(_) => res.passed = names,
         Err(e) => {
-            // A failure aborts the file, so every test after the one that broke
-            // is untested — not passed. Report what actually ran rather than
-            // what the file contained.
-            let ran = match failing_index(&e, &names) {
-                Some(i) => i + 1,
-                // Not a test mismatch: nothing is known to have run, because a
-                // program that raises before its first test never reached one.
-                None => 0,
-            };
-            let name = failing_index(&e, &names)
-                .and_then(|i| names.get(i).cloned())
-                .unwrap_or_default();
+            // A failure aborts the file, so every test *after* the one that broke
+            // is untested — not passed. The failing test itself is the `i`-th,
+            // so exactly `i` tests passed before it. Getting this off by one
+            // reports "1 passed, 1 failed" for a file whose only test failed,
+            // which is worse than no count at all.
+            let idx = failing_index(&e, &names);
+            let ran = idx.unwrap_or(0);
+            let name = idx.and_then(|i| names.get(i).cloned()).unwrap_or_default();
             res.passed = names.into_iter().take(ran).collect();
             res.failed = Some((name, e));
         }
@@ -156,13 +152,15 @@ pub fn run(target: &str, quiet: bool) -> ExitCode {
     for file in &files {
         let r = run_file(file);
         let shown = display_path(file);
+        // Count the passes first, and unconditionally. A file that fails partway
+        // through still passed everything before the failure, and a total that
+        // dropped them would contradict the per-file line printed right below it
+        // — a suite where 9 of 10 tests passed would report "0 passed".
+        passed += r.passed.len();
         match r.failed {
             Some((name, e)) if is_mismatch(&e) => {
                 failed += 1;
-                // The failing test is the last one that ran, and everything
-                // before it passed.
-                let passed_here = r.passed.len();
-                println!("FAIL {shown} — {passed_here} passed, 1 failed: {name}");
+                println!("FAIL {shown} — {} passed, 1 failed: {name}", r.passed.len());
                 println!("     {e}");
             }
             Some((_, e)) => {
@@ -173,7 +171,6 @@ pub fn run(target: &str, quiet: bool) -> ExitCode {
                 println!("ERROR {shown} — {e}");
             }
             None => {
-                passed += r.passed.len();
                 if !quiet {
                     println!("ok   {shown} ({} passed)", r.passed.len());
                 }
@@ -190,12 +187,17 @@ pub fn run(target: &str, quiet: bool) -> ExitCode {
         files.len(),
         if files.len() == 1 { "" } else { "s" },
     );
-    // A suite with zero passing tests is a failure, not a vacuous success: "no
-    // tests found" and "all tests passed" must not look the same to CI.
+    // A suite where nothing passed is a failure even if some test ran: "all
+    // tests failed" and "there were no tests" must both be non-zero, but only
+    // the second is a configuration problem, so the two messages differ.
     if passed == 0 {
-        eprintln!(
-            "ainl test: no (test ...) form ever passed — the suite is empty or every file errored"
-        );
+        if failed == 0 {
+            eprintln!(
+                "ainl test: no (test ...) form ran — the suite is empty or every file errored"
+            );
+        } else {
+            eprintln!("ainl test: every test failed");
+        }
         return ExitCode::FAILURE;
     }
     if failed > 0 || errors > 0 {
