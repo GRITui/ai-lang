@@ -158,6 +158,66 @@ fn sleep_blocks_synchronously() {
 }
 
 #[test]
+fn tier1_file_builtins_map_to_node_fs_and_our_own_path_rules() {
+    let out = js(r#"(do (file-exists "p") (delete-file "p") (list-dir "d")
+                    (path-join "a" "b") (path-base "a/b") (path-dir "a/b"))"#);
+    for helper in [
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+    ] {
+        assert!(
+            out.contains(&format!("function {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    // The filesystem ones use node's own synchronous fs calls.
+    assert!(out.contains("lstatSync"), "got:\n{out}");
+    assert!(out.contains("readdirSync"), "got:\n{out}");
+    assert!(out.contains("unlinkSync"), "got:\n{out}");
+    // ...but the path ones must NOT use node's `path` module: path.join and
+    // path.dirname disagree with the interpreter on empty parts, duplicate
+    // separators and a bare relative name, and the whole point of pinning the
+    // rules in eval.rs is that no host gets to choose.
+    assert!(
+        !out.contains("require(\"path\")"),
+        "must not delegate to node's path module:\n{out}"
+    );
+    // list-dir sorts by UTF-8 bytes, not JS string order.
+    assert!(
+        out.contains("Buffer.compare"),
+        "list-dir must sort by byte order:\n{out}"
+    );
+}
+
+#[test]
+fn path_join_reports_a_positional_type_error_in_ainl_wording() {
+    // The interpreter says "got int at position 2". JS's own `typeof` would say
+    // "number" for both an int and a float, so the helper carries its own
+    // type-name function — and must pull in the classes it tests against.
+    let out = js(r#"(path-join "a" 1)"#);
+    assert!(
+        out.contains("at position ${i + 1}"),
+        "must report the position:\n{out}"
+    );
+    assert!(out.contains("function _ainl_tname("), "got:\n{out}");
+    assert!(out.contains("class _Sym"), "_ainl_tname needs _Sym:\n{out}");
+    assert!(
+        out.contains("class _Hash"),
+        "_ainl_tname needs _Hash:\n{out}"
+    );
+    // A bare (path-join) is an error, not "".
+    let out = js("(path-join)");
+    assert!(
+        out.contains("path-join expects at least 1 argument"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
 fn stdlib_runtime_is_omitted_when_unused() {
     let out = js("(+ 1 2)");
     for helper in [
@@ -181,6 +241,14 @@ fn stdlib_runtime_is_omitted_when_unused() {
         "_floor",
         "_sqrt",
         "_isnum",
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+        "_path_canonical",
+        "_ainl_tname",
     ] {
         assert!(!out.contains(helper), "unused {helper} was emitted:\n{out}");
     }

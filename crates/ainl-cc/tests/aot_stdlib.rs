@@ -362,6 +362,243 @@ fn aot_read_file_error_message_matches_the_interpreter() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A file whose bytes are not valid UTF-8 cannot become a string, so `read-file`
+/// must fail — in *both* backends.
+///
+/// This is a pre-existing divergence the Tier 1 work found: the interpreter
+/// goes through `std::fs::read_to_string` (which fails on invalid UTF-8), while
+/// the C runtime used to hand the raw bytes back, so the same program was a
+/// runtime error interpreted and a 6-character string compiled. The C side now
+/// validates; this pins both halves together.
+#[test]
+fn aot_read_file_rejects_invalid_utf8_like_the_interpreter() {
+    let dir = std::env::temp_dir().join("ainl-aot-stdlib-utf8");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // One invalid byte in the middle of otherwise-valid ASCII, plus the two
+    // shapes a validator most often gets wrong: a *truncated* sequence and an
+    // encoded surrogate half (ED A0 80, which is not well-formed UTF-8).
+    for (name, bytes) in [
+        ("bad.bin", b"ok\xffbad".to_vec()),
+        ("trunc.bin", b"a\xc3".to_vec()),
+        ("surrogate.bin", b"\xed\xa0\x80".to_vec()),
+    ] {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).expect("write");
+        let src = format!("(read-file {:?})", p.to_str().unwrap());
+        assert_error_parity(&src, name);
+    }
+    // A valid multi-byte file must still read back, byte for byte: the check
+    // must not be so strict that it rejects real UTF-8.
+    let ok = dir.join("ok.txt");
+    std::fs::write(&ok, "héllo 日本 😀\n".as_bytes()).expect("write");
+    assert_stdout_parity(
+        &format!("(print (len (read-file {:?})))", ok.to_str().unwrap()),
+        "utf8_valid_read",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Tier 1 file I/O -------------------------------------------------------
+
+/// A fixture directory whose contents make a *wrong* sort order visible.
+///
+/// The names are chosen so a case-insensitive or locale-aware collation gives
+/// a different answer than byte order: uppercase `B` (0x42) before `_` (0x5F)
+/// before lowercase `a` (0x61). A hidden file is present (it must be listed),
+/// a name with a space (it must survive intact), and a subdirectory (it must
+/// appear as a name, with no trailing separator).
+fn seed_dir(dir: &Path) {
+    std::fs::create_dir_all(dir.join("sub")).expect("mkdir sub");
+    for name in ["Beta.txt", "alpha.txt", "zeta.md", "_.hidden", "sp ace.txt"] {
+        std::fs::write(dir.join(name), "x").expect("write fixture");
+    }
+    std::fs::write(dir.join("sub").join("inner.txt"), "x").expect("write inner");
+}
+
+#[test]
+fn aot_list_dir_matches_the_interpreter_and_is_sorted() {
+    // Each backend gets its own seeded copy: `list-dir` is read-only, but
+    // sharing one directory would make the assertion depend on the tests'
+    // execution order.
+    let src = r#"(do
+        (print (list-dir {dir}))
+        (print (len (list-dir {dir})))
+        (print (first (list-dir {dir})))
+        (print (list-dir (path-join {dir} "sub"))))"#;
+
+    for (label, name) in [("aot", "list_dir_aot"), ("interp", "list_dir_interp")] {
+        let dir = std::env::temp_dir().join(format!("ainl-aot-tier1-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_dir(&dir);
+        let program = src.replace("{dir}", &format!("{:?}", dir.to_str().unwrap()));
+
+        let out = if label == "aot" {
+            let bin = compile_aot(&program, name);
+            Command::new(&bin).output().expect("run aot")
+        } else {
+            let (_, path) = run_interpreter(&program);
+            let o = Command::new(ainl_bin())
+                .arg("run")
+                .arg(&path)
+                .output()
+                .expect("run ainl");
+            let _ = std::fs::remove_file(&path);
+            o
+        };
+        assert!(
+            out.status.success(),
+            "{label} list-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        // `print` renders a bare string unquoted (only a list of them quotes),
+        // so the third line is the name without quotes.
+        assert_eq!(
+            text,
+            "(\"Beta.txt\" \"_.hidden\" \"alpha.txt\" \"sp ace.txt\" \"sub\" \"zeta.md\")\n\
+             6\n\
+             Beta.txt\n\
+             (\"inner.txt\")\n",
+            "{label} list-dir output differs, or is not in byte order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn aot_file_exists_and_delete_file_match_the_interpreter() {
+    // Stateful, so each backend runs against its own copy of the fixture — the
+    // program deletes a file, and a shared directory would let the AOT run
+    // invalidate what the interpreted run is about to check.
+    let tmpl = r#"(do
+        (print (file-exists {f}))
+        (print (file-exists {missing}))
+        (print (file-exists {sub}))
+        (print (file-exists {g}))
+        (write-file {g} "fresh\n")
+        (print (file-exists {g}) (len (read-file {g})))
+        (print (delete-file {g}))
+        (print (file-exists {g}))
+        (print (file-exists {f}))
+        (print (file-exists (path-join {f} "/"))))"#;
+
+    let run = |label: &str, program: &str, bin: Option<&Path>| -> String {
+        let out = match bin {
+            Some(b) => Command::new(b).output().expect("run aot"),
+            None => {
+                let (_, path) = run_interpreter(program);
+                let o = Command::new(ainl_bin())
+                    .arg("run")
+                    .arg(&path)
+                    .output()
+                    .expect("run ainl");
+                let _ = std::fs::remove_file(&path);
+                o
+            }
+        };
+        assert!(
+            out.status.success(),
+            "{label} file-exists/delete failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let mut outputs = Vec::new();
+    for (label, name) in [("aot", "fs_aot"), ("interp", "fs_interp")] {
+        let dir = std::env::temp_dir().join(format!("ainl-aot-tier1-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_dir(&dir);
+        let d = format!("{:?}", dir.to_str().unwrap());
+        let program = tmpl
+            .replace("{f}", &format!("(path-join {d} \"alpha.txt\")"))
+            .replace("{g}", &format!("(path-join {d} \"new.txt\")"))
+            .replace("{sub}", &format!("(path-join {d} \"sub\")"))
+            .replace("{missing}", &format!("(path-join {d} \"nope\")"));
+
+        let out = if label == "aot" {
+            let bin = compile_aot(&program, name);
+            run(label, &program, Some(&bin))
+        } else {
+            run(label, &program, None)
+        };
+        // The documented answers: true/nil (not true/false), a directory
+        // exists, the created file reads back, delete returns nil, and a
+        // trailing separator still names the same file.
+        assert_eq!(
+            out, "true\nnil\ntrue\nnil\ntrue 6\nnil\nnil\ntrue\ntrue\n",
+            "{label} file-exists/delete-file output differs from the contract"
+        );
+        outputs.push(out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "AOT and the interpreter disagree on file-exists/delete-file"
+    );
+}
+
+#[test]
+fn aot_path_builtins_match_the_interpreter() {
+    // The full edge-case table, not just the happy path: these are the inputs
+    // where the four hosts disagree, so they are the ones worth pinning.
+    assert_stdout_parity(
+        r#"(do
+        (print (path-join "a" "b" "c") (path-join "a//b" "d") (path-join "" "b"))
+        (print (path-join "a" "" "b") (path-join "/a" "b") (path-join "a" "/b"))
+        (print (path-join "a" "b/") (path-join "a" "." "b") (path-join "a" ".."))
+        (print (path-base "a/b/c.txt") (path-base "a/b/") (path-base "/"))
+        (print (path-base "") (path-base "x") (path-base "a/."))
+        (print (path-dir "a/b/c.txt") (path-dir "x") (path-dir "/x"))
+        (print (path-dir "a//b") (path-dir "a/.") (path-dir "/") (path-dir "")))"#,
+        "path_builtins",
+    );
+}
+
+#[test]
+fn aot_tier1_error_messages_are_identical_to_the_interpreters() {
+    // Error cases for the new builtins, including the two answers that are
+    // design decisions rather than accidents (delete-file refuses a directory;
+    // list-dir on a file is an error), and the positional type error from
+    // path-join.
+    let dir = std::env::temp_dir().join("ainl-aot-tier1-errors");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+    std::fs::write(dir.join("afile.txt"), "x").expect("write");
+    let d = format!("{:?}", dir.to_str().unwrap());
+    let cases: &[(&str, &str)] = &[
+        (
+            &format!("(delete-file (path-join {d} \"sub\"))"),
+            "t1_del_dir",
+        ),
+        (
+            &format!("(delete-file (path-join {d} \"gone.txt\"))"),
+            "t1_del_missing",
+        ),
+        (
+            &format!("(list-dir (path-join {d} \"afile.txt\"))"),
+            "t1_list_file",
+        ),
+        (
+            &format!("(list-dir (path-join {d} \"nodir\"))"),
+            "t1_list_missing",
+        ),
+        ("(list-dir 1)", "t1_list_type"),
+        ("(file-exists 1)", "t1_exists_type"),
+        ("(delete-file 1)", "t1_delete_type"),
+        ("(path-join)", "t1_join_arity"),
+        ("(path-join \"a\" 1)", "t1_join_type"),
+        ("(path-join \"a\" \"b\" 1.5)", "t1_join_type_float"),
+        ("(path-base 1)", "t1_base_type"),
+        ("(path-dir 1)", "t1_dir_type"),
+    ];
+    for (src, name) in cases {
+        assert_error_parity(src, name);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- error-message identity (the card's "byte-for-byte" requirement) -------
 
 #[test]
@@ -495,6 +732,12 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         "max",
         "floor",
         "sqrt",
+        "file-exists",
+        "delete-file",
+        "list-dir",
+        "path-join",
+        "path-base",
+        "path-dir",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -517,5 +760,5 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 46, "update this list when the prelude changes");
+    assert_eq!(names.len(), 52, "update this list when the prelude changes");
 }

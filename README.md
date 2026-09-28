@@ -163,7 +163,7 @@ AINL's other properties, all measured:
 - **AOT to a native binary.** `ainl compile` emits a single self-contained C
   file — the micro-runtime is inlined, so the output links against nothing but
   libc. Needs `cc` to build; **the output needs nothing.**
-- **46 builtins** across the interpreter, the AOT binary, and all three
+- **52 builtins** across the interpreter, the AOT binary, and all three
   transpiler targets, with byte-identical output on all four.
 - **Zero external dependencies.** A small static Rust binary, no crates.io
   runtime deps.

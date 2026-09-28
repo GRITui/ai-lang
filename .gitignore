@@ -10,9 +10,10 @@ Cargo.lock
 # a killed compile can leave one behind)
 /.*.ainl-codegen.c
 
-# examples/stdlib.ainl's scratch file. AINL has no delete builtin, so the
-# example cannot clean up after itself and the file survives the run.
-ainl-stdlib-example.tmp
+# examples/stdlib.ainl's scratch file. AINL gained `delete-file` in Tier 1, so
+# the example now cleans up its own scratch file on a successful run; this entry
+# only matters when a run is interrupted, leaving one behind.
+ainl-stdlib-example.tmp*
 
 # Secrets (keep tokens/keys out of the repo)
 *.env

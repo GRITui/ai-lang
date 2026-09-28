@@ -87,6 +87,20 @@ impl Js {
                 self.needed.insert("_isnum");
             }
         }
+        // Tier 1 file I/O: the three path builtins share one canonicalizer, and
+        // `_ainl_tname` (used by `path-join`'s positional type error) branches
+        // on _Hash and _Sym, so it must pull both in.
+        if ["_path_join", "_path_base", "_path_dir"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_path_canonical");
+        }
+        if self.needed.contains("_path_join") {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+        }
         let mut out = String::new();
         out.push_str("// Transpiled from AINL by `ainl transpile --to js`.\n");
         out.push_str("// Generated code: edit the .ainl source, not this file.\n\n");
@@ -328,6 +342,17 @@ impl Js {
                 "append-file" => {
                     return self.call_builtin("_append_file", args, Some("_append_file"))
                 }
+                // ---- Tier 1 file I/O ----
+                "file-exists" => {
+                    return self.call_builtin("_file_exists", args, Some("_file_exists"))
+                }
+                "delete-file" => {
+                    return self.call_builtin("_delete_file", args, Some("_delete_file"))
+                }
+                "list-dir" => return self.call_builtin("_list_dir", args, Some("_list_dir")),
+                "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
+                "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
+                "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -666,6 +691,50 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_append_file",
         "function _append_file(path, content) {\n  if (typeof path !== \"string\") throw new TypeError(\"append-file expects a str path\");\n  if (typeof content !== \"string\") throw new TypeError(\"append-file expects str content\");\n  require(\"fs\").appendFileSync(path, content);\n}",
+    ),
+    // ---- Tier 1 file I/O ----
+    // The path helpers implement AINL's own rules rather than delegating to
+    // node's `path`, because the hosts disagree on every edge case that
+    // matters — path.join("a", "", "b") is "a/b" but path.join("a//b","d")
+    // collapses a duplicate separator the interpreter preserves, and
+    // path.dirname("x") is "." for a different reason than POSIX gives it.
+    // See the measured table in ainl-core/src/eval.rs and docs/SYNTAX.md
+    // "Path functions".
+    (
+        "_file_exists",
+        "function _file_exists(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"file-exists expects a str path\");\n  // lstatSync, not existsSync: existsSync follows the link, so a broken\n  // symlink would read as absent where the interpreter and the C runtime\n  // (both lstat) report it as present.\n  const p = path.length > 1 && path.endsWith(\"/\") ? path.slice(0, -1) : path;\n  try {\n    require(\"fs\").lstatSync(p);\n    return true;\n  } catch (e) {\n    return null;\n  }\n}",
+    ),
+    (
+        "_delete_file",
+        "function _delete_file(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"delete-file expects a str path\");\n  const fs = require(\"fs\");\n  let st;\n  try {\n    st = fs.lstatSync(path);\n  } catch (e) {\n    throw new Error(`delete-file: cannot delete '${path}'`);\n  }\n  if (st.isDirectory()) throw new Error(`delete-file: cannot delete '${path}': it is a directory`);\n  fs.unlinkSync(path);\n}",
+    ),
+    (
+        "_list_dir",
+        "function _list_dir(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"list-dir expects a str path\");\n  let names;\n  try {\n    names = require(\"fs\").readdirSync(path);\n  } catch (e) {\n    throw new Error(`list-dir: cannot read '${path}'`);\n  }\n  // Sort by UTF-8 *bytes*, not by JS string order: Array#sort compares UTF-16\n  // code units, which orders supplementary-plane characters (emoji, CJK\n  // extension B) before U+E000..U+FFFF, while the interpreter sorts by Rust's\n  // str Ord (byte order) and the C runtime by unsigned-byte order. Buffer\n  // comparison is byte order, so the two agree.\n  return names\n    .filter((n) => n !== \".\" && n !== \"..\")\n    .sort((a, b) => Buffer.compare(Buffer.from(a, \"utf8\"), Buffer.from(b, \"utf8\")));\n}",
+    ),
+    (
+        "_path_canonical",
+        "function _path_canonical(p) {\n  const absolute = p.startsWith(\"/\");\n  const segs = p.split(\"/\").filter((s) => s !== \"\" && s !== \".\");\n  if (p.endsWith(\"/.\")) segs.push(\".\");\n  const out = segs.join(\"/\");\n  return absolute ? \"/\" + out : out;\n}",
+    ),
+    (
+        "_path_join",
+        "function _path_join(...parts) {\n  if (!parts.length) throw new Error(\"path-join expects at least 1 argument\");\n  for (let i = 0; i < parts.length; i++) {\n    if (typeof parts[i] !== \"string\") throw new TypeError(`path-join expects str parts, got ${_ainl_tname(parts[i])} at position ${i + 1}`);\n  }\n  return _path_canonical(parts.join(\"/\"));\n}",
+    ),
+    (
+        "_path_base",
+        "function _path_base(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"path-base expects a str path\");\n  const c = _path_canonical(path);\n  if (!c) return \"\";\n  const i = c.lastIndexOf(\"/\");\n  const name = i === -1 ? c : c.slice(i + 1);\n  return name;\n}",
+    ),
+    (
+        "_path_dir",
+        "function _path_dir(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"path-dir expects a str path\");\n  const c = _path_canonical(path);\n  const i = c.lastIndexOf(\"/\");\n  if (i === -1) return \".\";\n  if (i === 0) return \"/\";\n  return c.slice(0, i);\n}",
+    ),
+    // The AINL type name for a value, for the position-reporting type errors
+    // `path-join` raises. Kept tiny and explicit: the interpreter's wording
+    // ("got int at position 2") is part of the 4-backend contract, and JS's own
+    // typeof would say "number" for both an int and a float.
+    (
+        "_ainl_tname",
+        "function _ainl_tname(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (typeof x === \"boolean\") return \"bool\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  if (typeof x === \"string\") return \"str\";\n  if (Array.isArray(x)) return \"list\";\n  if (x instanceof _Hash) return \"hash\";\n  if (x instanceof _Sym) return \"sym\";\n  if (typeof x === \"function\") return \"fn\";\n  return \"?\";\n}",
     ),
     (
         "_split",

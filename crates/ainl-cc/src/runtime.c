@@ -124,6 +124,13 @@ enum {
   B_ENV_GET, B_EXIT,
   B_NOW, B_SLEEP,
   B_ABS, B_MIN, B_MAX, B_FLOOR, B_SQRT,
+  /* Tier 1 file I/O. Appended at the end rather than grouped with the other
+   * file builtins so every Stage 3.1 id keeps the value it has always had —
+   * the three tables (this enum, BUILTIN_IDS in ainl-cc's lib.rs, and the
+   * runtime's name table) are pinned against each other by
+   * crates/ainl-cc/tests/aot_stdlib.rs. */
+  B_FILE_EXISTS, B_DELETE_FILE, B_LIST_DIR,
+  B_PATH_JOIN, B_PATH_BASE, B_PATH_DIR,
   B_COUNT
 };
 
@@ -1369,6 +1376,66 @@ static int as_num_arg(Value *v, const char *who, double *out) {
   return 0;
 }
 
+/* Is `buf[0..len)` well-formed UTF-8?
+ *
+ * The interpreter's read-file goes through std::fs::read_to_string, which
+ * *fails* on invalid UTF-8 (the file's bytes would not be representable as a
+ * Rust String). This runtime used to hand the raw bytes back instead, so
+ * (read-file "invalid.bin") was a runtime error in the interpreter and 6 raw
+ * bytes in the compiled binary — a real 4-backend divergence, reachable with
+ * any file that is not valid UTF-8. Rejecting it here is what makes the two
+ * agree. (The transpiler targets' hosts each have their own answer here, so
+ * their helpers are pinned to this same rule — see docs/SYNTAX.md "File I/O".)
+ *
+ * UTF-8 validity: a lead byte is 0xxxxxxx, 110xxxxx, 1110xxxx or 11110xxx
+ * followed by that many 10xxxxxx continuation bytes. Overlong encodings, a
+ * surrogate half (ED A0..BF ..), and anything above U+10FFFF are rejected, per
+ * the Unicode definition of well-formed UTF-8. */
+static int utf8_valid(const char *buf, size_t len) {
+  size_t i = 0;
+  while (i < len) {
+    unsigned char c = (unsigned char)buf[i];
+    size_t need;
+    unsigned int cp;
+    if (c < 0x80) {
+      i++;
+      continue;
+    } else if ((c & 0xE0) == 0xC0) {
+      need = 1;
+      cp = c & 0x1Fu;
+    } else if ((c & 0xF0) == 0xE0) {
+      need = 2;
+      cp = c & 0x0Fu;
+    } else if ((c & 0xF8) == 0xF0) {
+      need = 3;
+      cp = c & 0x07u;
+    } else {
+      return 0; /* continuation byte in lead position, or 0xF8-0xFF */
+    }
+    if (need >= len - i)
+      return 0; /* truncated sequence: fewer bytes left than it needs */
+    for (size_t k = 1; k <= need; k++) {
+      unsigned char cc = (unsigned char)buf[i + k];
+      if ((cc & 0xC0) != 0x80)
+        return 0;
+      cp = (cp << 6) | (cc & 0x3Fu);
+    }
+    /* Overlong (the shortest form must be used), surrogate halves, > U+10FFFF. */
+    if (need == 1 && cp < 0x80)
+      return 0;
+    if (need == 2 && cp < 0x800)
+      return 0;
+    if (need == 3 && cp < 0x10000)
+      return 0;
+    if (cp >= 0xD800 && cp <= 0xDFFF)
+      return 0;
+    if (cp > 0x10FFFF)
+      return 0;
+    i += need + 1;
+  }
+  return 1;
+}
+
 /* Read a whole file as a new Str. fopen in "rb" so no CRLF translation can
  * change the bytes on a Windows host (matching the interpreter's read). */
 static Value builtin_read_file(Value *args, int nargs) {
@@ -1399,6 +1466,13 @@ static Value builtin_read_file(Value *args, int nargs) {
   int bad = ferror(f);
   fclose(f);
   if (bad) {
+    free(buf);
+    set_err("read-file: cannot read '%s'", path);
+    return v_nil();
+  }
+  /* Same rule as the interpreter: a file whose bytes are not valid UTF-8
+   * cannot become a string, so it is the same error as an unreadable path. */
+  if (!utf8_valid(buf, len)) {
     free(buf);
     set_err("read-file: cannot read '%s'", path);
     return v_nil();
@@ -1447,6 +1521,301 @@ static Value builtin_write_file(Value *args, int nargs) {
 static Value builtin_append_file(Value *args, int nargs) {
   /* "ab" appends, and creates the file when absent, matching append-file. */
   return write_file_inner(args, nargs, "append-file", "append to", "ab");
+}
+
+/* ---- Tier 1 file I/O -----------------------------------------------------
+ * Byte-for-byte twins of the corresponding builtins in ainl-core/src/eval.rs,
+ * including every error string. The path algebra (path_join/path_base/
+ * path_dir) is spelled out here rather than delegated to <libgen.h>: the hosts
+ * disagree on every edge case (see the measured table in eval.rs), and this
+ * string surgery is the only way to get one answer all five backends share. */
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* path_canonical: the shared core of the three path builtins — duplicate
+ * separators merged, "." segments dropped, a leading "/" kept, a trailing
+ * separator dropped, and a trailing "." kept (so path_dir("a/.") is "a", not
+ * the parent). Mirrors `path_canonical` in eval.rs exactly.
+ *
+ * Returns a malloc'd string, or NULL if allocation fails (callers treat that
+ * as an allocation failure, which the runtime cannot report any better). */
+static char *path_canonical(const char *p) {
+  size_t len = strlen(p);
+  int absolute = p[0] == '/';
+  /* Upper bound: the input length is never exceeded by the canonical form
+   * (a trailing "." re-added at the end is the one case that grows it, and
+   * only for a path that already contained a "/."). len + 3 covers it. */
+  char *out = malloc(len + 3);
+  if (!out)
+    return NULL;
+  size_t w = 0;
+  if (absolute)
+    out[w++] = '/';
+  size_t i = 0;
+  while (i < len) {
+    size_t j = i;
+    while (j < len && p[j] != '/')
+      j++;
+    size_t seglen = j - i;
+    int is_dot = (seglen == 1 && p[i] == '.');
+    /* Drop an empty segment (duplicate separator) and a "." segment. */
+    if (seglen > 0 && !is_dot) {
+      if (w > (size_t)absolute && out[w - 1] != '/')
+        out[w++] = '/';
+      memcpy(out + w, p + i, seglen);
+      w += seglen;
+    }
+    i = (j < len) ? j + 1 : j;
+  }
+  /* A trailing "." is the final component, and is kept — see above. */
+  if (len >= 2 && p[len - 2] == '/' && p[len - 1] == '.') {
+    if (w > (size_t)absolute && out[w - 1] != '/')
+      out[w++] = '/';
+    out[w++] = '.';
+  }
+  out[w] = 0;
+  return out;
+}
+
+/* (path-join a b ...) -> str. */
+static Value builtin_path_join(Value *args, int nargs) {
+  if (nargs < 1) {
+    set_err("path-join expects at least 1 argument");
+    return v_nil();
+  }
+  size_t total = 0;
+  for (int i = 0; i < nargs; i++) {
+    if (args[i].tag != V_STR) {
+      /* Reported by position, as in the interpreter. */
+      set_err("path-join expects str parts, got %s at position %d", type_name(&args[i]),
+              i + 1);
+      return v_nil();
+    }
+    total += args[i].u.s->len;
+  }
+  /* nargs-1 separators for the join, +1 for the terminator. */
+  char *buf = malloc(total + (size_t)nargs + 1);
+  if (!buf) {
+    set_err("path-join: out of memory");
+    return v_nil();
+  }
+  size_t w = 0;
+  for (int i = 0; i < nargs; i++) {
+    if (i > 0)
+      buf[w++] = '/';
+    memcpy(buf + w, args[i].u.s->data, args[i].u.s->len);
+    w += args[i].u.s->len;
+  }
+  buf[w] = 0;
+  char *canon = path_canonical(buf);
+  free(buf);
+  if (!canon) {
+    set_err("path-join: out of memory");
+    return v_nil();
+  }
+  return v_str_take(canon);
+}
+
+/* (path-base p) -> the final component, or "" when there is none. */
+static Value builtin_path_base(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("path-base expects (path-base path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "path-base");
+  if (!path)
+    return v_nil();
+  char *canon = path_canonical(path);
+  if (!canon) {
+    set_err("path-base: out of memory");
+    return v_nil();
+  }
+  char *last = strrchr(canon, '/');
+  const char *name = last ? last + 1 : canon;
+  Value r = v_str(name);
+  free(canon);
+  return r;
+}
+
+/* (path-dir p) -> everything before the final component; "/" for a top-level
+ * name, "." when there is no separator at all. */
+static Value builtin_path_dir(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("path-dir expects (path-dir path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "path-dir");
+  if (!path)
+    return v_nil();
+  char *canon = path_canonical(path);
+  if (!canon) {
+    set_err("path-dir: out of memory");
+    return v_nil();
+  }
+  char *last = strrchr(canon, '/');
+  Value r;
+  if (!last) {
+    r = v_str(".");
+  } else if (last == canon) {
+    r = v_str("/");
+  } else {
+    *last = 0;
+    r = v_str(canon);
+  }
+  free(canon);
+  return r;
+}
+
+/* (file-exists p) -> true, or nil. lstat, not stat: a broken symlink is still
+ * a directory entry, and following the link would report it as absent. */
+static Value builtin_file_exists(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("file-exists expects (file-exists path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "file-exists");
+  if (!path)
+    return v_nil();
+  struct stat st;
+  /* A lone "/" must not be trimmed to "" (it is the root, which exists); a
+   * trailing separator on anything else names the same entry, as in the
+   * interpreter. The trimmed copy is built with malloc rather than by writing
+   * into the caller's string, which is const. */
+  size_t n = strlen(path);
+  if (n > 1 && path[n - 1] == '/') {
+    char *trimmed = malloc(n);
+    if (!trimmed) {
+      set_err("file-exists: out of memory");
+      return v_nil();
+    }
+    memcpy(trimmed, path, n - 1);
+    trimmed[n - 1] = 0;
+    int ok = lstat(trimmed, &st) == 0;
+    free(trimmed);
+    return ok ? v_bool(1) : v_nil();
+  }
+  return lstat(path, &st) == 0 ? v_bool(1) : v_nil();
+}
+
+/* (delete-file p) -> nil. A directory is refused, not silently ignored, and a
+ * missing path is an error — both matching the interpreter. */
+static Value builtin_delete_file(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("delete-file expects (delete-file path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "delete-file");
+  if (!path)
+    return v_nil();
+  struct stat st;
+  if (lstat(path, &st) != 0) {
+    set_err("delete-file: cannot delete '%s'", path);
+    return v_nil();
+  }
+  if (S_ISDIR(st.st_mode)) {
+    set_err("delete-file: cannot delete '%s': it is a directory", path);
+    return v_nil();
+  }
+  if (unlink(path) != 0) {
+    set_err("delete-file: cannot delete '%s'", path);
+    return v_nil();
+  }
+  return v_nil();
+}
+
+/* Byte-value name order for list-dir's qsort. strcoll is locale-dependent
+ * (and would disagree with the interpreter's Rust sort on several hosts), so
+ * the comparison is unsigned-byte order — which is exactly what Rust's Ord
+ * for str, Python's bytes ordering and a JS Buffer.compare all do. */
+static int name_cmp(const void *a, const void *b) {
+  const unsigned char *x = *(const unsigned char *const *)a;
+  const unsigned char *y = *(const unsigned char *const *)b;
+  while (*x && *x == *y) {
+    x++;
+    y++;
+  }
+  /* Cast to int so a difference of 0x80+ does not overflow to a positive. */
+  return (int)*x - (int)*y;
+}
+
+/* (list-dir p) -> list of str, sorted by byte value. "." and ".." are
+ * artifacts of the directory, not entries, so they are skipped — every other
+ * backend includes every name, so all five agree. */
+static Value builtin_list_dir(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("list-dir expects (list-dir path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "list-dir");
+  if (!path)
+    return v_nil();
+  DIR *d = opendir(path);
+  if (!d) {
+    set_err("list-dir: cannot read '%s'", path);
+    return v_nil();
+  }
+  size_t cap = 16, n = 0;
+  char **names = malloc(cap * sizeof(char *));
+  if (!names) {
+    closedir(d);
+    set_err("list-dir: out of memory");
+    return v_nil();
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    if (n == cap) {
+      cap *= 2;
+      char **bigger = realloc(names, cap * sizeof(char *));
+      if (!bigger) {
+        /* Free what we have rather than leaking; the error is still reported. */
+        for (size_t k = 0; k < n; k++)
+          free(names[k]);
+        free(names);
+        closedir(d);
+        set_err("list-dir: out of memory");
+        return v_nil();
+      }
+      names = bigger;
+    }
+    names[n] = strdup(ent->d_name);
+    if (!names[n]) {
+      for (size_t k = 0; k < n; k++)
+        free(names[k]);
+      free(names);
+      closedir(d);
+      set_err("list-dir: out of memory");
+      return v_nil();
+    }
+    n++;
+  }
+  closedir(d);
+  /* Determinism is the whole point of the builtin: readdir order is
+   * filesystem-dependent and differs per host. */
+  if (n > 1)
+    qsort(names, n, sizeof(char *), name_cmp);
+  Value *items = malloc((n > 0 ? n : 1) * sizeof(Value));
+  if (!items) {
+    for (size_t k = 0; k < n; k++)
+      free(names[k]);
+    free(names);
+    set_err("list-dir: out of memory");
+    return v_nil();
+  }
+  for (size_t k = 0; k < n; k++) {
+    items[k].tag = V_STR;
+    items[k].u.s = NULL;
+    Str *st = malloc(sizeof(Str));
+    st->ref = 1;
+    st->len = strlen(names[k]);
+    st->data = names[k]; /* takes ownership */
+    items[k].u.s = st;
+  }
+  free(names);
+  return v_list_from_array(items, (int)n);
 }
 
 /* (split str sep) -> list of str. An empty separator is rejected, as in the
@@ -1890,6 +2259,19 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_write_file(args, nargs);
     case B_APPEND_FILE:
       return builtin_append_file(args, nargs);
+    /* Tier 1 file I/O */
+    case B_FILE_EXISTS:
+      return builtin_file_exists(args, nargs);
+    case B_DELETE_FILE:
+      return builtin_delete_file(args, nargs);
+    case B_LIST_DIR:
+      return builtin_list_dir(args, nargs);
+    case B_PATH_JOIN:
+      return builtin_path_join(args, nargs);
+    case B_PATH_BASE:
+      return builtin_path_base(args, nargs);
+    case B_PATH_DIR:
+      return builtin_path_dir(args, nargs);
     case B_SPLIT:
       return builtin_split(args, nargs);
     case B_JOIN:
@@ -2140,6 +2522,10 @@ static void scope_install_prelude(Scope *env) {
       {"env-get", B_ENV_GET}, {"exit", B_EXIT}, {"now", B_NOW},
       {"sleep", B_SLEEP}, {"abs", B_ABS}, {"min", B_MIN}, {"max", B_MAX},
       {"floor", B_FLOOR}, {"sqrt", B_SQRT},
+      /* Tier 1 file I/O */
+      {"file-exists", B_FILE_EXISTS}, {"delete-file", B_DELETE_FILE},
+      {"list-dir", B_LIST_DIR}, {"path-join", B_PATH_JOIN},
+      {"path-base", B_PATH_BASE}, {"path-dir", B_PATH_DIR},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

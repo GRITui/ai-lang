@@ -576,6 +576,17 @@ fn install_stdlib(env: &Env) {
     b!("read-file", builtin_read_file);
     b!("write-file", builtin_write_file);
     b!("append-file", builtin_append_file);
+    // Tier 1 file I/O. The path builtins are deliberately *not* host
+    // `path`/`File` calls in the transpiler targets: the three hosts disagree
+    // on every edge case that matters (see `path_join` below and
+    // docs/SYNTAX.md "Path functions"), so each backend implements the same
+    // explicit POSIX-style rules instead of deferring to its own runtime.
+    b!("file-exists", builtin_file_exists);
+    b!("delete-file", builtin_delete_file);
+    b!("list-dir", builtin_list_dir);
+    b!("path-join", builtin_path_join);
+    b!("path-base", builtin_path_base);
+    b!("path-dir", builtin_path_dir);
 
     // strings
     b!("split", builtin_split);
@@ -715,6 +726,265 @@ fn builtin_write_file(args: &[Value]) -> Result<Value> {
 
 fn builtin_append_file(args: &[Value]) -> Result<Value> {
     write_file_inner(args, "append-file", "append to", true)
+}
+
+// ---- stdlib: Tier 1 file I/O ----------------------------------------------
+//
+// The six builtins below extend Stage 3.1's three with the operations a
+// self-contained tool actually needs, and the three `path-*` functions with a
+// string-only path algebra.
+//
+// The path algebra is written out here rather than delegated to `std::path`
+// (Rust), `os.path` (Python), `path` (JS) or `File` (Ruby) because the four
+// hosts disagree on every edge case that matters. Measured, on the same inputs:
+//
+//   input                     Rust   Python   Node     Ruby
+//   (path-join "a//b" "d")    a//b/d a//b/d  a/b/d    a//b/d
+//   (path-dir "a//b")         a//b   a       a/       a
+//   (path-base "a/b/")        b      ""      b        b
+//   (path-join "" "b")        b      b       b        /b      <- Ruby inserts a
+//                                                                  separator for an
+//                                                                  empty first part
+//
+// With four different answers, deferring to the host would mean the language
+// behaving differently depending on which backend runs it — the exact failure
+// the 4-backend rule exists to prevent. So the rules are pinned here, and each
+// of the other four backends implements the *same* table:
+//
+// * **Separator is always `/`.** AINL does not model the host separator, so
+//   there is exactly one, and a backslash is an ordinary filename character.
+//   (A Windows host therefore sees `path-join` build a forward-slash path,
+//   which Windows accepts.)
+// * **Runs of `/` collapse to one, and `.` segments are dropped** — except a
+//   *trailing* `.`, which is kept, because POSIX names a trailing-slash
+//   directory `"."` and dropping it would turn `path-dir "a/."` into `"a"`,
+//   i.e. the parent. `..` is *not* resolved: it may legitimately point at a
+//   path that does not exist, and resolving it would require touching the
+//   filesystem in a function that is documented to be pure.
+// * **A leading `/` is preserved**; there is no current-directory
+//   normalization, so `path-dir "x"` is `"."` (POSIX's answer) rather than
+//   Node's `"."` for a different reason or Python's `""`.
+// * **An empty part contributes nothing** — `(path-join)` and
+//   `(path-join "")` are both `""`, never `"/"` as Ruby would give.
+//
+// These are the POSIX single-letter rules, spelled out so every backend can
+// match them without a filesystem.
+
+/// Collapse a path to its canonical form: duplicate separators merged, `.`
+/// segments removed, a leading `/` kept, a trailing separator dropped, and a
+/// trailing `.` kept.
+///
+/// This is the shared core of [`path_join`], [`path_base`] and [`path_dir`];
+/// the builtins differ only in which part of the result they return.
+fn path_canonical(p: &str) -> String {
+    let absolute = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        // An empty segment is a duplicate separator, and a `.` segment is the
+        // current directory — neither names anything, so both are dropped. The
+        // trailing-`.` case is re-added below, because there a `.` *is* the
+        // final component.
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        out.push(seg);
+    }
+    // A `.` *trailing* segment is significant: "a/." is a directory reference,
+    // and keeping it is what makes `(path-dir "a/.")` return "a" rather than
+    // silently walking up one level. Dropping every `.` would turn the path
+    // "a" into itself and change the answer. (`path_canonical "a/./"` has the
+    // dot before the empty trailing segment, so it is dropped there.)
+    if p.ends_with("/.") {
+        out.push(".");
+    }
+    let mut s = out.join("/");
+    if absolute {
+        s.insert(0, '/');
+    }
+    s
+}
+
+/// `(path-join a b ...)` → the parts joined with `/`.
+///
+/// One or more string arguments. Zero arguments is an error rather than `""`:
+/// joining nothing has no meaningful result, and a 0-arg call is far more
+/// likely to be a bug (a stray `(path-join)`) than a request for the empty
+/// string.
+fn builtin_path_join(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::runtime("path-join expects at least 1 argument"));
+    }
+    for (i, v) in args.iter().enumerate() {
+        // Every part must be a str, reported by position so a 12-argument call
+        // names which one is wrong.
+        if !matches!(v, Value::Str(_)) {
+            return Err(Error::runtime(format!(
+                "path-join expects str parts, got {} at position {}",
+                v.type_name(),
+                i + 1
+            )));
+        }
+    }
+    let mut s = String::new();
+    for (i, v) in args.iter().enumerate() {
+        if i > 0 {
+            s.push('/');
+        }
+        if let Value::Str(part) = v {
+            s.push_str(part);
+        }
+    }
+    Ok(Value::str(path_canonical(&s)))
+}
+
+/// `(path-base p)` → the final component of `p`, or `""` if there is none
+/// (the path is empty, or is all separators). A trailing separator selects the
+/// last real component, so `(path-base "a/b/")` is `"b"`.
+fn builtin_path_base(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("path-base expects (path-base path)"));
+    };
+    let path = as_path_arg(p, "path-base")?;
+    let canon = path_canonical(path);
+    match canon.rsplit('/').next() {
+        Some(last) if !last.is_empty() => Ok(Value::str(last)),
+        _ => Ok(Value::str("")),
+    }
+}
+
+/// `(path-dir p)` → everything before the final component, or `""` if `p` has
+/// no directory part. `(path-dir "/x")` is `"/"`, and `(path-dir "x")` is
+/// `"."` — POSIX's answer, and the one every backend here implements.
+fn builtin_path_dir(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("path-dir expects (path-dir path)"));
+    };
+    let path = as_path_arg(p, "path-dir")?;
+    let canon = path_canonical(path);
+    match canon.rfind('/') {
+        None => Ok(Value::str(".")),
+        Some(0) => Ok(Value::str("/")),
+        Some(i) => Ok(Value::str(&canon[..i])),
+    }
+}
+
+/// `(file-exists p)` → `true` for anything that exists at `p` — file or
+/// directory — and `nil` otherwise.
+///
+/// `nil`, not `false`, is the "no" answer: AINL's own `get` returns `nil` for a
+/// missing key, and returning `false` would make a caller that tests `(if
+/// (file-exists p) ...)` behave identically while one that prints the value
+/// shows two different absences. `true`/`nil` also means `(= (file-exists p)
+/// nil)` tests for absence the way every other AINL program does.
+///
+/// A path that cannot be examined (a component that is not a directory, a
+/// permission error) is `nil` too, not an error: "is this there?" has one
+/// negative answer, and AINL has no way to distinguish EACCES from ENOENT
+/// without making the caller handle a filesystem detail.
+///
+/// A trailing separator is stripped, so `(file-exists "notes.txt/")` is
+/// `true` — it names the same file.
+fn builtin_file_exists(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("file-exists expects (file-exists path)"));
+    };
+    let path = as_path_arg(p, "file-exists")?;
+    // `symlink_metadata` rather than `metadata`: a broken symlink exists as a
+    // directory entry, and following the link would report it as absent. The
+    // filesystem is not canonicalized, so a trailing "/" on a symlink-to-dir
+    // still follows (POSIX requires it); only the whole-string case is
+    // trimmed here.
+    let probe = path
+        .strip_suffix('/')
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path);
+    Ok(if std::fs::symlink_metadata(probe).is_ok() {
+        Value::Bool(true)
+    } else {
+        Value::Nil
+    })
+}
+
+/// `(delete-file p)` → `nil`, removing the file or symlink at `p`.
+///
+/// A **directory** is an error, not a silent no-op: AINL has no
+/// `delete-dir`/`rm -r`, so a recursive delete has nowhere to be spelled, and
+/// quietly refusing would leave a caller believing a delete had happened.
+/// Refusing a directory — and saying so — is the safe half.
+///
+/// A missing path is an error for the same reason `read-file` errors rather
+/// than returning `""`: "delete this" against a typo'd path must not look
+/// like success. Call `(file-exists p)` first when absence is acceptable.
+fn builtin_delete_file(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("delete-file expects (delete-file path)"));
+    };
+    let path = as_path_arg(p, "delete-file")?;
+    match std::fs::symlink_metadata(path) {
+        Err(_) => Err(Error::runtime(format!(
+            "delete-file: cannot delete '{path}'"
+        ))),
+        Ok(meta) if meta.is_dir() => Err(Error::runtime(format!(
+            "delete-file: cannot delete '{path}': it is a directory"
+        ))),
+        Ok(_) => match std::fs::remove_file(path) {
+            Ok(()) => Ok(Value::Nil),
+            Err(_) => Err(Error::runtime(format!(
+                "delete-file: cannot delete '{path}'"
+            ))),
+        },
+    }
+}
+
+/// `(list-dir p)` → the names in directory `p`, **sorted**, as a list of
+/// strings.
+///
+/// The sort is the whole point of the builtin being deterministic: a raw
+/// `readdir` returns entries in filesystem order, which differs between
+/// filesystems (and between the same directory on different hosts), so a
+/// program that printed `(list-dir ".")` would produce different output
+/// depending on where it ran. Sorting by **byte value** makes the result
+/// stable everywhere — the AOT C runtime has no locale-independent
+/// `strcoll`/`strcasecmp` and the hosts each sort by a different collation
+/// (Python and Ruby use locale-aware, case-insensitive-ish rules; JS sorts by
+/// UTF-16 code unit). Byte order also puts uppercase before lowercase
+/// (`"B"` before `"a"`), which is the convention the C runtime can express
+/// exactly.
+///
+/// Entries are **names, not paths**: the result contains `"notes.txt"`, not
+/// `"./notes.txt"`. A hidden file is included — POSIX has no separate concept
+/// of hidden, and AINL has no glob or attribute test that would need one.
+///
+/// `.` and `..` are **not** included: they are artifacts of the directory,
+/// not entries, and including them would break every program that counts the
+/// contents of a directory. A missing path or a non-directory is an error,
+/// since "list this directory" against a typo is the same class of mistake as
+/// reading a typo'd file.
+fn builtin_list_dir(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("list-dir expects (list-dir path)"));
+    };
+    let path = as_path_arg(p, "list-dir")?;
+    let entries = match std::fs::read_dir(path) {
+        Err(_) => return Err(Error::runtime(format!("list-dir: cannot read '{path}'"))),
+        Ok(it) => it,
+    };
+    let mut names: Vec<String> = Vec::new();
+    // A single unreadable entry is skipped rather than failing the whole
+    // listing, so one bad name does not hide the rest of the directory.
+    for e in entries.flatten() {
+        let s = e.file_name().to_string_lossy().into_owned();
+        if s == "." || s == ".." {
+            continue;
+        }
+        names.push(s);
+    }
+    // Byte-value order — see the doc comment. Vec<String>::sort compares
+    // `Ord` on `str`, which is byte order.
+    names.sort_unstable();
+    Ok(Value::List(ConsCell::from_values(
+        names.into_iter().map(Value::str),
+    )))
 }
 
 // ---- stdlib: strings -------------------------------------------------------
@@ -1590,6 +1860,296 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- Tier 1 file I/O ----------------------------------------------------
+
+    /// AINL's path algebra, pinned case by case.
+    ///
+    /// Each of these is an input where the four hosts disagree — measured, not
+    /// assumed: Python's `os.path.join("", "b")` is `"b"` where Ruby's
+    /// `File.join("", "b")` is `"/b"`; Node's `path.join` collapses the
+    /// duplicate separator in `"a//b"` that Python and Ruby preserve; and
+    /// `os.path.dirname("x")` is `""` where POSIX (and therefore this table)
+    /// says `"."`. The rules are AINL's own so that the answer does not depend
+    /// on which backend runs the program.
+    #[test]
+    fn path_builtins_follow_the_pinned_rules() {
+        let cases: &[(&str, &str)] = &[
+            // path-join: one separator between parts, empty parts contribute
+            // nothing, duplicate separators collapse, a leading / is kept.
+            (r#"(path-join "a" "b" "c")"#, "a/b/c"),
+            (r#"(path-join "a//b" "d")"#, "a/b/d"),
+            (r#"(path-join "" "b")"#, "/b"),
+            (r#"(path-join "a" "" "b")"#, "a/b"),
+            (r#"(path-join "/a" "b")"#, "/a/b"),
+            (r#"(path-join "a" "/b")"#, "a/b"),
+            (r#"(path-join "a" "b/")"#, "a/b"),
+            (r#"(path-join "a" "." "b")"#, "a/b"),
+            (r#"(path-join "")"#, ""),
+            // `..` is never resolved: it can name a path that does not exist,
+            // and resolving it would make a pure function touch the disk.
+            (r#"(path-join "a" ".." "b")"#, "a/../b"),
+            (r#"(path-join "a" "b" "c" "d" "e" "f")"#, "a/b/c/d/e/f"),
+            // path-base: the final component; "" when there is none.
+            (r#"(path-base "a/b/c.txt")"#, "c.txt"),
+            (r#"(path-base "a/b/")"#, "b"),
+            (r#"(path-base "x")"#, "x"),
+            (r#"(path-base "/")"#, ""),
+            (r#"(path-base "")"#, ""),
+            (r#"(path-base "a/.")"#, "."),
+            // path-dir: everything before the final component; "." when there
+            // is no separator, "/" for a top-level name.
+            (r#"(path-dir "a/b/c.txt")"#, "a/b"),
+            (r#"(path-dir "x")"#, "."),
+            (r#"(path-dir "/x")"#, "/"),
+            (r#"(path-dir "a//b")"#, "a"),
+            (r#"(path-dir "a/.")"#, "a"),
+            (r#"(path-dir "/")"#, "/"),
+            (r#"(path-dir "")"#, "."),
+            (r#"(path-dir "a/../b")"#, "a/.."),
+        ];
+        for (src, want) in cases {
+            assert_eq!(
+                crate::run_str(src).unwrap(),
+                Value::str(*want),
+                "{src} should be {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_builtins_reject_bad_arguments() {
+        // Zero args is an error, not "": a stray (path-join) is a bug, and the
+        // empty string is available as (path-join "").
+        assert!(crate::run_str("(path-join)")
+            .unwrap_err()
+            .to_string()
+            .contains("path-join expects at least 1 argument"));
+        // A non-str part is reported *by position*, so a long call names which
+        // one is wrong.
+        let err = crate::run_str(r#"(path-join "a" "b" 1)"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("path-join expects str parts, got int at position 3"),
+            "got: {err}"
+        );
+        let err = crate::run_str(r#"(path-join 1.5)"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("path-join expects str parts, got float at position 1"),
+            "got: {err}"
+        );
+        // Arity and type for the other two.
+        assert!(crate::run_str(r#"(path-base "a" "b")"#)
+            .unwrap_err()
+            .to_string()
+            .contains("path-base expects (path-base path)"));
+        assert!(crate::run_str("(path-base 1)")
+            .unwrap_err()
+            .to_string()
+            .contains("path-base expects a str path, got int"));
+        assert!(crate::run_str("(path-dir 1)")
+            .unwrap_err()
+            .to_string()
+            .contains("path-dir expects a str path, got int"));
+    }
+
+    #[test]
+    fn file_exists_reports_true_or_nil() {
+        let dir = scratch_path("file-exists");
+        let file = dir.join("a.txt");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(&file, "x").expect("write");
+        let q = |p: &std::path::Path| format!("{:?}", p.to_str().unwrap());
+
+        assert_eq!(
+            crate::run_str(&format!("(file-exists {})", q(&file))).unwrap(),
+            Value::Bool(true)
+        );
+        // A directory counts as existing — "is something here?", not "is a
+        // *file* here?".
+        assert_eq!(
+            crate::run_str(&format!("(file-exists {})", q(&sub))).unwrap(),
+            Value::Bool(true)
+        );
+        // Absent is **nil**, not false: the same answer `get` gives for a
+        // missing key, so `(= (file-exists p) nil)` tests for absence.
+        assert_eq!(
+            crate::run_str(&format!("(file-exists {})", q(&dir.join("no")))).unwrap(),
+            Value::Nil
+        );
+        // A trailing separator names the same entry.
+        assert_eq!(
+            crate::run_str(&format!("(file-exists {})", q(&file.join("")))).unwrap(),
+            Value::Bool(true)
+        );
+        // ...but the root is not trimmed away into "".
+        assert_eq!(
+            crate::run_str(r#"(file-exists "/")"#).unwrap(),
+            Value::Bool(true)
+        );
+
+        assert!(crate::run_str("(file-exists 1)")
+            .unwrap_err()
+            .to_string()
+            .contains("file-exists expects a str path, got int"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_file_removes_a_file_and_refuses_anything_else() {
+        let dir = scratch_path("delete-file");
+        let file = dir.join("gone.txt");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(&file, "bye").expect("write");
+        let q = |p: &std::path::Path| format!("{:?}", p.to_str().unwrap());
+
+        // Returns nil, and the file is really gone.
+        assert_eq!(
+            crate::run_str(&format!("(delete-file {})", q(&file))).unwrap(),
+            Value::Nil
+        );
+        assert!(!file.exists());
+
+        // A directory is refused *with a message*, not silently ignored: AINL
+        // has no recursive delete, and a quiet no-op would leave the caller
+        // believing it had succeeded.
+        let err = crate::run_str(&format!("(delete-file {})", q(&sub)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("delete-file: cannot delete") && err.contains("it is a directory"),
+            "got: {err}"
+        );
+        assert!(
+            sub.exists(),
+            "a refused delete must not remove the directory"
+        );
+
+        // A missing path is an error too — "delete this" against a typo must not
+        // look like success. Call file-exists first when that is acceptable.
+        let err = crate::run_str(&format!("(delete-file {})", q(&file)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delete-file: cannot delete"), "got: {err}");
+
+        assert!(crate::run_str("(delete-file 1)")
+            .unwrap_err()
+            .to_string()
+            .contains("delete-file expects a str path, got int"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dir_is_sorted_and_free_of_dot_entries() {
+        let dir = scratch_path("list-dir");
+        for name in ["Beta.txt", "alpha.txt", "zeta.md", "_.hidden", "sp ace.txt"] {
+            std::fs::write(dir.join(name), "x").expect("write");
+        }
+        std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
+        std::fs::write(dir.join("sub").join("inner.txt"), "x").expect("write");
+
+        let got = crate::run_str(&format!("(list-dir {:?})", dir.to_str().unwrap())).unwrap();
+        // Byte order, not a case-insensitive or locale-aware collation:
+        // "Beta.txt" (B=0x42) < "_.hidden" (_=0x5F) < "alpha.txt" (a=0x61).
+        // A hidden file is included and "." / ".." are not — they are artifacts
+        // of the directory, not entries.
+        assert_eq!(
+            got,
+            crate::run_str(
+                r#"(list "Beta.txt" "_.hidden" "alpha.txt" "sp ace.txt" "sub" "zeta.md")"#
+            )
+            .unwrap(),
+            "list-dir must be sorted by byte value, with no . or .. entries"
+        );
+
+        // An empty directory is the empty list, not an error.
+        let empty = scratch_path("list-dir-empty");
+        assert_eq!(
+            crate::run_str(&format!("(list-dir {:?})", empty.to_str().unwrap())).unwrap(),
+            crate::run_str("(list)").unwrap()
+        );
+
+        // A file (or a missing path) is an error: "list this directory" against
+        // a typo is the same mistake as reading a typo'd file.
+        let err = crate::run_str(&format!(
+            "(list-dir {:?})",
+            dir.join("Beta.txt").to_str().unwrap()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("list-dir: cannot read"), "got: {err}");
+        assert!(crate::run_str("(list-dir 1)")
+            .unwrap_err()
+            .to_string()
+            .contains("list-dir expects a str path, got int"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// `write-file` does **not** create parent directories.
+    ///
+    /// This is a decision, not an accident, and the card asks for it to be
+    /// documented: a typo'd directory in a path would otherwise be silently
+    /// papered over by a recursive mkdir, and the resulting file would land
+    /// somewhere the script never named. Failing loudly at the write is the
+    /// safer half; a program that means to create a tree can do it explicitly
+    /// (and `list-dir` tells it what is already there).
+    #[test]
+    fn write_file_does_not_create_parent_directories() {
+        let dir = scratch_path("write-noparents");
+        let nested = dir.join("deep").join("nest").join("f.txt");
+        let err = crate::run_str(&format!(
+            "(write-file {:?} \"hi\")",
+            nested.to_str().unwrap()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("write-file: cannot write"), "got: {err}");
+        assert!(
+            !dir.join("deep").exists(),
+            "write-file must not have created the missing directories"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file whose bytes are not valid UTF-8 is an error, not a lossy string.
+    ///
+    /// The C runtime had to grow a UTF-8 validator to match this (see
+    /// `utf8_valid` in crates/ainl-cc/src/runtime.c) — before that, the same
+    /// program failed here and returned raw bytes in the compiled binary.
+    #[test]
+    fn read_file_rejects_a_non_utf8_file() {
+        let dir = scratch_path("read-utf8");
+        for (name, bytes) in [
+            ("bad.bin", b"ok\xffbad".to_vec()),
+            ("trunc.bin", b"a\xc3".to_vec()),
+            ("surrogate.bin", b"\xed\xa0\x80".to_vec()),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).expect("write");
+            let err = crate::run_str(&format!("(read-file {:?})", p.to_str().unwrap()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("read-file: cannot read"),
+                "{name} should be rejected, got: {err}"
+            );
+        }
+        // A real multi-byte file still reads back, counted in characters.
+        let ok = dir.join("ok.txt");
+        std::fs::write(&ok, "héllo 日本 😀".as_bytes()).expect("write");
+        assert_eq!(
+            crate::run_str(&format!("(read-file {:?})", ok.to_str().unwrap())).unwrap(),
+            Value::str("héllo 日本 😀")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn string_builtins_split_join_trim_replace_case_contains() {
         // split → list, including the leading-empty-field case every host
@@ -1898,6 +2458,18 @@ mod tests {
             "(floor 1.9)",
             "(sqrt 9)",
             r#"(env-get "AINL_STDLIB_UNSET_XYZ")"#,
+            // Tier 1 file I/O. The path builtins are pure, so they can be
+            // compared directly; the filesystem ones are exercised by their own
+            // tests above, which the VM shares (the VM dispatches `Value::Builtin`
+            // straight to the same Rust function, so a builtin that worked in one
+            // works in both — these cases prove the VM actually *reaches* it).
+            r#"(path-join "a" "b" "c")"#,
+            r#"(path-join "a//b" "")"#,
+            r#"(path-base "a/b/c.txt")"#,
+            r#"(path-base "/")"#,
+            r#"(path-dir "a/b/c.txt")"#,
+            r#"(path-dir "x")"#,
+            r#"(file-exists "ainl-definitely-not-here-xyz")"#,
         ];
         for src in cases {
             let vm = crate::run_str(src).unwrap_or_else(|e| panic!("VM failed on `{src}`: {e}"));
@@ -1905,5 +2477,49 @@ mod tests {
                 .unwrap_or_else(|e| panic!("tree-walk failed on `{src}`: {e}"));
             assert_eq!(vm, tw, "VM and tree-walk disagree on `{src}`");
         }
+    }
+
+    /// A Tier 1 builtin that only one evaluator wires up is a silent
+    /// divergence, and these are the *stateful* ones the pure-value list above
+    /// cannot cover.
+    #[test]
+    fn the_vm_and_the_tree_walk_agree_on_the_stateful_file_builtins() {
+        let dir = scratch_path("vm-file-agree");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        for name in ["Beta.txt", "alpha.txt"] {
+            std::fs::write(dir.join(name), "x").expect("write");
+        }
+        let d = format!("{:?}", dir.to_str().unwrap());
+        // A program each evaluator runs against its *own* copy: delete-file
+        // mutates, so a shared fixture would let the first run invalidate the
+        // second's.
+        let cases = [
+            format!("(do (write-file (path-join {d} \"w.txt\") \"body\") (read-file (path-join {d} \"w.txt\")))"),
+            format!("(do (write-file (path-join {d} \"w.txt\") \"body\") (append-file (path-join {d} \"w.txt\") \"!\") (read-file (path-join {d} \"w.txt\")))"),
+            format!("(list-dir {d})"),
+            format!("(do (write-file (path-join {d} \"del.txt\") \"x\") (delete-file (path-join {d} \"del.txt\")) (file-exists (path-join {d} \"del.txt\")))"),
+            format!("(file-exists (path-join {d} \"sub\"))"),
+        ];
+        for (i, src) in cases.iter().enumerate() {
+            let tag = format!("vm-file-agree-{i}");
+            let fresh = |tag: &str| {
+                let d = std::env::temp_dir().join(format!("ainl-stdlib-{tag}"));
+                let _ = std::fs::remove_dir_all(&d);
+                std::fs::create_dir_all(d.join("sub")).expect("mkdir");
+                for name in ["Beta.txt", "alpha.txt"] {
+                    std::fs::write(d.join(name), "x").expect("write");
+                }
+                format!("{:?}", d.to_str().unwrap())
+            };
+            let vm_src = src.replace(&d, &fresh(&format!("{tag}-vm")));
+            let tw_src = src.replace(&d, &fresh(&format!("{tag}-tw")));
+
+            let vm = crate::run_str(&vm_src).unwrap_or_else(|e| panic!("VM failed: {e}"));
+            let tw = crate::run_in_tree_walk(&tw_src)
+                .unwrap_or_else(|e| panic!("tree-walk failed: {e}"));
+            assert_eq!(vm, tw, "VM and tree-walk disagree on `{src}`");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

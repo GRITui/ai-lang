@@ -164,7 +164,7 @@ reason not to run this on everything.
 ```
 
 The micro-runtime (value model, refcounting, cons cells, interning, scopes,
-closures, 46 builtins, step counter) is inlined into a **single self-contained
+closures, 52 builtins, step counter) is inlined into a **single self-contained
 C file** that links against nothing but libc. Keep the C with `--keep-c`.
 
 ```

@@ -121,13 +121,47 @@ Two edge cases are **rejected rather than guessed**, because the hosts disagree 
 
 **File IO**: `(read-file path)` → the file's contents as a string. `(write-file path content)` creates or **truncates**. `(append-file path content)` appends. All three take a string path and string content and error otherwise; a missing file, or a path that cannot be opened, is a runtime error. Opening is binary on every backend, so a file's bytes are exactly what `read-file` returns — including `\r\n`, which is not translated. A very common idiom is `(split (read-file path) "\n")`, which is why `split` keeps trailing empties above.
 
+`write-file` and `append-file` **do not create parent directories**. `(write-file "new/dir/f.txt" "x")` is a `write-file: cannot write` error when `new/dir` does not exist. This is deliberate: silently `mkdir -p`-ing a typo'd path would put the file somewhere the script never named, and a program that means to build a tree can say so explicitly (`list-dir` also tells it what is already there).
+
+`read-file` requires the file to be **valid UTF-8**. A file whose bytes are not well-formed UTF-8 (a stray `0xFF`, a truncated multi-byte sequence, an encoded surrogate half) is the same `read-file: cannot read` error as a missing file, because its bytes cannot become a string. This rule is enforced in all four backends — the AOT C runtime carries a UTF-8 validator for it, because it has no `String` type to fail the conversion in.
+
+**Filesystem**: `(file-exists p)` → `true` if anything exists at `p` — a file *or* a directory — and `nil` otherwise. It is `nil` and not `false` so that absence is tested the same way as a missing map key: `(= (file-exists p) nil)`. A path that cannot be examined (a non-directory component, a permission error) is also `nil`, since "is this there?" has one negative answer. A trailing separator is ignored, so `(file-exists "notes.txt/")` is `true`.
+
+`(delete-file p)` → `nil`, removing the file or symlink at `p`. A **directory is an error** (`delete-file: cannot delete '…': it is a directory`), not a silent no-op: AINL has no recursive delete, and quietly refusing would leave a caller believing the delete had happened. A **missing path is an error too**, for the same reason `read-file` errors rather than returning `""` — check `(file-exists p)` first when absence is acceptable.
+
+`(list-dir p)` → the names in directory `p`, as a list of strings, **sorted by byte value**. The sort is the point: a raw directory read returns entries in filesystem order, which differs per filesystem and per host, so `(list-dir ".")` would otherwise print different output depending on where it ran. Byte order also puts `"Capital.txt"` before `"beta.txt"`, where a case-insensitive or locale-aware collation would not — which is why the AOT C runtime uses an unsigned-byte comparison (`strcoll` is locale-dependent) and the transpiler targets sort by encoded bytes rather than by their own string order (JS's `Array#sort` compares UTF-16 code units, which orders an emoji *before* `U+E000`). Entries are **names, not paths** (`"notes.txt"`, never `"./notes.txt"`); a hidden file **is** included, since AINL has no concept of one; and `"."` / `".."` are **not**, because they are artifacts of the directory rather than entries. A missing path, or one that is not a directory, is an error.
+
+**Path functions** — pure string operations, no filesystem access:
+
+- `(path-join a b ...)` → the parts joined with `/`. One or more arguments; `(path-join)` is an error.
+- `(path-base p)` → the final component, or `""` when there is none (`(path-base "/")`).
+- `(path-dir p)` → everything before the final component: `"."` when `p` has no separator, `"/"` for a top-level name.
+
+These three do **not** defer to the host's own path library, and that is a deliberate decision rather than an oversight. Measured on the same inputs, the hosts disagree on every edge case that matters:
+
+| input | Python `os.path` | Node `path` | Ruby `File` |
+| --- | --- | --- | --- |
+| `(path-join "a//b" "d")` | `a//b/d` | `a/b/d` | `a//b/d` |
+| `(path-dir "a//b")` | `a` | `a/` | `a` |
+| `(path-base "a/b/")` | `""` | `b` | `b` |
+| `(path-join "" "b")` | `b` | `b` | `/b` |
+| `(path-dir "x")` | `""` | `.` | `.` |
+
+With four different answers, deferring to the host would mean the language behaving differently depending on which backend runs the program — the exact failure the four-backend rule exists to prevent. So AINL defines **its own** rules, POSIX-flavoured and spelled out identically in all five implementations (`crates/ainl-core/src/eval.rs` is normative):
+
+- The separator is always `/`. AINL does not model the host separator, so a backslash is an ordinary filename character.
+- Runs of `/` collapse to one, and `.` segments are dropped — **except a trailing `.`**, which is kept, because `"a/."` names a directory and dropping the dot would make `(path-dir "a/.")` return `"a"`, i.e. the *parent*.
+- A leading `/` is preserved, and there is no current-directory normalization.
+- `..` is **never resolved**: it can legitimately name a path that does not exist, and resolving it would make a function documented as pure touch the disk.
+- An empty part contributes nothing, so `(path-join "" "b")` is `/b` and `(path-join "a" "" "b")` is `a/b` — never Ruby's `/b`-for-an-empty-first-part.
+
 **Environment / process**: `(env-get name)` → the value of the environment variable, or `nil` if unset. `(exit code)` ends the process with that status. `code` must be an integer.
 
 **Time**: `(now)` → whole Unix-epoch seconds as an integer. `(sleep secs)` pauses for `secs` seconds; a fractional value is allowed. `(sleep)` and a zero duration return immediately. A negative or NaN duration is an error.
 
 **Math**: `(abs n)`, `(floor n)` → an integer, `(sqrt n)`. `(min a b...)` / `(max a b...)` take **one or more** numbers and return the smallest/largest; mixed ints and floats compare numerically, a tie returns the *first* of the tied values, and a non-numeric argument is an error. They are deliberately numeric-only — not generic "compare anything" — because the hosts disagree about comparing lists and strings (`[1] < [2]` is a type error in Python but fine in JavaScript, and Ruby's `Comparable` will happily compare a String against an Integer). `(sqrt -1)` is an error, not `NaN`.
 
-**Why each of these has a hand-written rule per backend.** AINL has four execution backends — the interpreter/VM, the AOT-compiled C binary, and the Python, JavaScript and Ruby transpiler targets — and a builtin is only real when all five agree. Most of them do, because they map to the host's own facility. The ones above don't, and each of those cases has a test pinning the AINL answer: ASCII case folding and trimming, an empty split separator, an empty replace target, numeric-only `min`/`max`, and the errors for a negative `sqrt` or `sleep`. `crates/ainl-core/src/eval.rs` is the normative implementation and the other four are written to match it; `crates/ainl-cc/tests/aot_stdlib.rs` and the three `*_stdlib.rs` transpiler suites are what keep them there.
+**Why each of these has a hand-written rule per backend.** AINL has four execution backends — the interpreter/VM, the AOT-compiled C binary, and the Python, JavaScript and Ruby transpiler targets — and a builtin is only real when all five agree. Most of them do, because they map to the host's own facility. The ones above don't, and each of those cases has a test pinning the AINL answer: ASCII case folding and trimming, an empty split separator, an empty replace target, numeric-only `min`/`max`, the errors for a negative `sqrt` or `sleep`, **valid-UTF-8 `read-file`, and the whole path algebra** (the `path-*` builtins reimplement the rules rather than calling `os.path` / `path` / `File`, because the hosts give different answers for the same input — see the table above). `crates/ainl-core/src/eval.rs` is the normative implementation and the other four are written to match it; `crates/ainl-cc/tests/aot_stdlib.rs` and the three `*_stdlib.rs` transpiler suites are what keep them there.
 
 ## 4. Canonical examples
 

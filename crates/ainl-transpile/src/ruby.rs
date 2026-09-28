@@ -73,6 +73,18 @@ impl Rb {
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
+        // Tier 1 file I/O: the three path builtins share one canonicalizer, and
+        // `_ainl_tname` (path-join's positional type error) branches on AHash.
+        if ["_path_join", "_path_base", "_path_dir"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_path_canonical");
+        }
+        if self.needed.contains("_path_join") {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("AHash");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to ruby`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -297,6 +309,17 @@ impl Rb {
                 "append-file" => {
                     return self.call_builtin("_append_file", args, Some("_append_file"))
                 }
+                // ---- Tier 1 file I/O ----
+                "file-exists" => {
+                    return self.call_builtin("_file_exists", args, Some("_file_exists"))
+                }
+                "delete-file" => {
+                    return self.call_builtin("_delete_file", args, Some("_delete_file"))
+                }
+                "list-dir" => return self.call_builtin("_list_dir", args, Some("_list_dir")),
+                "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
+                "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
+                "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -618,6 +641,50 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_append_file",
         "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  File.open(path, 'a') { |f| f.write(content) }\nend",
+    ),
+    // ---- Tier 1 file I/O ----
+    // The path helpers implement AINL's own rules rather than delegating to
+    // File/File.dirname, because the hosts disagree on every edge case that
+    // matters — File.join("", "b") is "/b" where os.path.join gives "b" and
+    // File.join("a//b", "d") preserves a duplicate separator Node collapses.
+    // See the measured table in ainl-core/src/eval.rs and docs/SYNTAX.md
+    // "Path functions".
+    (
+        "_file_exists",
+        "def _file_exists(path)\n  raise TypeError, 'file-exists expects a str path' unless path.is_a?(String)\n  # File.lstat, not File.exist?: exist? follows a symlink, so a broken one\n  # reads as absent where the interpreter and the C runtime (both lstat) see it.\n  p = path.length > 1 && path.end_with?('/') ? path[0..-1] : path\n  begin\n    File.lstat(p)\n    true\n  rescue SystemCallError\n    nil\n  end\nend",
+    ),
+    (
+        "_delete_file",
+        "def _delete_file(path)\n  raise TypeError, 'delete-file expects a str path' unless path.is_a?(String)\n  begin\n    st = File.lstat(path)\n  rescue SystemCallError\n    raise \"delete-file: cannot delete '#{path}'\"\n  end\n  raise \"delete-file: cannot delete '#{path}': it is a directory\" if st.directory?\n  File.unlink(path)\n  nil\nend",
+    ),
+    (
+        "_list_dir",
+        "def _list_dir(path)\n  raise TypeError, 'list-dir expects a str path' unless path.is_a?(String)\n  begin\n    names = Dir.children(path)\n  rescue SystemCallError\n    raise \"list-dir: cannot read '#{path}'\"\n  end\n  # Dir.children already omits '.' and '..'. Sort by UTF-8 *bytes*: the\n  # interpreter sorts by Rust's str Ord and the C runtime by unsigned-byte\n  # order, while Array#sort compares String#<=> — which is defined for\n  # character content, and need not be byte order for non-ASCII names.\n  names.reject { |n| n == '.' || n == '..' }.sort_by { |n| n.b }\nend",
+    ),
+    (
+        "_path_canonical",
+        "def _path_canonical(p)\n  absolute = p.start_with?('/')\n  segs = p.split('/').reject { |s| s.empty? || s == '.' }\n  segs.push('.') if p.end_with?('/.')\n  out = segs.join('/')\n  absolute ? '/' + out : out\nend",
+    ),
+    (
+        "_path_join",
+        "def _path_join(*parts)\n  raise ArgumentError, 'path-join expects at least 1 argument' if parts.empty?\n  parts.each_with_index do |p, i|\n    raise TypeError, \"path-join expects str parts, got #{_ainl_tname(p)} at position #{i + 1}\" unless p.is_a?(String)\n  end\n  _path_canonical(parts.join('/'))\nend",
+    ),
+    (
+        "_path_base",
+        "def _path_base(path)\n  raise TypeError, 'path-base expects a str path' unless path.is_a?(String)\n  c = _path_canonical(path)\n  return '' if c.empty?\n  # rindex/slice, not split('/').last: Ruby's String#split drops trailing empty\n  # fields, so '/'.split('/') is [] and .last is nil, where the interpreter's\n  # rsplit gives \"\" and every other backend agrees.\n  i = c.rindex('/')\n  i.nil? ? c : c[(i + 1)..-1]\nend",
+    ),
+    (
+        "_path_dir",
+        "def _path_dir(path)\n  raise TypeError, 'path-dir expects a str path' unless path.is_a?(String)\n  c = _path_canonical(path)\n  i = c.rindex('/')\n  return '.' if i.nil?\n  return '/' if i.zero?\n  c[0...i]\nend",
+    ),
+    // The AINL type name for a value, for `path-join`'s positional type error.
+    // Explicit because the interpreter's wording ("got int at position 2") is
+    // part of the 4-backend contract, and Ruby's own class names differ. A
+    // quoted symbol is a real Ruby Symbol here (not a String subclass, as in
+    // the Python/JS targets), and a map is an AHash.
+    (
+        "_ainl_tname",
+        "def _ainl_tname(x)\n  case x\n  when nil then 'nil'\n  when true, false then 'bool'\n  when Integer then 'int'\n  when Float then 'float'\n  when Symbol then 'sym'\n  when String then 'str'\n  when AHash then 'hash'\n  when Array then 'list'\n  when Proc then 'fn'\n  else '?'\n  end\nend",
     ),
     (
         "_split",

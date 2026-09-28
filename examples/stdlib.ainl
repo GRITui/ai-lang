@@ -63,6 +63,52 @@
 (write-file tmp "")
 (print "emptied =" (len (read-file tmp)) (len tmp))
 
+; ---- Tier 1: existence, deletion, listing, paths ---------------------------
+; `list-dir` reads a fixture checked into the repo (examples/tier1-fixture/)
+; rather than a directory this program creates, so its contents — and therefore
+; this program's output — are identical on every machine and in every CI run.
+; A listing of a freshly-made directory would be sorted but would depend on what
+; else happened to be in the working directory, which is not a property this
+; example can assert.
+(def fixture "examples/tier1-fixture")
+(print "listing =" (list-dir fixture))
+; Byte order, not a case-insensitive collation: "Capital.txt" (C = 0x43) and
+; "Under_score.txt" (U = 0x55) both sort *before* "beta.txt" (b = 0x62), and
+; the hidden file is included. All four backends produce this exact list.
+(print "first   =" (first (list-dir fixture)))
+(print "present =" (file-exists (path-join fixture "beta.txt"))
+                      (file-exists (path-join fixture "nope.txt"))
+                      (file-exists fixture))
+; `file-exists` answers true or nil, so absence is tested against nil the same
+; way a missing map key is.
+(print "absent? =" (= nil (file-exists (path-join fixture "nope.txt"))))
+
+; The path builtins are pure string functions, so every one of them is safe to
+; print in a program that has to agree across all four backends.
+(print "join    =" (path-join "a" "b" "c") "|" (path-join "a//b" "d")
+                      "|" (path-join "" "b") "|" (path-join "a" "" "b"))
+(print "base    =" (path-base "a/b/c.txt") "|" (path-base "a/b/")
+                      "|" (path-base "/") "|" (path-base ""))
+(print "dir     =" (path-dir "a/b/c.txt") "|" (path-dir "x")
+                      "|" (path-dir "/x") "|" (path-dir "a/."))
+; `..` is deliberately not resolved, and "." only survives as a *trailing*
+; component (so (path-dir "a/.") is "a", not the parent).
+(print "dots    =" (path-join "a" "." "b") "|" (path-join "a" ".." "b")
+                      "|" (path-dir "a/."))
+
+; delete-file: create a scratch file, remove it, and show it is gone. Now that
+; AINL has a delete builtin the example *can* clean up after itself, so no
+; scratch file survives the run (the .gitignore entry for `tmp` is kept only
+; because that path is also the one a *failed* run would leave behind).
+; The scratch file deliberately lives outside `fixture`: this directory's
+; contents are what `list-dir` above asserts on, so nothing may be created in
+; it while the listing is being compared across backends.
+(def doomed (path-join fixture ".." "ainl-stdlib-example.tmp.deleted"))
+(write-file doomed "temporary\n")
+(print "before  =" (file-exists doomed) (len (read-file doomed)))
+(print "deleted =" (delete-file doomed))
+(print "after   =" (file-exists doomed))
+
 ; ---- maps: combine the stdlib with the core -------------------------------
 ; Count word frequencies. Note the accumulator is *threaded* through `tally`
 ; rather than mutated in a `def`: a `fn` body opens its own scope (SYNTAX.md

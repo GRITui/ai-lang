@@ -96,6 +96,28 @@ impl Py {
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
+        // Tier 1 file I/O: the three path builtins share one canonicalizer, and
+        // every new builtin rejects a quoted symbol (a `_Sym` str subclass) the
+        // way the interpreter's `as_path_arg` rejects a non-str — without the
+        // `_Sym` reference they would test `_Sym` before it is defined.
+        if ["_path_join", "_path_base", "_path_dir"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_path_canonical");
+        }
+        for n in [
+            "_file_exists",
+            "_delete_file",
+            "_list_dir",
+            "_path_join",
+            "_path_base",
+            "_path_dir",
+        ] {
+            if self.needed.contains(n) {
+                self.needed.insert("_Sym");
+            }
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to python`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -349,6 +371,17 @@ impl Py {
                 "append-file" => {
                     return self.call_builtin("_append_file", args, Some("_append_file"))
                 }
+                // ---- Tier 1 file I/O ----
+                "file-exists" => {
+                    return self.call_builtin("_file_exists", args, Some("_file_exists"))
+                }
+                "delete-file" => {
+                    return self.call_builtin("_delete_file", args, Some("_delete_file"))
+                }
+                "list-dir" => return self.call_builtin("_list_dir", args, Some("_list_dir")),
+                "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
+                "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
+                "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 "split" => return self.call_builtin("_split", args, Some("_split")),
                 "join" => return self.call_builtin("_join", args, Some("_join")),
                 "trim" => return self.call_builtin("_trim", args, Some("_trim")),
@@ -704,6 +737,43 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_append_file",
         "def _append_file(path, content):\n    with open(path, 'a') as f:\n        f.write(content)",
+    ),
+    // ---- Tier 1 file I/O ----
+    // The path helpers implement AINL's own rules rather than delegating to
+    // os.path, because the four hosts disagree on every edge case that matters
+    // — os.path.join("", "b") is "b" but File.join("", "b") is "/b", and
+    // os.path.dirname("x") is "" where POSIX says ".". See the measured table
+    // in ainl-core/src/eval.rs and docs/SYNTAX.md "Path functions".
+    //
+    // `os` is imported lazily inside each helper that needs it, as elsewhere,
+    // so a program that only uses the pure path functions loads nothing.
+    (
+        "_file_exists",
+        "def _file_exists(path):\n    import os\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('file-exists expects a str path')\n    # lexists, not exists: lexists is the lstat, and a broken symlink is still a\n    # directory entry. exists() follows the link and would report it as absent,\n    # matching neither the interpreter nor the C runtime.\n    return True if os.path.lexists(path.rstrip('/') or '/') else None",
+    ),
+    (
+        "_delete_file",
+        "def _delete_file(path):\n    import os\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('delete-file expects a str path')\n    if not os.path.lexists(path): raise OSError(\"delete-file: cannot delete '%s'\" % path)\n    if os.path.isdir(path): raise OSError(\"delete-file: cannot delete '%s': it is a directory\" % path)\n    os.remove(path)",
+    ),
+    (
+        "_list_dir",
+        "def _list_dir(path):\n    import os\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('list-dir expects a str path')\n    try:\n        names = os.listdir(path)\n    except OSError:\n        raise OSError(\"list-dir: cannot read '%s'\" % path)\n    # os.listdir already omits '.' and '..'; the filter is belt-and-braces.\n    # Sort by *bytes*, not by str: the interpreter sorts by Rust's str Ord (byte\n    # order) and the C runtime by unsigned-byte order, while Python's default\n    # str sort is by code point. The two orders differ for non-ASCII names.\n    return sorted((n for n in names if n not in ('.', '..')), key=lambda s: s.encode('utf-8'))",
+    ),
+    (
+        "_path_canonical",
+        "def _path_canonical(p):\n    absolute = p.startswith('/')\n    segs = [s for s in p.split('/') if s and s != '.']\n    if p.endswith('/.'):\n        segs.append('.')\n    out = '/'.join(segs)\n    return '/' + out if absolute else out",
+    ),
+    (
+        "_path_join",
+        "def _path_join(*parts):\n    if not parts: raise ValueError('path-join expects at least 1 argument')\n    for i, p in enumerate(parts):\n        if not isinstance(p, str) or isinstance(p, _Sym): raise TypeError('path-join expects str parts, got %s at position %d' % (type(p).__name__, i + 1))\n    return _path_canonical('/'.join(parts))",
+    ),
+    (
+        "_path_base",
+        "def _path_base(path):\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('path-base expects a str path')\n    c = _path_canonical(path)\n    return c.rsplit('/', 1)[-1] if c else ''",
+    ),
+    (
+        "_path_dir",
+        "def _path_dir(path):\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('path-dir expects a str path')\n    c = _path_canonical(path)\n    if '/' not in c: return '.'\n    if c == '/': return '/'\n    # rsplit on a top-level name leaves an empty head ('/x' -> ['', 'x']),\n    # which is the root, not the empty string.\n    head = c.rsplit('/', 1)[0]\n    return head or '/'",
     ),
     (
         "_split",

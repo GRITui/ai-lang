@@ -70,6 +70,15 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("max", 43),
     ("floor", 44),
     ("sqrt", 45),
+    // Tier 1 file I/O. Appended at the end so every Stage 3.1 id keeps its
+    // value; the `enum` in runtime.c must be extended in exactly the same
+    // order, and crates/ainl-cc/tests/aot_stdlib.rs checks both directions.
+    ("file-exists", 46),
+    ("delete-file", 47),
+    ("list-dir", 48),
+    ("path-join", 49),
+    ("path-base", 50),
+    ("path-dir", 51),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

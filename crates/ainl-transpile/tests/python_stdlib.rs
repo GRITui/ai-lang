@@ -148,6 +148,60 @@ fn min_max_share_one_fold_helper() {
 }
 
 #[test]
+fn tier1_file_builtins_map_to_os_and_our_own_path_rules() {
+    let out = py(r#"(do (file-exists "p") (delete-file "p") (list-dir "d")
+                 (path-join "a" "b") (path-base "a/b") (path-dir "a/b"))"#);
+    for helper in [
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+    ] {
+        assert!(
+            out.contains(&format!("def {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    // The filesystem ones use python's own os module.
+    assert!(out.contains("os.path.lexists"), "got:\n{out}");
+    assert!(out.contains("os.listdir"), "got:\n{out}");
+    assert!(out.contains("os.remove"), "got:\n{out}");
+    // ...but the path ones must NOT use os.path: os.path.join("", "b") is "b"
+    // where Ruby's File.join gives "/b", and os.path.dirname("x") is "" where
+    // the interpreter says ".". The rules are pinned in eval.rs instead.
+    assert!(
+        !out.contains("os.path.join") && !out.contains("os.path.dirname"),
+        "must not delegate to os.path:\n{out}"
+    );
+    // list-dir sorts by UTF-8 bytes, not python's default str order.
+    assert!(
+        out.contains("key=lambda s: s.encode('utf-8')"),
+        "list-dir must sort by byte order:\n{out}"
+    );
+}
+
+#[test]
+fn path_builtins_reject_a_quoted_symbol_and_empty_join() {
+    // A quoted symbol is a _Sym (a str subclass), so a bare isinstance(x, str)
+    // check would accept it where the interpreter's `as_path_arg` rejects a
+    // non-str. The helpers must exclude it explicitly.
+    let out = py(r#"(path-base "a/b")"#);
+    assert!(
+        out.contains("isinstance(path, _Sym)"),
+        "must exclude _Sym:\n{out}"
+    );
+    assert!(out.contains("class _Sym(str)"), "got:\n{out}");
+    // A bare (path-join) is an error, not "".
+    let out = py("(path-join)");
+    assert!(
+        out.contains("path-join expects at least 1 argument"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
 fn stdlib_runtime_is_omitted_when_unused() {
     // A program that touches no stdlib must not carry any of its helpers.
     let out = py("(+ 1 2)");
@@ -171,6 +225,13 @@ fn stdlib_runtime_is_omitted_when_unused() {
         "_max",
         "_floor",
         "_sqrt",
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+        "_path_canonical",
     ] {
         assert!(!out.contains(helper), "unused {helper} was emitted:\n{out}");
     }

@@ -167,6 +167,53 @@ fn env_exit_and_time_map_to_ruby_core() {
 }
 
 #[test]
+fn tier1_file_builtins_map_to_ruby_fs_and_our_own_path_rules() {
+    let out = rb(r#"(do (file-exists "p") (delete-file "p") (list-dir "d")
+                 (path-join "a" "b") (path-base "a/b") (path-dir "a/b"))"#);
+    for helper in [
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+    ] {
+        assert!(
+            out.contains(&format!("def {helper}(")),
+            "missing {helper}:\n{out}"
+        );
+    }
+    // The filesystem ones use ruby's own File/Dir, all in the lstat form so a
+    // broken symlink reads as present.
+    assert!(out.contains("File.lstat"), "got:\n{out}");
+    assert!(out.contains("Dir.children"), "got:\n{out}");
+    assert!(out.contains("File.unlink"), "got:\n{out}");
+    // ...but the path ones must NOT use File.join / File.dirname: File.join
+    // inserts a separator for an empty first part (File.join("", "b") is "/b"
+    // where os.path gives "b"), and File.dirname("x") is "." by a different
+    // route than POSIX. The rules are pinned in eval.rs instead.
+    assert!(
+        !out.contains("File.join") && !out.contains("File.dirname"),
+        "must not delegate to File's path helpers:\n{out}"
+    );
+    // list-dir sorts by UTF-8 bytes (String#b), not String#<=>.
+    assert!(out.contains("sort_by { |n| n.b }"), "got:\n{out}");
+}
+
+#[test]
+fn path_base_does_not_use_rubys_split_which_drops_trailing_empties() {
+    // A real trap this work hit: "/".split("/") is [] in Ruby (it drops
+    // trailing empty fields), so `.last` is nil where the interpreter's
+    // rsplit gives "". The helper must use rindex/slice instead.
+    let out = rb(r#"(path-base "/")"#);
+    assert!(
+        !out.contains("c.split('/').last"),
+        "must not use split('/').last:\n{out}"
+    );
+    assert!(out.contains("c.rindex('/')"), "got:\n{out}");
+}
+
+#[test]
 fn stdlib_runtime_is_omitted_when_unused() {
     let out = rb("(+ 1 2)");
     for helper in [
@@ -189,6 +236,14 @@ fn stdlib_runtime_is_omitted_when_unused() {
         "_max",
         "_floor",
         "_sqrt",
+        "_file_exists",
+        "_delete_file",
+        "_list_dir",
+        "_path_join",
+        "_path_base",
+        "_path_dir",
+        "_path_canonical",
+        "_ainl_tname",
     ] {
         assert!(!out.contains(helper), "unused {helper} was emitted:\n{out}");
     }
