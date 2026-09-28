@@ -226,6 +226,13 @@ jobs:
       - name: doctor without a C compiler must SKIP, not FAIL
         run: ./scripts/check-doctor-no-cc.sh
 
+      # The card's acceptance test: a full install under `env -i` with a fresh
+      # HOME and a minimal PATH, then --version / doctor / eval from the
+      # installed binary. It asserts the install works with no root, no
+      # inherited environment, and no C compiler.
+      - name: clean-env install (env -i, fresh HOME, no cc)
+        run: ./scripts/check-install-clean-env.sh
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest
