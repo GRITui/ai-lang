@@ -1,0 +1,79 @@
+; Collections: map, filter, reduce, sort.
+;
+; Every line here must produce byte-identical output in all five execution
+; paths: the interpreter and the bytecode VM (together "the evaluator"), the
+; AOT-compiled C binary, and the Python / JavaScript / Ruby transpiler targets.
+; That is what scripts/check-transpile.sh and scripts/check-aot.sh check, and
+; this file is what they check it on.
+;
+; The program is written to be a parity trap rather than a demo. Each section
+; below targets a specific place the four backends are easy to get wrong:
+; `nil` and `false` as list ELEMENTS, empty lists, an accumulator that is itself a
+; list, sort stability, and a comparator that crosses the fn-as-data boundary.
+
+; ---- map / filter / reduce over ordinary lists ---------------------------
+(def nums (list 1 2 3 4 5))
+(def dbl (fn (x) (* x 2)))
+(def big (fn (x) (> x 2)))
+(def add (fn (a b) (+ a b)))
+
+(print "map     =" (map dbl nums))
+(print "filter  =" (filter big nums))
+(print "reduce  =" (reduce add 0 nums))
+
+; ---- the empty list -------------------------------------------------------
+; All three degenerate to an empty result rather than to an error: `reduce`'s
+; init is the answer for an empty input, which is the whole reason it has one.
+(print "empty   =" (map dbl (list)) (filter big (list)) (reduce add 99 (list)))
+
+; ---- a list whose ELEMENTS are nil or false ------------------------------
+; This is the case a naive generated loop gets wrong. `(= (first cur) nil)`
+; looks like an exact "am I empty?" test and is not — `nil` is a legal element,
+; and a loop written that way stops at the first one and silently drops
+; everything after it. Nothing in the numeric sections above would catch it.
+(def odd (list 1 nil 2 false 3))
+(print "nil-in  =" (map (fn (x) x) odd))
+(print "nil-in  =" (filter (fn (x) x) odd))
+(print "allnil  =" (map (fn (x) x) (list nil nil nil)))
+(print "falsey  =" (filter (fn (x) x) (list 0 1 false nil 2 "")))
+
+; ---- reduce with a list accumulator --------------------------------------
+; The shape the card calls out. `push` appends, so the fold is order-preserving
+; and a `cons` fold would show up here as a reversed list.
+(def collect (fn (acc x) (push acc (* x 10))))
+(print "collect =" (reduce collect (list) nums))
+
+; ---- sort ----------------------------------------------------------------
+(print "sort    =" (sort (list 3 1 2)))
+(print "sortneg =" (sort (list -1 5 0)))
+(print "sortstr =" (sort (list "pear" "apple" "fig")))
+(print "sortmix =" (sort (list 2 1.5 1)))
+(print "sitempty=" (sort (list)) (sort (list 7)))
+
+; ---- sort with a comparator (fn as data) ---------------------------------
+; The comparator is a `fn` bound to a name and called from inside a builtin. On
+; the AOT path it is a C function pointer reached from `qsort`'s replacement; on
+; the transpiler paths it is a real host closure. A `(sort list fn)` that
+; returned the input unsorted would pass every case above.
+(def desc (fn (a b) (- b a)))
+(print "desc    =" (sort desc (list 3 1 2)))
+
+; ---- sort is stable ------------------------------------------------------
+; Equal ages must keep their input order. Without an explicit tie-break each
+; backend would be free to pick its own, and the four outputs would disagree
+; while every one of them was individually defensible.
+(def by-age (fn (a b) (- (nth a 1) (nth b 1))))
+(def people (list (list "bob" 30) (list "amy" 25) (list "cid" 30) (list "dan" 25)))
+(print "stable  =" (sort by-age people))
+(print "stabled =" (sort desc (list 1 2 2 2 3 3 1)))
+(print "allequal=" (sort (list 1 1 1 1 1 1 1 1)))
+
+; ---- sort does not mutate its input --------------------------------------
+(def xs (list 3 1 2))
+(def ys (sort xs))
+(print "nomutate=" xs ys)
+
+; ---- everything composes -------------------------------------------------
+(print "composed=" (reduce add 0 (sort (map dbl nums))))
+(print "chained =" (sort (filter big (list 4 1 3 2))))
+(print "records =" (sort by-age (filter (fn (r) (> (nth r 1) 25)) people)))

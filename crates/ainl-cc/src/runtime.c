@@ -136,6 +136,11 @@ enum {
   B_JSON_PARSE, B_JSON_SERIALIZE,
   /* Tier 2 testing. Appended last for the same reason. */
   B_TEST,
+  /* Tier 3 collections. Appended last for the same reason. `sort` is the only
+   * one of the four collection operations that is a real builtin; `map`,
+   * `filter` and `reduce` are special forms lowered to loops before codegen
+   * (see ainl_core::collection_forms), so they need no id here. */
+  B_SORT,
   B_COUNT
 };
 
@@ -2254,6 +2259,7 @@ static Value builtin_sqrt(Value *args, int nargs) {
 static Value builtin_json_parse(Value *args, int nargs);
 static Value builtin_json_serialize(Value *args, int nargs);
 static Value builtin_test(Value *args, int nargs);
+static Value builtin_sort(Value *args, int nargs);
 
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
@@ -2374,6 +2380,8 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_json_serialize(args, nargs);
     case B_TEST:
       return builtin_test(args, nargs);
+    case B_SORT:
+      return builtin_sort(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -3346,6 +3354,186 @@ static Value builtin_test(Value *args, int nargs) {
   return v_nil();
 }
 
+/* ---- sort (Tier 3 collections) ------------------------------------------ */
+
+/* The default ordering: numbers by value, strings bytewise, nothing else.
+ *
+ * A mixed-type list is REJECTED rather than given a defined-but-arbitrary
+ * order. A sort that quietly put every number before every string would return a
+ * stable, reproducible answer to a program that has a bug in it, and that bug
+ * would surface much later as a wrong number instead of here as a type error.
+ *
+ * int and float compare by value, not by tag: the runtime's own value equality
+ * already mixes them ((= 1 1.0) is true), and a sort that ordered [1, 1.0] by
+ * tag would answer a different question than the language does. This mirrors
+ * `ainl_core::collections::default_compare`, and every error string here is
+ * pinned to that module's wording so the two backends stay byte-identical. */
+static int sort_default_cmp(Value *a, Value *b) {
+  int a_num = (a->tag == V_INT || a->tag == V_FLOAT);
+  int b_num = (b->tag == V_INT || b->tag == V_FLOAT);
+  if (a_num && b_num) {
+    double x = as_f64(a), y = as_f64(b);
+    if (x < y)
+      return -1;
+    if (x > y)
+      return 1;
+    return 0;
+  }
+  if (a->tag == V_STR && b->tag == V_STR) {
+    /* Bytewise, deliberately. Python compares code points, JavaScript compares
+     * UTF-16 code units, Ruby compares bytes; only "bytes" is the same total
+     * order in all three, and this runtime spells it strcmp. */
+    int r = strcmp(a->u.s->data, b->u.s->data);
+    return r < 0 ? -1 : (r > 0 ? 1 : 0);
+  }
+  set_err("sort expects a list of numbers or of strings, got a list mixing %s and %s",
+          type_name(a), type_name(b));
+  return 0;
+}
+
+/* Normalise a comparator's result to -1/0/1.
+ *
+ * A comparator that returned a bool or a string is a mistake worth naming:
+ * coercing it to 0 would make a broken comparator look like an "equal" one and
+ * leave the list in input order, which reads as a working sort. */
+static int sort_comparator_sign(Value *res) {
+  double d;
+  if (res->tag != V_INT && res->tag != V_FLOAT) {
+    set_err("sort comparator must return a number, got %s", type_name(res));
+    return 0;
+  }
+  d = as_f64(res);
+  if (d < 0.0)
+    return -1;
+  if (d > 0.0)
+    return 1;
+  return 0;
+}
+
+/* Bottom-up stable merge sort over an array of already-reffed values.
+ *
+ * Stable: on a tie (`c <= 0`) take from the LEFT run, which is what makes equal
+ * elements keep their input order. Iterative rather than recursive so a long
+ * list cannot grow the C stack — the same concern that made the cons-cell
+ * release iterative. Mirrors `ainl_core::collections::merge_sort`; a host
+ * `qsort` is not an option because it is not stable. */
+static void sort_merge(Value *items, int n, Value *tmp, Value *cmpfn) {
+  int width;
+  for (width = 1; width < n; width *= 2) {
+    int start;
+    for (start = 0; start < n; start += 2 * width) {
+      int mid = start + width < n ? start + width : n;
+      int end = start + 2 * width < n ? start + 2 * width : n;
+      int l = start, r = mid, k = start;
+      while (l < mid && r < end) {
+        int c;
+        if (cmpfn) {
+          Value pair[2];
+          Value res;
+          pair[0] = items[l];
+          pair[1] = items[r];
+          res = v_call(*cmpfn, pair, 2);
+          if (g_err)
+            return;
+          c = sort_comparator_sign(&res);
+          if (g_err)
+            return;
+        } else {
+          c = sort_default_cmp(&items[l], &items[r]);
+          if (g_err)
+            return;
+        }
+        if (c <= 0) {
+          tmp[k++] = items[l++];
+        } else {
+          tmp[k++] = items[r++];
+        }
+      }
+      while (l < mid)
+        tmp[k++] = items[l++];
+      while (r < end)
+        tmp[k++] = items[r++];
+    }
+    for (start = 0; start < n; start++)
+      items[start] = tmp[start];
+  }
+}
+
+static Value builtin_sort(Value *args, int nargs) {
+  Value *cmpfn = NULL;
+  Value *listp;
+  int n, i;
+  Value *items, *tmp, out;
+
+  if (nargs == 2) {
+    if (args[0].tag != V_CLOSURE) {
+      set_err("sort expects a fn, got %s", type_name(&args[0]));
+      return v_nil();
+    }
+    cmpfn = &args[0];
+    listp = &args[1];
+  } else if (nargs == 1) {
+    listp = &args[0];
+  } else {
+    set_err("sort expects (sort list) or (sort fn list)");
+    return v_nil();
+  }
+  if (listp->tag != V_LIST) {
+    set_err("sort expects a list, got %s", type_name(listp));
+    return v_nil();
+  }
+
+  /* Flatten to an array so the merge can index it, then build a NEW list. The
+   * input is shared, immutable cons cells, so purity is free: nothing here
+   * writes through listp. The result is never the input itself — even a
+   * 0- or 1-element list comes back as a fresh list. */
+  n = listp->u.l->len;
+  items = (Value *)malloc(sizeof(Value) * (size_t)(n > 0 ? n : 1));
+  if (!items) {
+    set_err("out of memory");
+    return v_nil();
+  }
+  {
+    ConsCell *cur = listp->u.l;
+    for (i = 0; i < n; i++) {
+      items[i] = cur->head;
+      v_ref(&items[i]);
+      cur = cur->tail;
+    }
+  }
+
+  if (n > 1) {
+    tmp = (Value *)malloc(sizeof(Value) * (size_t)n);
+    if (!tmp) {
+      for (i = 0; i < n; i++)
+        v_unref(&items[i]);
+      free(items);
+      set_err("out of memory");
+      return v_nil();
+    }
+    sort_merge(items, n, tmp, cmpfn);
+    free(tmp);
+  }
+  if (g_err) {
+    for (i = 0; i < n; i++)
+      v_unref(&items[i]);
+    free(items);
+    return v_nil();
+  }
+
+  out = v_list_from_array(items, n);
+  /* No `v_unref` loop here. `v_list_from_array` -> `cons_cell_new` stores each
+   * head **without** taking its own reference — the caller passes ownership of
+   * the refs it took in, which is why `builtin_list` and `builtin_push` both
+   * `free(items)` without unref'ing. Unreffing here therefore drops the list's
+   * own reference on every element, and the sorted result comes back holding
+   * freed strings: `(sort (list "apple" "fig" "pear"))` printed
+   * `("apple" "fig" "")` — the last element's bytes were reclaimed, and which
+   * one lost them depended on the merge order, not on anything stable. */
+  free(items);
+  return out;
+}
+
 /* ---- prelude ----------------------------------------------------------- */
 static void scope_install_prelude(Scope *env) {
   struct {
@@ -3375,6 +3563,8 @@ static void scope_install_prelude(Scope *env) {
       {"json-parse", B_JSON_PARSE}, {"json-serialize", B_JSON_SERIALIZE},
       /* Tier 2 testing */
       {"test", B_TEST},
+      /* Tier 3 collections */
+      {"sort", B_SORT},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

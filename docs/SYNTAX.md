@@ -670,6 +670,136 @@ Python, JS and Ruby, so a `catch` cannot intercept it there; the interpreter
 and VM fail at run time and `catch` does see it. A program that relies on
 catching an unbound symbol is therefore interpreter/VM-only.
 
+## 3f. Collections: `map` / `filter` / `reduce` / `sort`
+
+```lisp
+(map    (fn (x) ...)   lst)        ; new list, fn applied to each element
+(filter (fn (x) ...)   lst)        ; new list of the elements the fn finds truthy
+(reduce (fn (acc x) ...) init lst)  ; fold left; acc starts at init
+(sort   lst)                        ; sorted copy
+(sort   (fn (a b) ...) lst)        ; sorted copy, by a comparator
+```
+
+All four are **pure**: they return a new list and never touch the input. AINL
+lists are shared, immutable cons cells, so this costs nothing to promise.
+
+Empty input: `map`, `filter` and `sort` give `()`; `reduce` gives `init` back
+untouched. That last one is a real case, not a degenerate one — summing nothing
+is `0`, so `(reduce (fn (acc x) (+ acc x)) 0 xs)` is the sum of `xs` with no
+special case at the call site.
+
+Write the empty list as **`(list)`**, not `()`. `()` is the AST for an empty
+list *node*, which evaluates to `nil`, so `(push () 1)` is a type error — the
+value `()` and the literal `()` are not the same thing.
+
+### `fn` is data here
+
+`map`/`filter`/`reduce` take a function **value**, so a callback can be a
+literal or a name:
+
+```lisp
+(def double (fn (x) (* x 2)))
+(map double (list 1 2 3))          ; (2 4 6)
+(map (fn (x) (* x 2)) (list 1 2 3)) ; (2 4 6) — same thing
+```
+
+Passing something that is obviously not a function is an error, and the message
+names the form you wrote rather than an internal helper:
+
+```
+(map 5 (list 1))   ; runtime error: map expects a fn, got int
+```
+
+This is worth stating because it is the first place AINL treats a function as
+an ordinary value. A **bare symbol is never rejected** — `x` may well be a `def`
+holding a closure, and naming the callback is the normal way to write this. The
+check catches only operands that cannot possibly be callable.
+
+`sort`'s comparator takes **two** arguments, not the element: `(fn (a b) ...)`.
+
+### `filter` uses AINL truthiness, not the host's
+
+The predicate is asked a yes/no question, and "no" means the one thing AINL calls
+falsey:
+
+| value | in a `filter`? |
+|---|---|
+| `nil` | no |
+| `false` | no |
+| `0` | **yes** |
+| `""` | **yes** |
+| `(list)` | **yes** |
+
+`0` and `""` are **truthy**. This trips up every host language — Python, JS and
+Ruby between them treat both as falsey — so a `filter` here is `(filter p xs)`
+where `p` is kept to a real predicate, and `(if p x y)` rather than `p and x`
+(see §2 for what `and`/`or` return).
+
+### `reduce` builds things, not just sums
+
+`acc` is an ordinary value, so a fold can accumulate a list, a string or a map —
+the two workhorses for it:
+
+```lisp
+(reduce (fn (acc x) (push acc (* x x))) (list) (list 1 2 3))  ; (1 4 9)
+(reduce (fn (acc x) (+ acc x)) 0 (list 1 2 3 4))            ; 10
+```
+
+Note the accumulator comes **first** and the element second, so an accumulator
+that starts as `(list)` stays a list.
+
+### `sort` is stable, and refuses to guess
+
+`sort` returns a **stable** sorted copy: elements that compare equal keep their
+input order. A program that sorts by a key that ties will therefore print the
+same thing every time, on every backend, and in a later run.
+
+The default order is numbers by value and strings **bytewise**. A list mixing
+the two is an **error**, not an arbitrary-but-reproducible order:
+
+```
+(sort (list 1 "a"))   ; runtime error: sort expects a list of numbers or of
+                      ;   strings, got a list mixing int and str
+```
+
+This is deliberate. A `sort` that quietly put every number before every string
+would return a stable, reproducible answer to a program that has a bug in it, and
+that bug would surface much later as a wrong number instead of here as a type
+error. `int` and `float` are **not** a mixed list — they compare by value, so
+`(sort (list 1 1.0 0.5))` is fine.
+
+The comparator form returns **negative / zero / positive**, and must return a
+number: `(sort (fn (a b) "x") lst)` is an error rather than a list left in input
+order, which would read like a working sort. The comparator is type-checked
+*before* the list is walked, so `(sort cmp (list 1))` still rejects a
+non-function comparator instead of accepting it because there was nothing to
+compare.
+
+### Backend scope: all four
+
+All four are supported on **all four backends** — the interpreter, the bytecode
+VM, the AOT C runtime, and the Python, JS and Ruby transpilers — byte-identical
+on stdout and on the error messages above.
+
+`map`/`filter`/`reduce` are **special forms**, not ordinary builtins, and they
+are worth knowing that because it explains two things. A builtin in AINL is
+handed its arguments and nothing else, with no way to *call* a function value it
+was given, so a builtin `map` could not work in the interpreter or the VM at all
+— it would work in C and in all three transpiler targets, where a closure is a
+real function pointer or lambda. That is a silent divergence in the one
+direction this language's rule exists to prevent, so these three are instead
+lowered, once, into the `def` + `while` loop they semantically are, before any
+backend sees the program. All six evaluators then run the *same* loop through
+the path they already had.
+
+`sort` stays a real builtin: it has no function to call in its default form, and
+in the comparator form the comparator is an ordinary value each backend already
+knows how to call. It is hand-written per backend rather than delegated to the
+host's `sort` for the reasons above — Ruby's `sort_by` is not stable, JS orders
+strings by UTF-16 code unit and Python by code point, and none of them rejects
+a mixed list. One explicit stable merge sort per backend makes each of those a
+property of code that is right there.
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

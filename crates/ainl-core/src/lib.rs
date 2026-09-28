@@ -5,6 +5,8 @@
 //! packaged as a static, zero-dependency binary (see docs/MASTER_PLAN.md §1.2).
 
 pub mod code;
+pub mod collection_forms;
+pub mod collections;
 pub mod deserialize;
 pub mod error;
 pub mod eval;

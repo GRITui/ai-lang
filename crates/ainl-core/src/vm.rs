@@ -742,6 +742,16 @@ pub fn compile_top(forms: &[Node]) -> Result<FnCode> {
 fn compile_top_seeded(forms: &[Node], extra_names: Vec<String>) -> Result<FnCode> {
     let mut c = Compiler::new_top();
     c.extra_names = extra_names;
+    // Lower the `map` / `filter` / `reduce` special forms to `let` + `while`
+    // loops *before* `collect_defs`, which is the whole reason it is here and
+    // not inside `compile_expr`: the generated accumulators are `def`-bound, so
+    // the scope pass has to see them to give them a local slot. Lowering
+    // later would compile a `def` for a name the slot table never reserved, and
+    // the read of that name in the next iteration would find it unbound.
+    //
+    // `collect_defs` is recursive over the whole tree, so the two `def`s
+    // generated inside the `do` block are found along with the user's own.
+    let forms = &crate::collection_forms::lower(forms)?;
     collect_defs(forms, &mut c.scope);
     let last = forms.len().saturating_sub(1);
     for (i, form) in forms.iter().enumerate() {
@@ -850,6 +860,38 @@ fn self_callee_name(frames: &[Frame], call_ip: usize) -> String {
         .unwrap_or_else(|| "anonymous".to_string())
 }
 
+/// Bind `args` into a fresh local-slot vector for a call to `fnc`, defining
+/// each parameter in `call_env` when the function's scope is env-backed.
+///
+/// The parameter slots come first, then the variadic rest slot (if any), then
+/// one `None` per remaining body local. Shared by the in-loop `Call` and by
+/// [`call_closure`] so a closure called from a builtin is entered exactly the
+/// same way as one called by bytecode — a divergence here would show up as a
+/// comparator that misbehaves only inside `sort`.
+fn bind_params(fnc: &FnCode, args: &[Value], call_env: &Env) -> Vec<Option<Value>> {
+    let np = fnc.params.len();
+    let n_body = fnc.locals.len() - np - usize::from(fnc.variadic.is_some());
+    let mut locals = Vec::with_capacity(fnc.locals.len());
+    for (pname, val) in fnc.params.iter().zip(args.iter()) {
+        locals.push(Some(val.clone()));
+        if fnc.env_active {
+            call_env.define(pname.clone(), val.clone());
+        }
+    }
+    if let Some(rest) = &fnc.variadic {
+        let extra: Vec<Value> = args[np.min(args.len())..].to_vec();
+        let rest_val = Value::List(ConsCell::from_values(extra));
+        locals.push(Some(rest_val.clone()));
+        if fnc.env_active {
+            call_env.define(rest, rest_val);
+        }
+    }
+    for _ in 0..n_body {
+        locals.push(None);
+    }
+    locals
+}
+
 /// The source span of the instruction at index `ip` in the current frame.
 ///
 /// Called only from error paths. Reading the span table on *every* instruction
@@ -899,6 +941,38 @@ struct TryHandler {
 /// final form. `env` is the global (REPL) environment: top-level `def`s are
 /// persisted into it so bindings survive across `run_in` calls.
 pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
+    // Top-level frame: pre-fill local slots from the global env so a var
+    // defined in an earlier run is visible before it is re-`def`d.
+    let mut top_locals: Vec<Option<Value>> = Vec::with_capacity(top.locals.len());
+    for name in &top.locals {
+        top_locals.push(env.get(name));
+    }
+    run_with_locals(top, env, top_locals, false)
+}
+
+/// [`run`], with the initial frame's local slots supplied by the caller instead
+/// of being looked up by name in `env`, and an optional **sentinel** base frame
+/// underneath it.
+///
+/// Two things [`run`] does by name are wrong for a *function* run, and
+/// [`call_closure`] needs both undone:
+///
+/// * `run` seeds the top frame's slots by looking each name up in `env`. For a
+///   closure the parameters were bound positionally by [`bind_params`], and they
+///   are not defined in the fresh call env — so `run` would find nothing and
+///   every parameter would read as unbound (`unbound symbol 'a'` inside a `sort`
+///   comparator). Hence the caller-supplied slots.
+/// * `run`'s top frame is a top-level `FnCode`, which ends by *falling off the
+///   end of `body`*. A compiled function ends with `Ret`, which **pops** the
+///   frame — and when that frame is the only one, the next loop iteration
+///   unwraps `None` and panics. Hence the sentinel: an empty `FnCode` beneath,
+///   which the loop exhausts and breaks on.
+fn run_with_locals(
+    top: &FnCode,
+    env: &Env,
+    top_locals: Vec<Option<Value>>,
+    sentinel: bool,
+) -> Result<Value> {
     let mut stack: Vec<Value> = Vec::new();
     let mut steps: u64 = 0;
     // Live `try` regions, innermost last. Empty for any program without a
@@ -906,18 +980,32 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
     // `catch` pays nothing for the feature.
     let mut handlers: Vec<TryHandler> = Vec::new();
 
-    // Top-level frame: pre-fill local slots from the global env so a var
-    // defined in an earlier run is visible before it is re-`def`d.
-    let mut top_locals: Vec<Option<Value>> = Vec::with_capacity(top.locals.len());
-    for name in &top.locals {
-        top_locals.push(env.get(name));
-    }
-    let mut frames: Vec<Frame> = vec![Frame {
+    let real = Frame {
         code: Rc::new(top.clone()),
         ip: 0,
         locals: top_locals,
         env: env.clone(),
-    }];
+    };
+    let mut frames: Vec<Frame> = Vec::with_capacity(if sentinel { 2 } else { 1 });
+    if sentinel {
+        // An empty program **underneath**, so the function's own `Ret` pops
+        // *itself* and leaves this one, which the loop then exhausts and breaks
+        // on. See the note on `run_with_locals` for why a function run needs
+        // this and a program run does not.
+        //
+        // It must be pushed *first*: the loop executes `frames.last_mut()`, so
+        // the frame that actually runs is the one on top. Pushing the sentinel
+        // last made it the frame that ran — an empty body, so the loop broke on
+        // the first iteration and the function never executed at all (every
+        // comparator silently returned nil).
+        frames.push(Frame {
+            code: Rc::new(FnCode::new("")),
+            ip: 0,
+            locals: Vec::new(),
+            env: Env::new(),
+        });
+    }
+    frames.push(real);
 
     // Raise `e` in the VM loop: deliver it to the innermost enclosing `try` if
     // there is one, otherwise fail the run.
@@ -1321,25 +1409,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                             )));
                         }
                         let call_env = c.env.child();
-                        let n_body = fnc.locals.len() - np - usize::from(fnc.variadic.is_some());
-                        let mut locals = Vec::with_capacity(fnc.locals.len());
-                        for (pname, val) in fnc.params.iter().zip(args.iter()) {
-                            locals.push(Some(val.clone()));
-                            if fnc.env_active {
-                                call_env.define(pname.clone(), val.clone());
-                            }
-                        }
-                        if let Some(rest) = &fnc.variadic {
-                            let extra: Vec<Value> = args[np..].to_vec();
-                            let rest_val = Value::List(ConsCell::from_values(extra));
-                            locals.push(Some(rest_val.clone()));
-                            if fnc.env_active {
-                                call_env.define(rest, rest_val);
-                            }
-                        }
-                        for _ in 0..n_body {
-                            locals.push(None);
-                        }
+                        let locals = bind_params(fnc, &args, &call_env);
                         frames.push(Frame {
                             code: Rc::clone(fnc),
                             ip: 0,
@@ -1385,7 +1455,10 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
     // Persist top-level `def`s into the global env so they survive across
     // `run_in` calls (REPL contract). Slots already synced during the run
     // (env_active) are re-written with the same value — a harmless no-op.
-    let top_frame = &frames[0];
+    //
+    // The frame that ran is `frames.last()` — it is the one on top. With a
+    // sentinel the *first* frame is the empty base, so index from the end.
+    let top_frame = frames.last().expect("a frame always exists here");
     for (name, slot) in top_frame.code.locals.iter().zip(top_frame.locals.iter()) {
         if let Some(v) = slot {
             env.define(name, v.clone());
@@ -1393,6 +1466,57 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
     }
 
     Ok(stack.pop().unwrap_or(Value::Nil))
+}
+
+/// Call a VM-compiled closure from outside the run loop, with `args`.
+///
+/// This is the seam that lets a **builtin** call a function value — which is
+/// what `sort`'s comparator form needs. A builtin is a `fn(&[Value]) -> …` with
+/// no access to the running frame stack, so it cannot push a frame itself; this
+/// runs the closure's bytecode in a **nested** [`run`] instead.
+///
+/// The nested run is a real cost, and it is paid only on the comparator path:
+/// a program that never passes a function to a builtin never calls this, and
+/// `sort`'s no-comparator form never does either. The alternative — a `Call`
+/// instruction that the builtin could inject — would mean giving builtins a
+/// handle on the frame stack, which is the thing `BuiltinFn`'s bare-fn-pointer
+/// type exists to prevent.
+///
+/// The step budget is fresh, exactly as it is per `run_in` call, so a
+/// comparator cannot exhaust the enclosing program's budget (or vice versa) and
+/// report a misleading step-limit error. A `try` in the enclosing frame is not
+/// visible from in here: an error propagates as `Err` to the builtin, which
+/// returns it, and the enclosing `Call` hands it to the enclosing `raise!`.
+/// That is the same unwinding the tree-walk gets for free.
+pub fn call_closure(callee: Value, args: &[Value]) -> Result<Value> {
+    let Value::Closure(c) = callee else {
+        return Err(crate::eval::not_callable(callee.type_name(), 0));
+    };
+    let Some(fnc) = c.code.as_ref() else {
+        return Err(Error::runtime(
+            "cannot call a tree-walk closure from the VM",
+        ));
+    };
+    let np = fnc.params.len();
+    if fnc.variadic.is_some() {
+        if args.len() < np {
+            return Err(Error::runtime(format!(
+                "arity mismatch: takes at least {np} args, got {}",
+                args.len()
+            )));
+        }
+    } else if args.len() != np {
+        return Err(crate::eval::arity_mismatch("anonymous", np, args.len(), 0));
+    }
+    let call_env = c.env.child();
+    let locals = bind_params(fnc, args, &call_env);
+    // `sentinel = true`: the frame being run is a *function*, so its `Ret` pops
+    // itself and needs a frame underneath to land on. And caller-supplied
+    // locals: the parameters were bound positionally above, and `run` would
+    // re-resolve them by name in the fresh call env — where they are not
+    // defined — so every parameter would read as unbound (`unbound symbol 'a'`
+    // inside a `sort` comparator).
+    run_with_locals(fnc, &call_env, locals, true)
 }
 
 /// Parse + compile + run a program in a fresh preloaded environment.
