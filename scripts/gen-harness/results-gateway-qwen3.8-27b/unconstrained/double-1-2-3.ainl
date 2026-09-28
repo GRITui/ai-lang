@@ -1,0 +1,2 @@
+(def double-each (fn (xs) (if (= (len xs) 0) (list) (list (* 2 (first xs)) (double-each (rest xs))))))
+(print (double-each (list 1 2 3)))

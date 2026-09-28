@@ -1,0 +1,392 @@
+[
+  {
+    "id": "sum-2-3",
+    "expected": "5",
+    "raw_prompt": "Write an AINL program that prints the sum of 2 and 3. Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(print (+ 2 3))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "5",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 15,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(print (+ 2 3))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "5",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 15,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "print-42",
+    "expected": "42",
+    "raw_prompt": "Write an AINL program that prints the number 42. Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(print 42)",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "42",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 10,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(print 42)",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "42",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 10,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "hello",
+    "expected": "hello, world",
+    "raw_prompt": "Write an AINL program that prints the string \"hello, world\". Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(print \"hello, world\")",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "hello, world",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 22,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(print \"hello, world\")",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "hello, world",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 22,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "sq-12",
+    "expected": "144",
+    "raw_prompt": "Write an AINL program that defines a function sq that squares its argument, then prints (sq 12). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(def sq (fn (x) (* x x)))\n(print (sq 12))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "144",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 41,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(def sq (fn (x) (* x x)))\n(print (sq 12))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "144",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 41,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "fib-10",
+    "expected": "55",
+    "raw_prompt": "Write an AINL program that computes and prints the 10th fibonacci number (fib 0 = 0, fib 1 = 1). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(def fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))\n(print (fib 10))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "55",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 82,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(def fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))\n(print (fib 10))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "55",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 82,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "fact-5",
+    "expected": "120",
+    "raw_prompt": "Write an AINL program that defines a function fact that computes the factorial of n, then prints (fact 5). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(def fact (fn (n) (if (<= n 1) 1 (* n (fact (- n 1))))))\n(print (fact 5))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "120",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 73,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(def fact (fn (n) (if (<= n 1) 1 (* n (fact (- n 1))))))\n(print (fact 5))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "120",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 73,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "max2-7-9",
+    "expected": "9",
+    "raw_prompt": "Write an AINL program that defines a function max2 that returns the larger of two numbers, then prints (max2 7 9). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(def max2 (fn (a b) (if (> a b) a b)))\n(print (max2 7 9))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "9",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 57,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(def max2 (fn (a b) (if (> a b) a b)))\n(print (max2 7 9))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "9",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 57,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "len-5",
+    "expected": "5",
+    "raw_prompt": "Write an AINL program that prints the length of the list (list 1 2 3 4 5). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(print (len (list 1 2 3 4 5)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "5",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 30,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(print (len (list 1 2 3 4 5)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "5",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 30,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "first-10",
+    "expected": "10",
+    "raw_prompt": "Write an AINL program that prints the first element of the list (list 10 20 30). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(print (first (list 10 20 30)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "10",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 31,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(print (first (list 10 20 30)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "10",
+      "run_err": "",
+      "correct": true,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 31,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "id": "double-1-2-3",
+    "expected": "(2 4 6)",
+    "raw_prompt": "Write an AINL program that defines a function that doubles each element of a list, then prints it applied to (list 1 2 3). Respond with only the AINL program \u2014 no explanation, no markdown, no code fences.",
+    "constrained": {
+      "generated": "(def double-each (fn (xs) (if (= (len xs) 0) (list) (list (* 2 (first xs)) (double-each (rest xs))))))\n(print (double-each (list 1 2 3)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "(2 (4 (6 ())))",
+      "run_err": "",
+      "correct": false,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 137,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    },
+    "unconstrained": {
+      "generated": "(def double-each (fn (xs) (if (= (len xs) 0) (list) (list (* 2 (first xs)) (double-each (rest xs))))))\n(print (double-each (list 1 2 3)))",
+      "gbnf_member": true,
+      "parse_ok": true,
+      "run_ok": true,
+      "run_out": "(2 (4 (6 ())))",
+      "run_err": "",
+      "correct": false,
+      "prefix": {
+        "complete": true,
+        "valid_prefix": false,
+        "kind": "complete",
+        "length": 137,
+        "coverage": 1.0,
+        "truncated": false
+      }
+    }
+  }
+]

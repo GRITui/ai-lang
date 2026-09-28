@@ -1,0 +1,11 @@
+id,expected,c_gbnf,c_run,c_correct,c_out,c_prefix,u_gbnf,u_run,u_correct,u_out,u_prefix
+sum-2-3,5,True,True,True,5,complete,True,True,True,5,complete
+print-42,42,True,True,True,42,complete,True,True,True,42,complete
+hello,"hello, world",True,True,True,"hello, world",complete,True,True,True,"hello, world",complete
+sq-12,144,True,True,True,144,complete,True,True,True,144,complete
+fib-10,55,True,True,True,55,complete,True,True,True,55,complete
+fact-5,120,True,True,True,120,complete,True,True,True,120,complete
+max2-7-9,9,True,True,True,9,complete,True,True,True,9,complete
+len-5,5,True,True,True,5,complete,True,True,True,5,complete
+first-10,10,True,True,True,10,complete,True,True,True,10,complete
+double-1-2-3,(2 4 6),True,True,False,(2 (4 (6 ()))),complete,True,True,False,(2 (4 (6 ()))),complete

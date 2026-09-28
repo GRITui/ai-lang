@@ -1,0 +1,2 @@
+(def sq (fn (x) (* x x)))
+(print (sq 12))

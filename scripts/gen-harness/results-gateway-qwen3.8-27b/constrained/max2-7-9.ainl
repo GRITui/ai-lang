@@ -1,0 +1,2 @@
+(def max2 (fn (a b) (if (> a b) a b)))
+(print (max2 7 9))
