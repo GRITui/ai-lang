@@ -240,6 +240,50 @@ impl Error {
         }
     }
 
+    /// A stable, host-independent name for the *kind* of failure — the
+    /// classification a `catch` sees as `e`'s `"kind"` field.
+    ///
+    /// Derived from the **variant**, not from the individual error, and that is
+    /// the whole point. A `catch`'s caught value must be identical on all four
+    /// backends (the 4-backend rule), and the interpreter, the AOT C runtime
+    /// and the Python/JS/Ruby targets each construct it independently. Anything
+    /// derived from the error *instance* would have to be re-derived four times
+    /// and could silently drift; anything derived from the variant cannot,
+    /// because there is exactly one place each backend spells it.
+    ///
+    /// Only `"runtime"` is reachable by `catch`: a lex, parse or JSON failure
+    /// happens before or instead of evaluation, so it is never in flight to be
+    /// caught. The other three are reported rather than omitted because a
+    /// reader debugging the shape wants to know the field is not a
+    /// `kind`-per-occurrence string.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Lex { .. } => "lex",
+            Error::Parse { .. } => "parse",
+            Error::Json { .. } => "json",
+            Error::Runtime { .. } => "runtime",
+        }
+    }
+
+    /// The value a `catch` binds: a hash of `"message"` and `"kind"`, in that
+    /// order.
+    ///
+    /// A hash rather than a bare string because a message alone is not
+    /// actionable: a health check that catches a dead port wants to tell
+    /// "the connection was refused" apart from "the response was malformed",
+    /// and string-prefix sniffing is how that ends up breaking. The shape is
+    /// pinned by `crates/ainl-core/tests/try_catch.rs` and reproduced verbatim
+    /// by the AOT runtime and all three transpiler targets — see
+    /// docs/SYNTAX.md "Error handling".
+    pub fn to_value(&self) -> crate::value::Value {
+        use crate::value::Value;
+        use std::rc::Rc;
+        Value::Map(Rc::new(vec![
+            (Value::str("message"), Value::str(self.message())),
+            (Value::str("kind"), Value::str(self.kind())),
+        ]))
+    }
+
     /// Resolve this error's byte offset into a line/column against `src`.
     ///
     /// This is the single place a position becomes reader-facing, and it runs

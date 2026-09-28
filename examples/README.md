@@ -27,6 +27,7 @@ AINL, and a broken example teaches the broken shape.
 | [`http-get-json.ainl`](corpus/http-get-json.ainl) | An HTTP GET, a JSON response, request headers, and a 404 as a value. |
 | [`cli-tool.ainl`](corpus/cli-tool.ainl) | Arguments from the environment, validation, and exit codes as a contract. |
 | [`error-handling.ainl`](corpus/error-handling.ainl) | Checking before acting, the shape of a diagnostic, and what `error` is for. |
+| [`try-catch.ainl`](corpus/try-catch.ainl) | Catching a failure you expect: the form, the caught value, and a loop that survives. |
 | [`aot-compare.ainl`](corpus/aot-compare.ainl) | A compute loop that runs identically interpreted and AOT-compiled; the step cap. |
 | [`libmod/main.ainl`](corpus/libmod/main.ainl) | Multi-file programs: flat and namespaced `import`, and both resolution rules. |
 | [`testing/run-tests.ainl`](corpus/testing/run-tests.ainl) | The `test` builtin and `ainl test`, with a real suite in [`testing/suite/`](corpus/testing/suite). |

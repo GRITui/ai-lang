@@ -1222,6 +1222,44 @@ static Value builtin_get(Value *args, int nargs) {
   return v_nil();
 }
 
+/* ---- caught-error value ------------------------------------------------ */
+/* The value a `catch` clause binds to: the hash
+ *   {"message" <str>, "kind" "runtime"}
+ *
+ * Built by hand rather than by calling `builtin_hash` so the key ORDER is fixed
+ * by construction. Every backend prints a map in insertion order, so
+ * `message` before `kind` is what makes the caught value byte-identical across
+ * the tree-walk, the VM, this runtime and the three transpilers.
+ *
+ * It also CLEARS g_err. That is the whole of the AOT unwind: the error has
+ * already been recorded in g_errmsg, and a `catch` consumes it, so the code
+ * after the dispatch must not see the flag. A generated `try` therefore calls
+ * v_error_value() immediately after the failing body, before running the
+ * handler. Spelled in prose rather than as a nested C comment because an
+ * embedded comment terminator closes this block comment early, and the stray
+ * text that follows is a -Wcomment warning on every single AOT compile.
+ *
+ * `kind` is always "runtime" here, and that is not a shortcut: the only errors
+ * this runtime raises at run time are runtime errors, so the constant is what
+ * the variant-derived value would be. (A lex or parse error stops the program
+ * before any code runs, so a `catch` can never observe one.) */
+static Value v_error_value(void) {
+  Value r;
+  r.tag = V_MAP;
+  Map *m = malloc(sizeof(Map));
+  m->ref = 1;
+  m->n = 2;
+  m->keys = malloc(2 * sizeof(Value));
+  m->vals = malloc(2 * sizeof(Value));
+  m->keys[0] = v_str("message");
+  m->vals[0] = v_str(g_errmsg);
+  m->keys[1] = v_str("kind");
+  m->vals[1] = v_str("runtime");
+  r.u.m = m;
+  g_err = 0;
+  return r;
+}
+
 static Value builtin_assoc(Value *args, int nargs) {
   if (nargs != 3) {
     set_err("assoc expects (assoc hash key value)");

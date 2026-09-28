@@ -38,24 +38,6 @@ pub(crate) fn infix<E: ExprEmit>(
     }
 }
 
-/// `-`: unary negation on one arg, subtraction-chain on 2+.
-pub(crate) fn infix_sub<E: ExprEmit>(e: &mut E, args: &[Node]) -> Result<String> {
-    let parts = e.expr_all(args)?;
-    match parts.len() {
-        0 => Err(Error::runtime("- expects at least 1 argument")),
-        1 => Ok(format!("(-{})", parts[0])),
-        _ => Ok(format!("({})", parts.join(" - "))),
-    }
-}
-
-/// Fixed-arity 2-argument infix operator (`mod`).
-pub(crate) fn binary<E: ExprEmit>(e: &mut E, args: &[Node], op: &str) -> Result<String> {
-    let [a, b] = args else {
-        return Err(Error::runtime(format!("'{op}' expects 2 arguments")));
-    };
-    Ok(format!("({} {op} {})", e.expr(a)?, e.expr(b)?))
-}
-
 /// Fixed-arity 1-argument prefix operator (`not`).
 pub(crate) fn unary<E: ExprEmit>(e: &mut E, args: &[Node], op: &str) -> Result<String> {
     let [a] = args else {

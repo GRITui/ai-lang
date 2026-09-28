@@ -5,22 +5,20 @@
 ; @expect    missing: 1
 ; @run       ainl run examples/corpus/error-handling.ainl
 ;
-; HOW AINL REPORTS FAILURE TODAY — read this before writing the next one.
+; HOW AINL REPORTS FAILURE — read this before writing the next one.
 ;
-; There is NO `try`/`catch` in AINL today. A runtime error is UNCATCHABLE: it
-; propagates to the top level, prints a diagnostic, and exits non-zero. That
-; is the single biggest "not a real language" gap, and it is being addressed —
-; but a program written now has to plan around it, and this example is the
-; honest shape of that.
+; There are two halves to failure, and this example is about the first.
 ;
-; The workaround is a principle, not a trick: CHECK BEFORE YOU ACT, using a
-; predicate that returns a value instead of raising.
+; CHECK BEFORE YOU ACT, for a failure you can see coming. A runtime error is
+; catchable (`try`/`catch` — see the `try-catch` example beside this one), but
+; catching is not the same as testing. A check is cheaper, states the intent
+; directly, and keeps the failure out of the control flow:
 ;
 ;     (read-file p)            raises on a missing file
 ;     (file-exists p)          returns nil  <- ask this first
 ;
 ;     (json-parse s)           raises on malformed text
-;     ...                      no `try`, so validate before you parse
+;     ...                      validate before you parse
 ;
 ;     (nth xs 99)              returns nil for an out-of-range index (no raise)
 ;
@@ -28,8 +26,8 @@
 ;
 ; So: prefer builtins that return `nil` over builtins that raise, and when you
 ; must use a raising builtin, guard it with a check. `(if (file-exists p) ... )`
-; is not defensive noise — with no `try`, it is the only way to express
-; "if this is there".
+; is not defensive noise — it is the clearest way to express "if this is
+; there", and it does not cost a handler.
 ;
 ; Two kinds of failure, handled differently:
 ;
@@ -37,6 +35,12 @@
 ;               continue or exit deliberately. This is what this example does.
 ;   IMPOSSIBLE — a broken invariant, a bug. Call `error`, which aborts
 ;               immediately. Do not try to carry on past it.
+;
+; And for an expected failure you genuinely cannot check for in advance — a
+; connection that may drop mid-flight, a parse of text whose validity you only
+; learn by attempting it — `try`/`catch` is the tool, not a last resort. The
+; line is not "never catch"; it is "know whether the check or the catch is the
+; honest description of this failure".
 
 (def path "ainl-corpus-does-not-exist.txt")
 

@@ -117,6 +117,46 @@ jobs:
       - name: Documented import behavior matches the interpreter
         run: ./scripts/check-docs-import.sh
 
+  try-catch:
+    name: try/catch (4-backend parity on the error path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: try-catch-${{ hashFiles('Cargo.lock') }}
+          restore-keys: try-catch-
+
+      - name: Install Python, Node and Ruby
+        # The parity half of the gate needs all three hosts. A `catch` binds a
+        # MESSAGE a program may compare, so "it ran" is not the claim — "the
+        # bytes matched the interpreter" is, and that cannot be checked with one
+        # host present.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # Every claim in SYNTAX.md §3e, executed against the real binary, plus
+      # the byte-identical check across the interpreter, the AOT C binary and
+      # the three transpiler hosts. The `e` shape and the "no OS error text"
+      # rule are the load-bearing ones: both were plausible on first draft and
+      # both were wrong — the caught value was a host exception on two of the
+      # three transpilers, and the message embedded `strerror` output that
+      # differs per platform.
+      - name: Documented try/catch behavior + 4-backend parity
+        run: ./scripts/check-docs-try.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest

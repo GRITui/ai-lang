@@ -8,7 +8,10 @@ fn py(src: &str) -> String {
 fn function_becomes_def() {
     let out = py("(def sq (fn (x) (* x x)))");
     assert!(out.contains("def sq(x):"), "got:\n{out}");
-    assert!(out.contains("return (x * x)"), "got:\n{out}");
+    // `*` goes through the checked `_mul` helper, not Python's bare `*`: a
+    // `catch` binds the message it sees, and Python's `1 * "s"` is a repeated
+    // string with no error at all while AINL rejects the operand.
+    assert!(out.contains("return _mul(x, x)"), "got:\n{out}");
 }
 
 #[test]
@@ -25,14 +28,14 @@ fn while_and_let_are_statements() {
     let out = py("(def f (fn (n) (let ((i 0)) (while (< i n) (def i (+ i 1))) i)))");
     assert!(out.contains("i = 0"), "got:\n{out}");
     assert!(out.contains("while (i < n):"), "got:\n{out}");
-    assert!(out.contains("i = (i + 1)"), "got:\n{out}");
+    assert!(out.contains("i = _add(i, 1)"), "got:\n{out}");
     assert!(out.contains("return i"), "got:\n{out}");
 }
 
 #[test]
 fn lambda_in_expression_position() {
     let out = py("(map (fn (x) (* x 2)) xs)");
-    assert!(out.contains("(lambda x: (x * 2))"), "got:\n{out}");
+    assert!(out.contains("lambda x: _mul(x, 2)"), "got:\n{out}");
 }
 
 #[test]
@@ -88,7 +91,12 @@ fn hash_builtins_dispatch_to_runtime_helpers() {
 
 #[test]
 fn hash_runtime_omitted_when_unused() {
+    // `_add` needs `_ainl_tname` to name a bad operand's type, and `_ainl_tname`
+    // branches on `isinstance(x, _Hash)` — so a program that only does
+    // arithmetic now legitimately carries the class. What must still be omitted
+    // is the hash *constructor* and the hash *builtins*.
     let out = py("(+ 1 2)");
-    assert!(!out.contains("_Hash"), "got:\n{out}");
     assert!(!out.contains("def _hash("), "got:\n{out}");
+    assert!(!out.contains("def _get("), "got:\n{out}");
+    assert!(!out.contains("def _assoc("), "got:\n{out}");
 }

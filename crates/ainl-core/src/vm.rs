@@ -43,7 +43,7 @@ use crate::code::{FnCode, Instr};
 use crate::error::{Error, Result};
 use crate::eval::{
     builtin_div, builtin_mod, builtin_sub, compare, numeric_fold, value_keeps_env_alive, Env,
-    MAX_DEPTH, MAX_STEPS,
+    TryForm, MAX_DEPTH, MAX_STEPS,
 };
 use crate::parser::{Node, Span};
 use crate::value::{Closure, ConsCell, Value};
@@ -275,6 +275,7 @@ impl Compiler {
                 "let" => return shape(self.sf_let(&items[1..])),
                 "while" => return shape(self.sf_while(&items[1..])),
                 "quote" => return shape(self.sf_quote(&items[1..])),
+                "try" => return shape(self.sf_try(&items[1..])),
                 "and" => return shape(self.sf_and(&items[1..])),
                 "or" => return shape(self.sf_or(&items[1..])),
                 op if is_inlined_op(op) => return self.compile_inlined_op(op, &items[1..]),
@@ -476,6 +477,118 @@ impl Compiler {
         Ok(())
     }
 
+    /// `(try body... (catch (e) handler...))`.
+    ///
+    /// Lowered as **two sibling `FnCode`s** — one for the body, one for the
+    /// handler — plus a `PushTryHandler`/`PopTryHandler` pair around the body.
+    /// Each side is then an ordinary function call, which is what makes the
+    /// body a genuine scope: its `def`s are its own local slots, invisible to
+    /// the handler. Reusing the `let` machinery is deliberate — `let` already
+    /// needs "a nested scope with the enclosing locals visible", and `try`'s
+    /// body needs exactly that.
+    ///
+    /// The handler is reached two ways, and the VM must not care which: the
+    /// body's `Ret` lands on `PopTryHandler` when it completed normally (the
+    /// body's own value is the result of the whole `try`), or the unwind path
+    /// in `vm::run` sets `ip` to this `try`'s recorded `handler_pc` when a
+    /// frame inside the body raised.
+    fn sf_try(&mut self, args: &[Node]) -> Result<()> {
+        // Shared with the tree-walk (`eval::parse_try`) so the two evaluators
+        // cannot disagree about which body is protected or what `e` binds to.
+        let TryForm {
+            body,
+            param,
+            handler,
+        } = crate::eval::parse_try(args)?;
+
+        // The body, as its own scope. `new_let` with no bindings gives a child
+        // scope that can still LoadSlot the enclosing function's locals.
+        let mut bodyc = Compiler::new_let(Vec::new());
+        collect_defs(body, &mut bodyc.scope);
+        self.emit_fn_tail(&mut bodyc, body)?;
+        self.push_fn(bodyc.code);
+
+        // The handler, likewise its own scope, taking the error as its single
+        // parameter.
+        let mut handc = Compiler::new_fn(format!("(catch {param})"), vec![param.to_string()], None);
+        collect_defs(handler, &mut handc.scope);
+        self.emit_fn_tail(&mut handc, handler)?;
+        self.push_fn(handc.code);
+        let handler_idx = self.code.fns.len() - 1;
+
+        // --- layout ---
+        //   PushTryHandler{pc, fn}              ; also resets the step budget
+        //   MakeFn(body) ; Call(0) ; PopTryHandler ; Jump(join)
+        //   handler_pc: Call(1)                 ; <- the unwind path lands here
+        //   join:
+        //
+        // The success path jumps *over* the handler, so the body's own value
+        // is the result of the whole `try` and the handler never runs.
+        //
+        // The unwind path arrives at `handler_pc` having pushed the handler
+        // closure and the error value itself, in `Call`'s calling order
+        // (callee below argument). That is why there is no `MakeFn` here: the
+        // marker already recorded `handler_idx`, so the unwind can build the
+        // callee directly instead of re-entering bytecode mid-expression.
+        // Both paths therefore arrive at the same `Call(1)` with the same
+        // operand shape, and the body's value never needs a `Pop` to get out
+        // of the way.
+        self.emit(Instr::PushTryHandler {
+            handler_pc: 0,
+            handler_fn: handler_idx,
+        });
+        let marker = self.body_len() - 1;
+        self.emit(Instr::MakeFn(self.code.fns.len() - 2));
+        self.emit(Instr::Call(0));
+        self.emit(Instr::PopTryHandler);
+        let join = self.emit_jump(Instr::Jump);
+
+        let handler_pc = self.body_len();
+        self.emit(Instr::Call(1));
+        self.patch_jump(join, self.body_len());
+
+        match self.code.body[marker] {
+            Instr::PushTryHandler { handler_fn, .. } => {
+                self.code.body[marker] = Instr::PushTryHandler {
+                    handler_pc,
+                    handler_fn,
+                }
+            }
+            _ => unreachable!("sf_try: marker is a PushTryHandler"),
+        }
+        Ok(())
+    }
+
+    /// Emit `forms` as a `do` body (all but the last popped) plus `Ret`, and
+    /// finalize the code: locals table, env flag, slot symbols. Shared by
+    /// `sf_let`, `sf_try`'s two halves, and so they cannot drift in how a
+    /// nested scope is finalized.
+    fn emit_fn_tail(&mut self, c: &mut Compiler, forms: &[Node]) -> Result<()> {
+        if forms.is_empty() {
+            c.emit(Instr::Nil);
+        } else {
+            let last = forms.len() - 1;
+            for (i, form) in forms.iter().enumerate() {
+                c.compile_expr(form)?;
+                if i != last {
+                    c.emit(Instr::Pop);
+                }
+            }
+        }
+        c.emit(Instr::Ret);
+        c.code.locals = c.scope.locals.clone();
+        c.code.env_active = c.scope.env_active;
+        c.code.sync_slot_syms();
+        Ok(())
+    }
+
+    /// Register a finished nested `FnCode` and mark this scope as
+    /// closure-bearing (its body may reference the enclosing env).
+    fn push_fn(&mut self, code: FnCode) {
+        self.scope.env_active = true;
+        self.code.fns.push(Rc::new(code));
+    }
+
     fn sf_and(&mut self, args: &[Node]) -> Result<()> {
         // Returns the first falsey value, or the last value if all truthy
         // (nil-ary -> true). `Dup` preserves the value across `JumpIfFalse`
@@ -591,7 +704,12 @@ fn collect_defs(forms: &[Node], scope: &mut Scope) {
         };
         if let Some(Node::Sym(op, _)) = items.first() {
             match op.as_str() {
-                "fn" | "let" => continue, // new scope
+                // New scope. `try`'s body and handler are each their own
+                // scope (see `Compiler::sf_try`), so a `def` in either is that
+                // nested function's local — not a slot in the enclosing one.
+                // This also stops the enclosing scope from reserving a slot
+                // for a name the body can never see.
+                "fn" | "let" | "try" => continue,
                 "def" => {
                     if let Some(Node::Sym(name, _)) = items.get(1) {
                         scope.define(name.clone());
@@ -744,12 +862,49 @@ fn cur_span(frames: &[Frame], ip: usize) -> usize {
     frames.last().map(|f| f.code.span_at(ip).start).unwrap_or(0)
 }
 
+/// One live `(try … (catch …))`, recorded by [`Instr::PushTryHandler`].
+///
+/// The interpreter and the tree-walk return `Err` up their native call stacks,
+/// so unwinding is free there. The VM has no native stack to unwind — it has a
+/// frame stack and a `Result` in each loop body — so it records the same
+/// information here and turns a raised `Error` into a jump. What has to be
+/// captured is exactly what a native unwinder would restore:
+///
+/// * **`stack_len`** — the operand-stack depth on entry. A frame that raised
+///   may have left partial operands (a call's arguments, say) on the stack;
+///   truncating back to this depth is what makes the handler see the same
+///   operand stack the body's start did.
+/// * **`frame_depth`** — how many *call* frames the body pushed. Those frames
+///   are popped, which also means their scopes get cleared (see the `Ret`
+///   note) rather than leaked.
+/// * **`steps`** — the step count on entry, so the body gets a fresh budget
+///   (see `eval::sf_try` for why) and the *enclosing* run is not charged for
+///   the caught one.
+struct TryHandler {
+    /// Bytecode offset to jump to when a frame inside the region raises.
+    handler_pc: usize,
+    /// Index into the enclosing frame's `fns` of the `catch` closure. The
+    /// unwind path builds the callee itself rather than re-entering bytecode
+    /// at a `MakeFn`, so the marker has to carry it.
+    handler_fn: usize,
+    /// Operand-stack depth when the protected region began.
+    stack_len: usize,
+    /// Number of call frames on `frames` when it began.
+    frame_depth: usize,
+    /// Step count when the region began.
+    steps: u64,
+}
+
 /// Execute a compiled top-level program in `env`. Returns the value of the
 /// final form. `env` is the global (REPL) environment: top-level `def`s are
 /// persisted into it so bindings survive across `run_in` calls.
 pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
     let mut stack: Vec<Value> = Vec::new();
     let mut steps: u64 = 0;
+    // Live `try` regions, innermost last. Empty for any program without a
+    // `try`, and never touched by the hot loop, so a program that does not use
+    // `catch` pays nothing for the feature.
+    let mut handlers: Vec<TryHandler> = Vec::new();
 
     // Top-level frame: pre-fill local slots from the global env so a var
     // defined in an earlier run is visible before it is re-`def`d.
@@ -764,6 +919,73 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
         env: env.clone(),
     }];
 
+    // Raise `e` in the VM loop: deliver it to the innermost enclosing `try` if
+    // there is one, otherwise fail the run.
+    //
+    // A macro rather than a function so it can `continue`/`return` out of the
+    // loop; that is the whole point, and it is why the unwind body is written
+    // once here instead of at each of the loop's error sites. Using it at
+    // every site is what makes "innermost catch wins" true *by construction*
+    // rather than by remembering to route each new error path through here.
+    macro_rules! raise {
+        ($e:expr) => {{
+            let err: Error = $e;
+            let Some(h) = handlers.pop() else {
+                return Err(err);
+            };
+            // Discard whatever the failing frame left on the operand stack:
+            // a partially-applied call's arguments, a half-built list. The
+            // handler must see the same stack the body's first instruction did.
+            stack.truncate(h.stack_len);
+            // Drop the frames the body pushed, clearing each scope exactly as
+            // `Instr::Ret` does — a self-referential `def` cycle rooted in a
+            // discarded frame would otherwise leak the whole scope chain.
+            while frames.len() > h.frame_depth {
+                let f = frames.pop().expect("depth checked above");
+                f.env.clear();
+            }
+            // The body ran on its own budget; give it back rather than
+            // charging the enclosing run for work it did not do.
+            steps = h.steps;
+            // Resume at `handler_pc`, which is the `Pop ; Call(1)` pair. `Call`
+            // pops its arguments first and the callee *below* them, so both
+            // operands are pushed here, callee-first. The callee is built from
+            // the enclosing frame's fn table — the same closure a `MakeFn` at
+            // that point would have produced, so the handler runs in exactly
+            // the scope the surrounding code is in.
+            let frame = frames
+                .last_mut()
+                .expect("a `try` is always pushed by a frame");
+            let fnc = &frame.code.fns[h.handler_fn];
+            stack.push(Value::Closure(Rc::new(Closure {
+                params: fnc.params.clone(),
+                variadic: fnc.variadic.clone(),
+                body: Vec::new(), // the VM runs `code`, not `body`
+                env: frame.env.clone(),
+                code: Some(Rc::clone(fnc)),
+            })));
+            stack.push(err.to_value());
+            frame.ip = h.handler_pc;
+            continue;
+        }};
+    }
+
+    // [`raise!`] for an expression that already yields a `Result`: the `Ok`
+    // arm is the value, the `Err` arm unwinds.
+    //
+    // This exists because `?` in this loop would `return Err(..)` straight out
+    // of `run`, skipping every enclosing `try`. Using it at each `Result`-typed
+    // site is what lets the inlined numeric ops, the comparisons and the
+    // builtin call all be catchable without a second error channel.
+    macro_rules! value {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => raise!(e),
+            }
+        };
+    }
+
     loop {
         // Advance the instruction pointer and charge a step. A single
         // `last_mut()` borrows the frame for the whole prologue (bounds check,
@@ -776,7 +998,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
         }
         steps += 1;
         if steps > MAX_STEPS {
-            return Err(Error::runtime(format!(
+            raise!(Error::runtime(format!(
                 "step limit exceeded (max {MAX_STEPS} evaluation steps) — likely an infinite loop or runaway recursion"
             )));
         }
@@ -828,7 +1050,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                                 if let Some(m) = frame.code.slot_suggestions.get(&s) {
                                     e = e.with_suggestion(m.clone());
                                 }
-                                return Err(e);
+                                raise!(e);
                             }
                         }
                     }
@@ -852,23 +1074,27 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
             Instr::Load(i) => {
                 let frame = &frames.last().unwrap();
                 let name = frame.code.names[i].clone();
-                let v = frame.env.get(&name).ok_or_else(|| {
-                    // The suggestion was resolved at *compile* time (see
-                    // `emit_load_var`), when the compiler knew every name in
-                    // scope — including `def`s that had not executed yet. The
-                    // runtime env at this point holds fewer names than the
-                    // program will eventually have, so it cannot re-derive the
-                    // same answer, and doing so would make the VM disagree
-                    // with the tree-walk (4-backend rule).
-                    let mut e = Error::runtime_at(
-                        format!("unbound symbol '{name}'"),
-                        cur_span(&frames, ip),
-                    );
-                    if let Some(m) = frame.code.name_suggestions.get(&i) {
-                        e = e.with_suggestion(m.clone());
+                let found = frame.env.get(&name);
+                let v = match found {
+                    Some(v) => v,
+                    None => {
+                        // The suggestion was resolved at *compile* time (see
+                        // `emit_load_var`), when the compiler knew every name in
+                        // scope — including `def`s that had not executed yet. The
+                        // runtime env at this point holds fewer names than the
+                        // program will eventually have, so it cannot re-derive
+                        // the same answer, and doing so would make the VM disagree
+                        // with the tree-walk (4-backend rule).
+                        let mut e = Error::runtime_at(
+                            format!("unbound symbol '{name}'"),
+                            cur_span(&frames, ip),
+                        );
+                        if let Some(m) = frame.code.name_suggestions.get(&i) {
+                            e = e.with_suggestion(m.clone());
+                        }
+                        raise!(e)
                     }
-                    e
-                })?;
+                };
                 stack.push(v);
             }
             Instr::Def(i) => {
@@ -891,42 +1117,60 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         Some(r) => stack.push(Value::Int(r)),
                         None => stack.push(Value::Float((*x as f64) + (*y as f64))),
                     },
-                    _ => stack.push(
-                        numeric_fold(&[a, b], 0.0, 0, |x, y| x + y, i64::checked_add)
-                            .map_err(|e| e.or_at(cur_span(&frames, ip)))?,
-                    ),
+                    _ => stack.push(value!(numeric_fold(
+                        &[a, b],
+                        0.0,
+                        0,
+                        |x, y| x + y,
+                        i64::checked_add
+                    )
+                    .map_err(|e| e.or_at(cur_span(&frames, ip))))),
                 }
             }
             Instr::Mul => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(
-                    numeric_fold(&[a, b], 1.0, 1, |x, y| x * y, i64::checked_mul)
-                        .map_err(|e| e.or_at(cur_span(&frames, ip)))?,
-                );
+                stack.push(value!(numeric_fold(
+                    &[a, b],
+                    1.0,
+                    1,
+                    |x, y| x * y,
+                    i64::checked_mul
+                )
+                .map_err(|e| e.or_at(cur_span(&frames, ip)))));
             }
             Instr::Sub => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_sub(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
+                stack.push(value!(
+                    builtin_sub(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))
+                ));
             }
             Instr::Div => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_div(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
+                stack.push(value!(
+                    builtin_div(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))
+                ));
             }
             Instr::Mod => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_mod(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
+                stack.push(value!(
+                    builtin_mod(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))
+                ));
             }
             Instr::Neg => {
                 let a = stack.pop().unwrap();
-                stack.push(builtin_sub(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
+                stack.push(value!(
+                    builtin_sub(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))
+                ));
             }
             Instr::Recip => {
                 let a = stack.pop().unwrap();
-                stack.push(builtin_div(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
+                stack.push(value!(
+                    builtin_div(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))
+                ));
             }
 
             // ---- inlined comparisons ----
@@ -945,23 +1189,23 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                     (Value::Int(x), Value::Int(y)) => {
                         stack.push(Value::Bool((*x as f64) < (*y as f64)))
                     }
-                    _ => stack.push(compare(&[a, b], |o| o == Ordering::Less)?),
+                    _ => stack.push(value!(compare(&[a, b], |o| o == Ordering::Less))),
                 }
             }
             Instr::CmpGt => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(compare(&[a, b], |o| o == Ordering::Greater)?);
+                stack.push(value!(compare(&[a, b], |o| o == Ordering::Greater)));
             }
             Instr::CmpLe => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(compare(&[a, b], |o| o != Ordering::Greater)?);
+                stack.push(value!(compare(&[a, b], |o| o != Ordering::Greater)));
             }
             Instr::CmpGe => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(compare(&[a, b], |o| o != Ordering::Less)?);
+                stack.push(value!(compare(&[a, b], |o| o != Ordering::Less)));
             }
             Instr::Not => {
                 let a = stack.pop().unwrap();
@@ -982,6 +1226,32 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 let v = stack.pop().unwrap();
                 if v.is_truthy() {
                     frames.last_mut().unwrap().ip = t;
+                }
+            }
+            Instr::PushTryHandler {
+                handler_pc,
+                handler_fn,
+            } => {
+                // The body is a containment boundary, so it gets its own step
+                // budget: an infinite loop inside one is bounded on its own
+                // rather than consuming the enclosing run's. Recorded in the
+                // marker so the unwind path can hand the budget back.
+                handlers.push(TryHandler {
+                    handler_pc,
+                    handler_fn,
+                    stack_len: stack.len(),
+                    frame_depth: frames.len(),
+                    steps,
+                });
+                steps = 0;
+            }
+            Instr::PopTryHandler => {
+                // The protected region completed: drop the marker and give the
+                // enclosing run the steps the body actually used. Restoring the
+                // *whole* count rather than adding it back keeps a `try` inside
+                // a long-running loop from starving the run that contains it.
+                if let Some(h) = handlers.pop() {
+                    steps = h.steps + steps.min(MAX_STEPS);
                 }
             }
 
@@ -1014,18 +1284,21 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 let call_ip = frame.ip - 1;
                 match callee {
                     Value::Builtin { f, .. } => {
-                        let r = f(&args).map_err(|e| e.or_at(cur_span(&frames, ip)))?;
+                        let r = value!(f(&args).map_err(|e| e.or_at(cur_span(&frames, ip))));
                         stack.push(r);
                     }
                     Value::Closure(c) => {
-                        let fnc = c.code.as_ref().ok_or_else(|| {
-                            Error::runtime("cannot call a tree-walk closure from the VM")
-                        })?;
+                        let fnc = match c.code.as_ref() {
+                            Some(f) => f,
+                            None => raise!(Error::runtime(
+                                "cannot call a tree-walk closure from the VM"
+                            )),
+                        };
                         let np = fnc.params.len();
                         if fnc.variadic.is_some() {
                             if args.len() < np {
                                 let who = self_callee_name(&frames, call_ip);
-                                return Err(Error::runtime_at(
+                                raise!(Error::runtime_at(
                                     format!(
                                         "arity mismatch: ({who}) takes at least {np} args, got {}",
                                         args.len()
@@ -1035,7 +1308,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                             }
                         } else if args.len() != np {
                             let who = self_callee_name(&frames, call_ip);
-                            return Err(crate::eval::arity_mismatch(
+                            raise!(crate::eval::arity_mismatch(
                                 &who,
                                 np,
                                 args.len(),
@@ -1043,7 +1316,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                             ));
                         }
                         if frames.len() > MAX_DEPTH {
-                            return Err(Error::runtime(format!(
+                            raise!(Error::runtime(format!(
                                 "recursion limit exceeded (max depth {MAX_DEPTH})"
                             )));
                         }
@@ -1075,7 +1348,7 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         });
                     }
                     other => {
-                        return Err(crate::eval::not_callable(
+                        raise!(crate::eval::not_callable(
                             other.type_name(),
                             cur_span(&frames, ip),
                         ));

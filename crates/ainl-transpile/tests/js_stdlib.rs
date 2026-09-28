@@ -259,7 +259,13 @@ fn path_join_reports_a_positional_type_error_in_ainl_wording() {
 
 #[test]
 fn stdlib_runtime_is_omitted_when_unused() {
-    let out = js("(+ 1 2)");
+    // `(print "hi")` is the one program that genuinely needs no arithmetic and
+    // no type-name helper. `(+ 1 2)` no longer qualifies: it routes through
+    // `_add`, which calls `_ainl_tname` (to name a bad operand) and `_isnum`,
+    // so those two are now correctly emitted. They are dropped from the list
+    // below rather than from the language — see js.rs's
+    // `hash_runtime_omitted_when_unused` for the same reasoning.
+    let out = js(r#"(print "hi")"#);
     for helper in [
         "_read_file",
         "_write_file",

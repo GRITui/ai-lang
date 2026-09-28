@@ -144,6 +144,73 @@ impl Py {
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
+        // `try`. `_ainl_try` needs `_AinlError` (the except clause) and
+        // `_caught` (which builds the hash and needs `_Hash`), and the RUNTIME
+        // table is emitted in declaration order, so `_Hash` must be pulled in
+        // too — otherwise `_caught` would name a class defined after it.
+        if self.needed.contains("_ainl_try") || self.needed.contains("_caught") {
+            self.needed.insert("_ainl_try");
+            self.needed.insert("_caught");
+            self.needed.insert("_AinlError");
+            self.needed.insert("_Hash");
+        }
+        // The checked helpers call `_error` and `_ainl_tname` by name, and
+        // `_ainl_tname` itself branches on `_Hash`/`_Sym`, so both must be
+        // emitted first. RUNTIME is emitted in declaration order, and the
+        // helper cluster is declared ABOVE the type-name helper, so ordering
+        // here is what keeps the generated module importable.
+        //
+        // This pass runs BEFORE the `_error` -> `_AinlError` rule below,
+        // because it is what can insert `_error` in the first place: a program
+        // that only reaches `_error` indirectly (through a `(len x)` type
+        // guard, say) has no `error` form and no `try`, yet still generates a
+        // `raise _AinlError(...)` from `_error`. Checking `_error` before this
+        // loop would miss it, and the program would fail at RUN time with
+        // `NameError: name '_AinlError' is not defined` — on the error path,
+        // which is exactly the path `try` exists to exercise.
+        for n in [
+            "_add", "_sub", "_mul", "_div", "_mod", "_alist", "_ahash", "_len", "_first", "_rest",
+            "_nth", "_cons", "_push", "_get", "_assoc", "_has", "_keys", "_vals",
+        ] {
+            if self.needed.contains(n) {
+                self.needed.insert("_error");
+                self.needed.insert("_ainl_tname");
+            }
+        }
+        // AINL-level `error` must raise the type `catch` looks for. Asking for
+        // `_error` alone would emit the raise without the class it raises.
+        if self.needed.contains("_error") {
+            self.needed.insert("_AinlError");
+        }
+        // The list builtins all guard through `_alist`; the hash ones through
+        // `_ahash`. Pulling the right predicate in is what keeps a program that
+        // only calls `first` from emitting the hash guard too (and vice versa).
+        for n in ["_first", "_rest", "_nth", "_cons", "_push"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_alist");
+            }
+        }
+        for n in ["_get", "_assoc", "_has", "_keys", "_vals"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_ahash");
+            }
+        }
+        // Every file builtin shares `_apath`, and it needs `_ainl_tname` to name
+        // the type it was handed.
+        for n in ["_read_file", "_write_file", "_append_file"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_apath");
+                self.needed.insert("_error");
+                self.needed.insert("_ainl_tname");
+            }
+        }
+        // `_ainl_tname` is declared after the guards that use it, so pull the
+        // classes it inspects in as well.
+        if self.needed.contains("_ainl_tname") {
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+            self.needed.insert("_disp");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to python`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -192,6 +259,7 @@ impl Py {
                     "let" => return self.stmt_let(&items[1..], ret),
                     "do" => return self.stmt_body(&items[1..], ret),
                     "if" => return self.stmt_if(&items[1..], ret),
+                    "try" => return self.stmt_try(&items[1..], ret),
                     _ => {}
                 }
             }
@@ -255,6 +323,17 @@ impl Py {
         let params = python_params(params_node)?;
         self.line(&format!("def {name}({params}):"));
         self.indent += 1;
+        // A `& rest` parameter must hold an AINL LIST, not Python's tuple.
+        // `def sum(*xs)` binds a tuple, and every AINL list builtin refuses
+        // one — `(len xs)`, `(first xs)` and `(rest xs)` all raise "expects
+        // list, got ?", where `?` is `_ainl_tname` failing to name a type that
+        // should not exist. Converting here keeps the rest parameter an
+        // ordinary AINL value, so the program behaves the same as it does in
+        // the interpreter. The slice keeps a 0-arg call binding `[]` rather
+        // than `None`, matching `(fn (& xs) ...)` called with no arguments.
+        if let Some(rest) = rest_param(params_node)? {
+            self.line(&format!("{rest} = list({rest})"));
+        }
         if body.is_empty() {
             self.line("return None");
         } else {
@@ -294,6 +373,59 @@ impl Py {
             self.line(&format!("{} = {e}", sanitize(name)));
         }
         self.stmt_body(body, ret)
+    }
+
+    /// `(try body... (catch (e) handler...))` in statement position.
+    ///
+    /// Lowers to a native `try`/`except`, via a `_ainl_try(body, handler)`
+    /// helper so the same lowering serves expression position too. Each side
+    /// becomes a **closure**, which is what makes the body a real scope: Python
+    /// resolves a function's names locally, so a `def` in the body is invisible
+    /// to the handler — the same sibling-scope rule the other three backends
+    /// enforce. Without it a handler could read a half-initialised value from
+    /// the body that failed.
+    fn stmt_try(&mut self, args: &[Node], ret: bool) -> Result<()> {
+        let f = ainl_core::eval::parse_try(args)?;
+        self.need("_ainl_try");
+        self.need("_AinlError");
+        self.need("_caught");
+        // The two thunks share ONE pair of names and are re-bound by every
+        // `try` in the program. That is safe because each is defined and then
+        // immediately called, with no code between the `def` and the `_ainl_try`
+        // that reads them — so the names are always the ones just defined, even
+        // inside a loop. A counter would work too and buy nothing here.
+        self.line("def _ainl_body():");
+        self.indent += 1;
+        self.emit_side(f.body)?;
+        self.indent -= 1;
+        self.line(&format!("def _ainl_hand({e}):", e = sanitize(f.param)));
+        self.indent += 1;
+        self.emit_side(f.handler)?;
+        self.indent -= 1;
+        let slot = "_ainl_v";
+        self.line(&format!("{slot} = _ainl_try(_ainl_body, _ainl_hand)"));
+        if ret {
+            self.line(&format!("return {slot}"));
+        }
+        Ok(())
+    }
+
+    /// Emit `forms` as a function body whose value is the last form's, `return`ed.
+    fn emit_side(&mut self, forms: &[Node]) -> Result<()> {
+        if forms.is_empty() {
+            self.line("return None");
+            return Ok(());
+        }
+        let last = forms.len() - 1;
+        for (i, f) in forms.iter().enumerate() {
+            if i == last {
+                let e = self.expr(f)?;
+                self.line(&format!("return {e}"));
+            } else {
+                self.stmt(f, false)?;
+            }
+        }
+        Ok(())
     }
 
     fn stmt_if(&mut self, args: &[Node], ret: bool) -> Result<()> {
@@ -338,10 +470,10 @@ impl Py {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return shared::infix(self, args, "+", "0"),
-                "*" => return shared::infix(self, args, "*", "1"),
-                "-" => return shared::infix_sub(self, args),
-                "/" => return self.infix_div(args),
+                "+" => return self.arith("+", args),
+                "*" => return self.arith("*", args),
+                "-" => return self.arith("-", args),
+                "/" => return self.arith("/", args),
                 "=" => return self.eq_chain(args),
                 "<" => return self.chain(args, "<"),
                 ">" => return self.chain(args, ">"),
@@ -350,10 +482,19 @@ impl Py {
                 "and" => return self.chain_logic(args, "and"),
                 "or" => return self.chain_logic(args, "or"),
                 "not" => return shared::unary(self, args, "not "),
-                "mod" => return shared::binary(self, args, "%"),
+                "mod" => {
+                    let [a, b] = args else {
+                        return Err(Error::runtime("'mod' expects 2 arguments"));
+                    };
+                    self.need("_ainl_tname");
+                    self.need("_mod");
+                    let (x, y) = (self.expr(a)?, self.expr(b)?);
+                    return Ok(format!("_mod({x}, {y})"));
+                }
                 "if" => return self.expr_if(args),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
+                "try" => return self.expr_try(args, span),
                 "quote" => return self.expr_quote(args),
                 "fn" => return self.expr_fn(args, span),
                 "list" => {
@@ -371,7 +512,7 @@ impl Py {
                     self.need("_str");
                     return Ok(format!("_str({})", self.expr_all(args)?.join(", ")));
                 }
-                "len" => return self.call_builtin("len", args, None),
+                "len" => return self.call_builtin("_len", args, Some("_len")),
                 "first" => return self.call_builtin("_first", args, Some("_first")),
                 "rest" => return self.call_builtin("_rest", args, Some("_rest")),
                 "nth" => return self.call_builtin("_nth", args, Some("_nth")),
@@ -458,13 +599,47 @@ impl Py {
         Ok(format!("{py_name}({})", self.expr_all(args)?.join(", ")))
     }
 
-    fn infix_div(&mut self, args: &[Node]) -> Result<String> {
+    /// `+ - * /` route through the checked `_add`/`_sub`/`_mul`/`_div` helpers
+    /// rather than Python's operators.
+    ///
+    /// The reason is error parity, not speed: a host operator raises a host
+    /// exception whose text a `catch` would then bind, and those texts differ
+    /// per target (`ZeroDivisionError: division by zero` here, `division by
+    /// zero` in the C runtime, a silent `NaN` in JavaScript). The helper
+    /// raises AINL's own message, so the caught value matches on all five
+    /// backends. The 0-arg and 1-arg cases keep Python's own identities so the
+    /// non-error path is unchanged.
+    fn arith(&mut self, op: &str, args: &[Node]) -> Result<String> {
+        let helper = match op {
+            "+" => {
+                if args.is_empty() {
+                    return Ok("0".to_string());
+                }
+                "_add"
+            }
+            "*" => {
+                if args.is_empty() {
+                    return Ok("1".to_string());
+                }
+                "_mul"
+            }
+            "-" => {
+                if args.is_empty() {
+                    return Err(Error::runtime("- expects at least 1 argument"));
+                }
+                "_sub"
+            }
+            _ => {
+                if args.is_empty() {
+                    return Err(Error::runtime("/ expects at least 1 argument"));
+                }
+                "_div"
+            }
+        };
+        self.need("_ainl_tname");
+        self.need(helper);
         let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("/ expects at least 1 argument")),
-            1 => Ok(format!("(1 / {})", parts[0])),
-            _ => Ok(format!("({})", parts.join(" / "))),
-        }
+        Ok(format!("{helper}({})", parts.join(", ")))
     }
 
     /// `=` needs the `_eq` runtime helper rather than native `==`: `_Sym` is
@@ -516,6 +691,45 @@ impl Py {
             None => "None".to_string(),
         };
         Ok(format!("({t} if {c} else {e})"))
+    }
+
+    /// `try` in expression position — `(def status (try … (catch (e) …)))` is
+    /// the most natural form of all, so it is not refused.
+    ///
+    /// A Python expression cannot contain statements, so this needs an IIFE:
+    /// the whole `try` becomes a call to a nullary lambda that in turn calls
+    /// `_ainl_try` with the two sides. That keeps the sides as real closures
+    /// (so the body's `def`s stay local to it) *and* keeps them closing over
+    /// the enclosing function's locals, which a hoisted module-level helper
+    /// could not do.
+    ///
+    /// The limit is the same one `let` already has: a side that is more than
+    /// one form is a sequence of statements and cannot be an expression. Saying
+    /// so beats emitting something that silently drops a form.
+    fn expr_try(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
+        let f = ainl_core::eval::parse_try(args)?;
+        if f.body.len() > 1 {
+            return Err(self.no_expr("multi-statement try body", span));
+        }
+        if f.handler.len() > 1 {
+            return Err(self.no_expr("multi-statement try handler", span));
+        }
+        self.need("_ainl_try");
+        self.need("_AinlError");
+        self.need("_caught");
+        let body = match f.body.first() {
+            Some(n) => self.expr(n)?,
+            // An empty body is nil, the same as `(do)`.
+            None => "None".to_string(),
+        };
+        let handler = match f.handler.first() {
+            Some(n) => self.expr(n)?,
+            None => "None".to_string(),
+        };
+        Ok(format!(
+            "(lambda: _ainl_try(lambda: {body}, lambda {e}: {handler}))()",
+            e = sanitize(f.param)
+        ))
     }
 
     /// `let` in expression position becomes an immediately-invoked lambda, but
@@ -618,6 +832,27 @@ impl ExprEmit for Py {
 
 fn python_params(params_node: &Node) -> Result<String> {
     Ok(shared::parse_params(params_node, "*", sanitize)?.join(", "))
+}
+
+/// The name of the `& rest` parameter, if the parameter list has one.
+///
+/// Reported separately from `python_params` because the caller needs to emit
+/// something for it beyond the parameter itself: a Python `*rest` binds a
+/// tuple, and an AINL rest parameter is a list.
+fn rest_param(params_node: &Node) -> Result<Option<String>> {
+    let Node::List(param_nodes, _) = params_node else {
+        return Err(Error::runtime("fn params must be a list"));
+    };
+    let Some(i) = param_nodes
+        .iter()
+        .position(|n| matches!(n, Node::Sym(p, _) if p == "&"))
+    else {
+        return Ok(None);
+    };
+    match param_nodes.get(i + 1) {
+        Some(Node::Sym(rest, _)) => Ok(Some(sanitize(rest))),
+        _ => Err(Error::runtime("'&' must be followed by a rest parameter")),
+    }
 }
 
 /// Turn an AINL symbol into a valid Python identifier.
@@ -737,28 +972,159 @@ const RUNTIME: &[(&str, &str)] = &[
         "_test",
         "def _test(name, actual, expected):\n    if not isinstance(name, str) or isinstance(name, _Sym): raise RuntimeError('test expects a str name, got %s' % _typename(name))\n    if not isinstance(expected, str) or isinstance(expected, _Sym): raise RuntimeError('test expects a str expected value, got %s' % _typename(expected))\n    got = _disp(actual)\n    if got == expected: return True\n    raise RuntimeError('test failed: %s: expected %s, got %s' % (name, expected, got))",
     ),
+    (
+        // Type guards for the list and hash builtins.
+        //
+        // Same reason as the arithmetic helpers: a `catch` binds the message,
+        // and a host `TypeError` ("object of type 'int' has no len()") is not
+        // AINL's text and does not match the C runtime or the interpreter. The
+        // guards re-establish AINL's own wording — which leads with the
+        // *builtin's* name (`first expects list, got int`), so the builtin
+        // passes its own name in rather than the guard hard-coding one.
+        "_alist",
+        "def _alist(who, x):\n    if not isinstance(x, list) or isinstance(x, _Hash): _error(who + ' expects list, got ' + _ainl_tname(x))",
+    ),
+    (
+        // The path-argument check shared by every file builtin. It exists as one
+        // helper because AINL's rule is uniform across them — a quoted symbol is
+        // a `str` subclass in Python, so `isinstance` alone would accept
+        // `(read-file 'x.txt)`, which the interpreter rejects.
+        "_apath",
+        "def _apath(who, p):\n    if not isinstance(p, str) or isinstance(p, _Sym): _error(who + ' expects a str path, got ' + _ainl_tname(p))",
+    ),
+    (
+        "_ahash",
+        "def _ahash(who, x):\n    if not isinstance(x, _Hash): _error(who + ' expects a hash, got ' + _ainl_tname(x))",
+    ),
     ("_str", "def _str(*xs):\n    return ''.join(_disp(x) for x in xs)"),
-    ("_first", "def _first(x):\n    return x[0] if len(x) else None"),
-    ("_rest", "def _rest(x):\n    return list(x[1:])"),
-    ("_nth", "def _nth(x, i):\n    return x[i] if 0 <= i < len(x) else None"),
-    ("_cons", "def _cons(h, t):\n    return [h] + list(t)"),
-    ("_push", "def _push(t, *xs):\n    return list(t) + list(xs)"),
+    (
+        // `len` accepts a list, a str or a hash in AINL, so it cannot be
+        // Python's builtin `len` (which would also accept a dict, a set, and
+        // raise on an int with a host message).
+        "_len",
+        "def _len(x):\n    if isinstance(x, _Hash) or isinstance(x, list) or isinstance(x, str): return len(x)\n    _error('len expects list, str, or hash, got ' + _ainl_tname(x))",
+    ),
+    (
+        // The arity text is AINL's, not Python's. Python would say
+        // `TypeError: _first() takes 1 positional argument but 2 were given`,
+        // and a `catch` binds that string — so the message has to be the one
+        // the interpreter and the C runtime already use.
+        "_first",
+        "def _first(*a):\n    if len(a) != 1: _error('first expects (first list)')\n    _alist('first', a[0])\n    return a[0][0] if len(a[0]) else None",
+    ),
+    (
+        "_rest",
+        "def _rest(*a):\n    if len(a) != 1: _error('rest expects (rest list)')\n    _alist('rest', a[0])\n    return list(a[0][1:])",
+    ),
+    (
+        "_nth",
+        "def _nth(*a):\n    if len(a) != 2: _error('nth expects (nth list int)')\n    if not isinstance(a[0], list) or isinstance(a[0], _Hash): _error('nth expects (nth list int)')\n    return a[0][a[1]] if 0 <= a[1] < len(a[0]) else None",
+    ),
+    (
+        "_cons",
+        "def _cons(*a):\n    if len(a) != 2: _error('cons expects (cons value list)')\n    if not isinstance(a[1], list) or isinstance(a[1], _Hash): _error('cons expects (cons value list)')\n    return [a[0]] + list(a[1])",
+    ),
+    (
+        "_push",
+        "def _push(*a):\n    if len(a) < 2: _error('push expects (push list value...)')\n    if not isinstance(a[0], list) or isinstance(a[0], _Hash): _error('push expects (push list value...)')\n    return list(a[0]) + list(a[1:])",
+    ),
     (
         "_hash",
-        "def _hash(*kvs):\n    out = _Hash()\n    for i in range(0, len(kvs), 2):\n        k, v = kvs[i], kvs[i + 1]\n        for pair in out:\n            if _eq(pair[0], k):\n                pair[1] = v\n                break\n        else:\n            out.append([k, v])\n    return out",
+        "def _hash(*kvs):\n    if len(kvs) % 2 != 0: _error('hash expects an even number of key/value arguments, got ' + str(len(kvs)))\n    out = _Hash()\n    for i in range(0, len(kvs), 2):\n        k, v = kvs[i], kvs[i + 1]\n        for pair in out:\n            if _eq(pair[0], k):\n                pair[1] = v\n                break\n        else:\n            out.append([k, v])\n    return out",
     ),
     (
         "_get",
-        "def _get(h, k):\n    for pair in h:\n        if _eq(pair[0], k): return pair[1]\n    return None",
+        "def _get(h, k):\n    _ahash('get', h)\n    for pair in h:\n        if _eq(pair[0], k): return pair[1]\n    return None",
     ),
     (
         "_assoc",
-        "def _assoc(h, k, v):\n    out = _Hash(list(p) for p in h)\n    for pair in out:\n        if _eq(pair[0], k):\n            pair[1] = v\n            return out\n    out.append([k, v])\n    return out",
+        "def _assoc(h, k, v):\n    _ahash('assoc', h)\n    out = _Hash(list(p) for p in h)\n    for pair in out:\n        if _eq(pair[0], k):\n            pair[1] = v\n            return out\n    out.append([k, v])\n    return out",
     ),
-    ("_has", "def _has(h, k):\n    return any(_eq(pair[0], k) for pair in h)"),
-    ("_keys", "def _keys(h):\n    return [pair[0] for pair in h]"),
-    ("_vals", "def _vals(h):\n    return [pair[1] for pair in h]"),
-    ("_error", "def _error(*xs):\n    raise RuntimeError(' '.join(_disp(x) for x in xs))"),
+    (
+        "_has",
+        "def _has(h, k):\n    _ahash('has', h)\n    return any(_eq(pair[0], k) for pair in h)",
+    ),
+    (
+        "_keys",
+        "def _keys(h):\n    _ahash('keys', h)\n    return [pair[0] for pair in h]",
+    ),
+    (
+        "_vals",
+        "def _vals(h):\n    _ahash('vals', h)\n    return [pair[1] for pair in h]",
+    ),
+    (
+        // AINL-level errors get their own exception type, not a bare
+        // `RuntimeError`. `catch` binds the message it sees, so the type has to
+        // carry AINL's own text rather than a host string; and a dedicated type
+        // keeps a `catch` from swallowing a genuine Python bug in the generated
+        // code (a `TypeError` from a mistake in *this* transpiler is not an
+        // AINL-level error and should propagate rather than be caught).
+        "_AinlError",
+        "class _AinlError(Exception):\n    pass",
+    ),
+    (
+        "_error",
+        "def _error(*xs):\n    raise _AinlError(' '.join(_disp(x) for x in xs))",
+    ),
+    (
+        // Checked arithmetic.
+        //
+        // These exist because a `catch` binds the MESSAGE it sees, and the
+        // host's own message is not AINL's: Python says `ZeroDivisionError:
+        // division by zero` and `TypeError: unsupported operand type(s)`, the
+        // C runtime and the interpreter say `division by zero` and `expected a
+        // number, got str`. Before `catch` that difference was invisible — the
+        // error just killed the process. The moment it became catchable it was
+        // a 4-backend divergence on the error path, so the arithmetic is
+        // re-checked here and the AINL message raised instead.
+        //
+        // The check is `type(x) in (int, float)` rather than `isinstance`,
+        // because Python's bool is a subclass of int and `(true + 1)` must
+        // report `got bool` — the same message the other backends give.
+        //
+        // The fold is a plain loop, NOT `sum(xs)`. AINL names a function
+        // `sum` with no difficulty (`(def sum (fn (& xs) ...))` is in
+        // examples/hello.ainl), and a module-level `def sum` shadows the
+        // builtin for the WHOLE module — including inside `_add`. Calling
+        // `sum(xs)` there re-entered the AINL function with a tuple, and the
+        // program died with "expected a number, got ?" instead of adding its
+        // arguments. A loop has no name to collide with.
+        "_add",
+        "def _add(*xs):\n    for x in xs:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n    r = 0\n    for x in xs: r += x\n    return r",
+    ),
+    (
+        "_mul",
+        "def _mul(*xs):\n    for x in xs:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n    r = 1\n    for x in xs: r *= x\n    return r",
+    ),
+    (
+        "_sub",
+        "def _sub(a, *rest):\n    if type(a) not in (int, float): _error('expected a number, got ' + _ainl_tname(a))\n    if not rest: return -a\n    for x in rest:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n    r = a\n    for x in rest: r -= x\n    return r",
+    ),
+    (
+        "_div",
+        "def _div(a, *rest):\n    if type(a) not in (int, float): _error('expected a number, got ' + _ainl_tname(a))\n    if not rest: return 1 / a if a != 0 else _error('division by zero')\n    for x in rest:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n        if x == 0: _error('division by zero')\n    r = a\n    for x in rest: r = r / x if r != 0 else _error('division by zero')\n    return r",
+    ),
+    (
+        "_mod",
+        "def _mod(a, b):\n    if type(a) not in (int, float): _error('expected a number, got ' + _ainl_tname(a))\n    if type(b) not in (int, float): _error('expected a number, got ' + _ainl_tname(b))\n    if b == 0: _error('mod by zero')\n    return a % b",
+    ),
+    (
+        // The value a `catch` binds: `{"message" <str>, "kind" "runtime"}`.
+        // Built here rather than by calling `_hash` so the key ORDER is fixed by
+        // construction — every backend prints a map in insertion order, and
+        // `message` before `kind` is what makes the caught value byte-identical
+        // across all five.
+        "_caught",
+        "def _caught(e):\n    return _Hash([['message', str(e)], ['kind', 'runtime']])",
+    ),
+    (
+        // The `try` itself. A dedicated helper (rather than an inline
+        // `try:`/`except:`) is what lets statement position and expression
+        // position share one lowering: both are just a call with the two sides
+        // passed as closures.
+        "_ainl_try",
+        "def _ainl_try(body, handler):\n    try:\n        return body()\n    except _AinlError as e:\n        return handler(_caught(e))",
+    ),
     // ---- Tier 1 JSON ----
     // Python is the one host with a real JSON parser, but `json.loads` cannot
     // be used directly: it returns dicts (unordered-by-contract, and the
@@ -828,17 +1194,27 @@ const RUNTIME: &[(&str, &str)] = &[
     //     i64 is not round-tripped through a float.
     //   * join requires a list of str, so a non-string element is a defined
     //     error rather than Python's silent str() coercion.
+    // The three file builtins below raise AINL's own message rather than
+    // letting the host's exception escape. That matters because `catch` binds
+    // the message it sees, and a host message differs per target: Python would
+    // give `[Errno 2] No such file or directory: 'x.txt'`, JavaScript a raw
+    // `ENOENT` object, Ruby `Errno::ENOENT`. The C runtime and the interpreter
+    // both say `read-file: cannot read 'x.txt'`, so that is what all five
+    // must say — a `catch` comparing messages is then portable. The
+    // `except` clauses deliberately re-raise only the I/O failure: a
+    // TypeError from a non-str path is already a defined AINL error and keeps
+    // its own (different) text.
     (
         "_read_file",
-        "def _read_file(path):\n    with open(path, 'r') as f:\n        return f.read()",
+        "def _read_file(path):\n    _apath('read-file', path)\n    try:\n        with open(path, 'r') as f:\n            return f.read()\n    except IsADirectoryError:\n        _error(\"read-file: cannot read '%s': it is a directory\" % path)\n    except OSError:\n        _error(\"read-file: cannot read '%s'\" % path)",
     ),
     (
         "_write_file",
-        "def _write_file(path, content):\n    with open(path, 'w') as f:\n        f.write(content)",
+        "def _write_file(path, content):\n    _apath('write-file', path)\n    try:\n        with open(path, 'w') as f:\n            f.write(content)\n    except IsADirectoryError:\n        _error(\"write-file: cannot write '%s': it is a directory\" % path)\n    except OSError:\n        _error(\"write-file: cannot write '%s'\" % path)",
     ),
     (
         "_append_file",
-        "def _append_file(path, content):\n    with open(path, 'a') as f:\n        f.write(content)",
+        "def _append_file(path, content):\n    _apath('append-file', path)\n    try:\n        with open(path, 'a') as f:\n            f.write(content)\n    except IsADirectoryError:\n        _error(\"append-file: cannot append '%s': it is a directory\" % path)\n    except OSError:\n        _error(\"append-file: cannot append '%s'\" % path)",
     ),
     // ---- Tier 1 file I/O ----
     // The path helpers implement AINL's own rules rather than delegating to

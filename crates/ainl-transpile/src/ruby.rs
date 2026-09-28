@@ -61,6 +61,56 @@ impl Rb {
         if self.needed.contains("_test") {
             self.needed.insert("_ainl_tname");
         }
+        // `try`. `_ainl_try` needs `AinlError` (the `rescue` clause type) and
+        // `_caught` (which builds the hash and needs `AHash`), and the RUNTIME
+        // table is emitted in declaration order, so `AHash` must be pulled in
+        // too — otherwise `_caught` would name a class defined after it.
+        if self.needed.contains("_ainl_try") || self.needed.contains("_caught") {
+            self.needed.insert("_ainl_try");
+            self.needed.insert("_caught");
+            self.needed.insert("AinlError");
+            self.needed.insert("AHash");
+        }
+        // AINL-level `error` must raise the type `catch` looks for. Asking for
+        // `_error` alone would emit the raise without the class it raises.
+        if self.needed.contains("_error") {
+            self.needed.insert("AinlError");
+        }
+        // The checked helpers call `_error` and `_ainl_tname` by name, and
+        // `_ainl_tname` itself branches on AHash, so both must be emitted
+        // first. RUNTIME is emitted in declaration order and the helper cluster
+        // is declared ABOVE the type-name helper, so this ordering is what
+        // keeps the generated file loadable.
+        for n in [
+            "_add", "_sub", "_mul", "_div", "_mod", "_alist", "_ahash", "_len", "_first", "_rest",
+            "_nth", "_cons", "_push", "_get", "_assoc", "_has", "_keys", "_vals",
+        ] {
+            if self.needed.contains(n) {
+                self.needed.insert("_error");
+                self.needed.insert("_ainl_tname");
+            }
+        }
+        // The list builtins all guard through `_alist`, the hash ones through
+        // `_ahash`. Pulling the right predicate in is what keeps a program that
+        // only calls `first` from emitting the hash guard too (and vice versa).
+        for n in ["_first", "_rest", "_nth", "_cons", "_push"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_alist");
+            }
+        }
+        for n in ["_get", "_assoc", "_has", "_keys", "_vals"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_ahash");
+            }
+        }
+        // Every file builtin raises through `_error`, and names a bad operand's
+        // type through `_ainl_tname`.
+        for n in ["_read_file", "_write_file", "_append_file"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_error");
+                self.needed.insert("_ainl_tname");
+            }
+        }
         let disp_used = self.needed.iter().any(|n| {
             matches!(
                 *n,
@@ -164,6 +214,7 @@ impl Rb {
                     "let" => return self.stmt_let(&items[1..]),
                     "do" => return self.stmt_body(&items[1..]),
                     "if" => return self.stmt_if(&items[1..]),
+                    "try" => return self.stmt_try(&items[1..]),
                     _ => {}
                 }
             }
@@ -286,10 +337,10 @@ impl Rb {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return shared::infix(self, args, "+", "0"),
-                "*" => return shared::infix(self, args, "*", "1"),
-                "-" => return shared::infix_sub(self, args),
-                "/" => return self.infix_div(args),
+                "+" => return self.arith("+", args),
+                "*" => return self.arith("*", args),
+                "-" => return self.arith("-", args),
+                "/" => return self.arith("/", args),
                 "=" => return shared::cmp(self, args, "=="),
                 "<" => return shared::cmp(self, args, "<"),
                 ">" => return shared::cmp(self, args, ">"),
@@ -298,8 +349,9 @@ impl Rb {
                 "and" => return shared::infix(self, args, "&&", "true"),
                 "or" => return shared::infix(self, args, "||", "false"),
                 "not" => return shared::unary(self, args, "!"),
-                "mod" => return shared::binary(self, args, "%"),
+                "mod" => return self.infix_mod(args),
                 "if" => return self.expr_if(args),
+                "try" => return self.expr_try(args, span),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
                 "quote" => return Ok(self.quote(&items[1..][0])),
@@ -404,20 +456,158 @@ impl Rb {
         Ok(format!("{name}({})", self.expr_all(args)?.join(", ")))
     }
 
-    /// AINL `/` is float division; Ruby `/` on integers truncates, so coerce the
-    /// first operand to Float to preserve AINL semantics.
-    fn infix_div(&mut self, args: &[Node]) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("/ expects at least 1 argument")),
-            1 => Ok(format!("(1.0 / {})", parts[0])),
-            _ => {
-                let mut it = parts.into_iter();
-                let first = it.next().unwrap();
-                let rest: Vec<String> = it.collect();
-                Ok(format!("(({}).to_f / {})", first, rest.join(" / ")))
-            }
+    /// `(try body... (catch (e) handler...))` in statement position.
+    ///
+    /// Lowers to a native `begin`/`rescue`, via an `_ainl_try(body, handler)`
+    /// helper so the same lowering serves expression position too. Each side
+    /// becomes a **lambda**, which is what makes the body a real scope: Ruby
+    /// resolves a block's parameters and locals locally, so a `def` in the body
+    /// is invisible to the handler — the same sibling-scope rule the other
+    /// four backends enforce. Without it a handler could read a
+    /// half-initialised value from the body that failed.
+    fn stmt_try(&mut self, args: &[Node]) -> Result<()> {
+        let f = ainl_core::eval::parse_try(args)?;
+        self.need("_ainl_try");
+        self.need("AinlError");
+        self.need("_caught");
+        // The two lambdas share ONE pair of names and are re-bound by every
+        // `try` in the program. That is safe because each is defined and then
+        // immediately passed to `_ainl_try`, with no code between the `lambda`
+        // and the call that reads them — so the names are always the ones just
+        // defined, even inside a loop. A counter would work too and buys
+        // nothing here.
+        //
+        // The sides are emitted as stabby lambdas (`-> () { }`) rather than
+        // `lambda { }` or `lambda do end`. A brace block is only syntactic sugar
+        // for `do...end`, and `do...end` BINDS TO THE NEAREST KEYWORD — so a
+        // `lambda { }` appearing inside this method's own `do` block is a parse
+        // error ("tried to create Proc object without a block"), and a
+        // `lambda do ... end` would capture the wrong `do`. The stabby form is
+        // delimited by its own braces, so it cannot be captured by an enclosing
+        // block. Both sides always carry an explicit parenthesised parameter
+        // list: a bare `-> body` reads as the unary minus operator followed by
+        // its operand, which does not parse. Verified on the host at top level
+        // and nested in a `do` block.
+        self.line("_ainl_v = _ainl_try(");
+        self.indent += 1;
+        self.line("->() {");
+        self.indent += 1;
+        self.emit_side(f.body)?;
+        self.indent -= 1;
+        self.line("},");
+        self.line(&format!("->({}) {{", sanitize(f.param)));
+        self.indent += 1;
+        self.emit_side(f.handler)?;
+        self.indent -= 1;
+        self.line("}");
+        self.indent -= 1;
+        self.line(")");
+        Ok(())
+    }
+
+    /// Emit `forms` as a lambda body whose value is the last form's — Ruby
+    /// returns a block's last expression, so no explicit return is threaded.
+    fn emit_side(&mut self, forms: &[Node]) -> Result<()> {
+        if forms.is_empty() {
+            self.line("nil");
+            return Ok(());
         }
+        for f in forms {
+            self.stmt(f)?;
+        }
+        Ok(())
+    }
+
+    /// `try` in expression position — `(def status (try … (catch (e) …)))` is
+    /// the most natural form of all, so it is not refused.
+    ///
+    /// A Ruby expression cannot contain statements, so this needs an IIFE: the
+    /// whole `try` becomes a call to a nullary lambda that in turn calls
+    /// `_ainl_try` with the two sides. That keeps the sides as real lambdas
+    /// (so the body's `def`s stay local to it) *and* keeps them closing over
+    /// the enclosing method's locals, which a hoisted top-level helper could
+    /// not do.
+    ///
+    /// The limit is the same one `let` already has: a side that is more than
+    /// one form is a sequence of statements and cannot be an expression. Saying
+    /// so beats emitting something that silently drops a form.
+    fn expr_try(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
+        let f = ainl_core::eval::parse_try(args)?;
+        if f.body.len() > 1 {
+            return Err(self.no_expr("multi-statement try body", span));
+        }
+        if f.handler.len() > 1 {
+            return Err(self.no_expr("multi-statement try handler", span));
+        }
+        self.need("_ainl_try");
+        self.need("AinlError");
+        self.need("_caught");
+        let body = match f.body.first() {
+            Some(n) => self.expr(n)?,
+            // An empty body is nil, the same as `(do)`.
+            None => "nil".to_string(),
+        };
+        let handler = match f.handler.first() {
+            Some(n) => self.expr(n)?,
+            None => "nil".to_string(),
+        };
+        // The IIFE wrapper is a stabby lambda too, for the reason `stmt_try`
+        // gives. It is spelled with parens and a block, and never as a bare
+        // `-> name` with no argument list: without one, `->` reads as the unary
+        // minus operator and the next token is taken as its operand.
+        Ok(format!(
+            "(->() {{\n  _ainl_try(->() {{ {body} }}, ->({e}) {{ {handler} }})\n}}).call",
+            e = sanitize(f.param)
+        ))
+    }
+
+    /// AINL `+ - * /` and `mod` route through the checked runtime helpers rather
+    /// than Ruby's own operators, for the reason `_add` documents: a `catch`
+    /// binds the message it sees, and Ruby's behaviour is not AINL's
+    /// (`1 + "s"` is `"1s"`, `1.0 / 0.0` is `Infinity`).
+    fn arith(&mut self, op: &str, args: &[Node]) -> Result<String> {
+        let helper = match op {
+            "+" => {
+                if args.is_empty() {
+                    return Ok("0".to_string());
+                }
+                "_add"
+            }
+            "*" => {
+                if args.is_empty() {
+                    return Ok("1".to_string());
+                }
+                "_mul"
+            }
+            "-" => {
+                if args.is_empty() {
+                    return Err(Error::runtime("- expects at least 1 argument"));
+                }
+                "_sub"
+            }
+            _ => {
+                if args.is_empty() {
+                    return Err(Error::runtime("/ expects at least 1 argument"));
+                }
+                "_div"
+            }
+        };
+        self.need("_ainl_tname");
+        self.need(helper);
+        let parts = self.expr_all(args)?;
+        Ok(format!("{helper}({})", parts.join(", ")))
+    }
+
+    /// `mod` needs its own helper: the zero-denominator check must precede the
+    /// `%`, and the message differs from `division by zero`.
+    fn infix_mod(&mut self, args: &[Node]) -> Result<String> {
+        let [a, b] = args else {
+            return Err(Error::runtime("'mod' expects 2 arguments"));
+        };
+        self.need("_ainl_tname");
+        self.need("_mod");
+        let (x, y) = (self.expr(a)?, self.expr(b)?);
+        Ok(format!("_mod({x}, {y})"))
     }
 
     fn expr_if(&mut self, args: &[Node]) -> Result<String> {
@@ -645,28 +835,120 @@ const RUNTIME: &[(&str, &str)] = &[
         "def _test(name, actual, expected)\n  raise RuntimeError, 'test expects a str name, got ' + _ainl_tname(name) unless name.is_a?(String)\n  raise RuntimeError, 'test expects a str expected value, got ' + _ainl_tname(expected) unless expected.is_a?(String)\n  got = _disp(actual)\n  return true if got == expected\n  raise RuntimeError, \"test failed: #{name}: expected #{expected}, got #{got}\"\nend",
     ),
     ("_str", "def _str(*xs)\n  xs.map { |x| _disp(x) }.join(\"\")\nend"),
-    ("_len", "def _len(x)\n  x.length\nend"),
-    ("_first", "def _first(x)\n  x[0]\nend"),
-    ("_rest", "def _rest(x)\n  x.drop(1)\nend"),
-    ("_nth", "def _nth(x, i)\n  (0 <= i && i < x.length) ? x[i] : nil\nend"),
-    ("_cons", "def _cons(h, t)\n  [h] + t\nend"),
-    ("_push", "def _push(t, *xs)\n  t + xs\nend"),
+    // Type guards shared by the list and hash builtins.
+    //
+    // These are the reason a `catch` sees the same message on Ruby as on the
+    // other four backends. Without them a wrong-typed operand raises a HOST
+    // error — `NoMethodError: undefined method 'length' for 5:Integer` — which
+    // is neither the interpreter's wording nor an `_AinlError`, so it would
+    // escape the rescue clause and kill the program. Each guard leads with the
+    // *builtin's* name, so the builtin passes its own name in rather than the
+    // guard hard-coding one.
+    (
+        "_alist",
+        "def _alist(who, x)\n  _error(who + ' expects list, got ' + _ainl_tname(x)) unless x.is_a?(Array) && !x.is_a?(AHash)\nend",
+    ),
+    (
+        "_ahash",
+        "def _ahash(who, x)\n  _error(who + ' expects a hash, got ' + _ainl_tname(x)) unless x.is_a?(AHash)\nend",
+    ),
+    (
+        // `len` accepts a list, a str or a hash in AINL, so it cannot be
+        // Ruby's own `length` — which would also accept a Hash/Range and would
+        // raise a host NoMethodError on an Integer.
+        "_len",
+        "def _len(x)\n  return x.length if x.is_a?(AHash) || x.is_a?(Array) || x.is_a?(String)\n  _error('len expects list, str, or hash, got ' + _ainl_tname(x))\nend",
+    ),
+    ("_first", "def _first(x)\n  _alist('first', x)\n  x[0]\nend"),
+    ("_rest", "def _rest(x)\n  _alist('rest', x)\n  x.drop(1)\nend"),
+    (
+        "_nth",
+        "def _nth(x, i)\n  _alist('nth', x)\n  (0 <= i && i < x.length) ? x[i] : nil\nend",
+    ),
+    ("_cons", "def _cons(h, t)\n  _alist('cons', t)\n  [h] + t\nend"),
+    ("_push", "def _push(t, *xs)\n  _alist('push', t)\n  t + xs\nend"),
     (
         "_hash",
         "def _hash(*kvs)\n  out = AHash.new\n  i = 0\n  while i < kvs.length\n    k, v = kvs[i], kvs[i + 1]\n    pair = out.find { |p| p[0] == k }\n    if pair\n      pair[1] = v\n    else\n      out << [k, v]\n    end\n    i += 2\n  end\n  out\nend",
     ),
     (
         "_get",
-        "def _get(h, k)\n  pair = h.find { |p| p[0] == k }\n  pair ? pair[1] : nil\nend",
+        "def _get(h, k)\n  _ahash('get', h)\n  pair = h.find { |p| p[0] == k }\n  pair ? pair[1] : nil\nend",
     ),
     (
         "_assoc",
-        "def _assoc(h, k, v)\n  out = AHash[*h.map { |p| p.dup }]\n  pair = out.find { |p| p[0] == k }\n  if pair\n    pair[1] = v\n  else\n    out << [k, v]\n  end\n  out\nend",
+        "def _assoc(h, k, v)\n  _ahash('assoc', h)\n  out = AHash[*h.map { |p| p.dup }]\n  pair = out.find { |p| p[0] == k }\n  if pair\n    pair[1] = v\n  else\n    out << [k, v]\n  end\n  out\nend",
     ),
-    ("_has", "def _has(h, k)\n  h.any? { |p| p[0] == k }\nend"),
-    ("_keys", "def _keys(h)\n  h.map { |p| p[0] }\nend"),
-    ("_vals", "def _vals(h)\n  h.map { |p| p[1] }\nend"),
-    ("_error", "def _error(*xs)\n  raise(xs.map { |x| _disp(x) }.join(\" \"))\nend"),
+    ("_has", "def _has(h, k)\n  _ahash('has', h)\n  h.any? { |p| p[0] == k }\nend"),
+    ("_keys", "def _keys(h)\n  _ahash('keys', h)\n  h.map { |p| p[0] }\nend"),
+    ("_vals", "def _vals(h)\n  _ahash('vals', h)\n  h.map { |p| p[1] }\nend"),
+    // ---- Tier 3 try/catch ----
+    // The error type a `catch` looks for. Every AINL-level failure raises
+    // THIS, not Ruby's `RuntimeError`, so `_ainl_try` can tell an AINL error
+    // (catchable) from a bug in the generated code (not catchable) and
+    // re-raise the latter. Declared BEFORE `_error` because the RUNTIME table
+    // is emitted in declaration order and `_error` names this class.
+    ("AinlError", "class AinlError < StandardError\nend"),
+    (
+        // Raises `AinlError`, the type `_ainl_try` rescues. A bare `raise`
+        // with a String would produce a `RuntimeError`, which the rescue clause
+        // would NOT catch — so an AINL error raised through this helper would
+        // pass straight through every `catch` in the program.
+        "_error",
+        "def _error(*xs)\n  raise(AinlError, xs.map { |x| _disp(x) }.join(\" \"))\nend",
+    ),
+    // Checked arithmetic.
+    //
+    // These exist because a `catch` binds the MESSAGE it sees, and Ruby's own
+    // behaviour is not AINL's. The two traps, both verified on the host:
+    //   * `/` does not raise on a zero denominator — `1.0 / 0.0` is
+    //     `Infinity` and `1 / 0` is `ZeroDivisionError` only for Integers.
+    //     AINL rejects both, so the zero test comes BEFORE the division.
+    //   * `+` does not reject a non-numeric operand: `1 + "s"` is `"1s"` and
+    //     `true + 1` is a TypeError with a different message. AINL rejects
+    //     both with `expected a number, got <t>`.
+    // `mod` is the same story, and the zero test must precede `%` too.
+    (
+        "_add",
+        "def _add(a, *rest)\n  _error('expected a number, got ' + _ainl_tname(a)) unless a.is_a?(Numeric)\n  rest.each { |x| _error('expected a number, got ' + _ainl_tname(x)) unless x.is_a?(Numeric) }\n  a + rest.inject(0) { |acc, x| acc + x }\nend",
+    ),
+    (
+        "_sub",
+        "def _sub(a, *rest)\n  _error('expected a number, got ' + _ainl_tname(a)) unless a.is_a?(Numeric)\n  rest.each { |x| _error('expected a number, got ' + _ainl_tname(x)) unless x.is_a?(Numeric) }\n  return -a if rest.empty?\n  a - rest.inject(0) { |acc, x| acc + x }\nend",
+    ),
+    (
+        "_mul",
+        "def _mul(a, *rest)\n  _error('expected a number, got ' + _ainl_tname(a)) unless a.is_a?(Numeric)\n  rest.each { |x| _error('expected a number, got ' + _ainl_tname(x)) unless x.is_a?(Numeric) }\n  rest.inject(a) { |acc, x| acc * x }\nend",
+    ),
+    (
+        "_div",
+        "def _div(a, *rest)\n  _error('expected a number, got ' + _ainl_tname(a)) unless a.is_a?(Numeric)\n  _error('division by zero') if a == 0\n  return (1.0 / a).to_f if rest.empty?\n  rest.each do |x|\n    _error('expected a number, got ' + _ainl_tname(x)) unless x.is_a?(Numeric)\n    _error('division by zero') if x == 0\n  end\n  (a.to_f / rest[0].to_f).to_f\nend",
+    ),
+    (
+        "_mod",
+        "def _mod(a, b)\n  _error('expected a number, got ' + _ainl_tname(a)) unless a.is_a?(Numeric)\n  _error('expected a number, got ' + _ainl_tname(b)) unless b.is_a?(Numeric)\n  _error('mod by zero') if b == 0\n  a % b\nend",
+    ),
+    (
+        // The value a `catch` binds: `{"message" <str>, "kind" "runtime"}`.
+        // Built here rather than by calling `_hash` so the key ORDER is fixed by
+        // construction — every backend prints a map in insertion order, and
+        // `message` before `kind` is what makes the caught value byte-identical
+        // across all five. `e.to_s` on a `AinlError` is exactly the message
+        // `_error` built, because `_error` passes it to `raise` as the whole
+        // string.
+        "_caught",
+        "def _caught(e)\n  AHash.new([['message', e.to_s], ['kind', 'runtime']])\nend",
+    ),
+    (
+        // The `try` itself. A dedicated helper (rather than an inline
+        // `begin`/`rescue`) is what lets statement position and expression
+        // position share one lowering: both are just a call with the two sides
+        // passed as lambdas. The `rescue AinlError` (not a bare `rescue`) is
+        // what keeps a Ruby-level bug in the generated code from being
+        // silently swallowed as if the AINL program had handled it.
+        "_ainl_try",
+        "def _ainl_try(body, handler)\n  begin\n    body.call\n  rescue AinlError => e\n    handler.call(_caught(e))\n  end\nend",
+    ),
     // ---- Stage 3.1 stdlib ----
     // Each helper pins the *interpreter's* rule where Ruby's own behavior would
     // differ, so all four backends agree:
@@ -681,17 +963,26 @@ const RUNTIME: &[(&str, &str)] = &[
     //     raising Math::DomainError with a different message.
     // `require` is lazy inside each helper so a program that only uses `trim`
     // loads nothing.
+    // The three file builtins convert a host failure into AINL's own message.
+    // Without the conversion a `catch` binds a HOST object: Ruby's would be
+    // `Errno::ENOENT`, Python's a `FileNotFoundError`, JS's a raw `ENOENT`
+    // `Error` — three different types and three different message bodies for
+    // the same missing file, which is exactly the 4-backend divergence this
+    // card has to rule out. `SystemCallError` is the common ancestor of the
+    // errno-backed ones (`Errno::ENOENT`, `Errno::EISDIR`, `Errno::EACCES`);
+    // `SystemStackError`/`NoMemoryError` are not file failures and must not be
+    // relabelled as one.
     (
         "_read_file",
-        "def _read_file(path)\n  raise TypeError, 'read-file expects a str path' unless path.is_a?(String)\n  File.read(path)\nend",
+        "def _read_file(path)\n  raise TypeError, 'read-file expects a str path' unless path.is_a?(String)\n  begin\n    File.read(path)\n  rescue Errno::EISDIR\n    _error(\"read-file: cannot read '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"read-file: cannot read '#{path}'\")\n  end\nend",
     ),
     (
         "_write_file",
-        "def _write_file(path, content)\n  raise TypeError, 'write-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'write-file expects str content' unless content.is_a?(String)\n  File.write(path, content)\nend",
+        "def _write_file(path, content)\n  raise TypeError, 'write-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'write-file expects str content' unless content.is_a?(String)\n  begin\n    File.write(path, content)\n  rescue Errno::EISDIR\n    _error(\"write-file: cannot write '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"write-file: cannot write '#{path}'\")\n  end\nend",
     ),
     (
         "_append_file",
-        "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  File.open(path, 'a') { |f| f.write(content) }\nend",
+        "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  begin\n    File.open(path, 'a') { |f| f.write(content) }\n  rescue Errno::EISDIR\n    _error(\"append-file: cannot append '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"append-file: cannot append '#{path}'\")\n  end\nend",
     ),
     // ---- Tier 1 file I/O ----
     // The path helpers implement AINL's own rules rather than delegating to

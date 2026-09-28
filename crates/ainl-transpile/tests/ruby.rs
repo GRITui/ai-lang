@@ -8,7 +8,10 @@ fn rb(src: &str) -> String {
 fn function_becomes_lambda() {
     let out = rb("(def sq (fn (x) (* x x)))");
     assert!(out.contains("sq = lambda do |x|"), "got:\n{out}");
-    assert!(out.contains("(x * x)"), "got:\n{out}");
+    // `*` goes through the checked `_mul` helper, not Ruby's bare `*`: a
+    // `catch` binds the message it sees, and Ruby's `1 * "s"` raises an
+    // `ArgumentError` with a message that is not AINL's.
+    assert!(out.contains("_mul(x, x)"), "got:\n{out}");
     assert!(out.contains("end"), "got:\n{out}");
 }
 
@@ -55,7 +58,12 @@ fn hash_builtins_dispatch_to_runtime_helpers() {
 
 #[test]
 fn hash_runtime_omitted_when_unused() {
+    // `_add` needs `_ainl_tname` to name a bad operand's type, and `_ainl_tname`
+    // branches on `is_a?(AHash)` — so a program that only does arithmetic now
+    // legitimately carries the class. What must still be omitted is the hash
+    // *constructor* and the hash *builtins*.
     let out = rb("(+ 1 2)");
-    assert!(!out.contains("AHash"), "got:\n{out}");
     assert!(!out.contains("def _hash("), "got:\n{out}");
+    assert!(!out.contains("def _get("), "got:\n{out}");
+    assert!(!out.contains("def _assoc("), "got:\n{out}");
 }

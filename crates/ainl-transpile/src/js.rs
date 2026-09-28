@@ -95,6 +95,80 @@ impl Js {
                 self.needed.insert("_isnum");
             }
         }
+        // `try`. `_ainl_try` needs `_AinlError` (to tell an AINL-level error from
+        // a JS bug) and `_caught` (which builds the hash and needs `_Hash`), and
+        // the RUNTIME table is emitted in declaration order, so `_Hash` must be
+        // pulled in too.
+        if self.needed.contains("_ainl_try") || self.needed.contains("_caught") {
+            self.needed.insert("_ainl_try");
+            self.needed.insert("_caught");
+            self.needed.insert("_AinlError");
+            self.needed.insert("_Hash");
+        }
+        // The list/hash/file builtins below all validate their arguments and raise
+        // AINL's own message instead of letting a host TypeError escape. `catch`
+        // binds that message, so a host one would be a cross-backend divergence on
+        // the error path. The builtin passes its own name in because AINL's wording
+        // leads with it (`first expects list, got int`).
+        //
+        // This pass runs BEFORE the `_error` -> `_AinlError` rule below, because
+        // it is what can insert `_error` in the first place: a program that only
+        // reaches `_error` indirectly (through a `(len x)` type guard, say) has
+        // no `error` form and no `try`, yet still generates a
+        // `throw new _AinlError(...)` from `_error`. Checking `_error` before
+        // this loop would miss it and the program would fail at RUN time with
+        // `ReferenceError: _AinlError is not defined` — on the error path, which
+        // is exactly the path `try` exists to exercise.
+        for n in [
+            "_add",
+            "_sub",
+            "_mul",
+            "_div",
+            "_mod",
+            "_alist",
+            "_ahash",
+            "_len",
+            "_first",
+            "_rest",
+            "_nth",
+            "_cons",
+            "_push",
+            "_get",
+            "_assoc",
+            "_has",
+            "_keys",
+            "_vals",
+            "_hash",
+            "_read_file",
+            "_write_file",
+            "_append_file",
+        ] {
+            if self.needed.contains(n) {
+                self.needed.insert("_error");
+                self.needed.insert("_ainl_tname");
+            }
+        }
+        // AINL-level `error` must throw the type `catch` looks for. Runs after
+        // the loop above, which is what can insert `_error` indirectly.
+        if self.needed.contains("_error") {
+            self.needed.insert("_AinlError");
+        }
+        // The list builtins guard through `_alist`, the hash ones through `_ahash`.
+        for n in ["_first", "_rest", "_cons", "_push"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_alist");
+            }
+        }
+        for n in ["_get", "_assoc", "_has", "_keys", "_vals"] {
+            if self.needed.contains(n) {
+                self.needed.insert("_ahash");
+            }
+        }
+        if self.needed.contains("_ainl_tname") {
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+            self.needed.insert("_disp");
+        }
         // Tier 1 file I/O: the three path builtins share one canonicalizer, and
         // `_ainl_tname` (used by `path-join`'s positional type error) branches
         // on _Hash and _Sym, so it must pull both in.
@@ -179,6 +253,7 @@ impl Js {
                     "let" => return self.stmt_let(&items[1..], ret),
                     "do" => return self.stmt_body(&items[1..], ret),
                     "if" => return self.stmt_if(&items[1..], ret),
+                    "try" => return self.stmt_try(&items[1..], ret),
                     _ => {}
                 }
             }
@@ -277,6 +352,61 @@ impl Js {
         self.stmt_body(body, ret)
     }
 
+    /// `(try body... (catch (e) handler...))` in statement position.
+    ///
+    /// Lowers to a native `try`/`catch` via an `_ainl_try(body, handler)` helper,
+    /// so statement and expression position share one lowering. Each side is an
+    /// arrow function, which is what makes the body a real scope: JS `var` is
+    /// function-scoped, so without the closure a `def` in the body would be
+    /// visible to the handler — the opposite of what the other four backends do,
+    /// and the reason a handler could read a half-initialised value out of the
+    /// body that failed.
+    fn stmt_try(&mut self, args: &[Node], ret: bool) -> Result<()> {
+        let f = ainl_core::eval::parse_try(args)?;
+        self.need("_ainl_try");
+        self.need("_AinlError");
+        self.need("_caught");
+        // One shared pair of names, re-bound by every `try`. Safe because each
+        // is defined and immediately called, with nothing in between that could
+        // rebind them — even inside a loop.
+        self.line("var _ainl_body = () => {");
+        self.indent += 1;
+        self.emit_side(f.body)?;
+        self.indent -= 1;
+        self.line("};");
+        self.line(&format!(
+            "var _ainl_hand = ({e}) => {{",
+            e = sanitize(f.param)
+        ));
+        self.indent += 1;
+        self.emit_side(f.handler)?;
+        self.indent -= 1;
+        self.line("};");
+        self.line("var _ainl_v = _ainl_try(_ainl_body, _ainl_hand);");
+        if ret {
+            self.line("return _ainl_v;");
+        }
+        Ok(())
+    }
+
+    /// Emit `forms` as a function body whose value is the last form's, returned.
+    fn emit_side(&mut self, forms: &[Node]) -> Result<()> {
+        if forms.is_empty() {
+            self.line("return null;");
+            return Ok(());
+        }
+        let last = forms.len() - 1;
+        for (i, f) in forms.iter().enumerate() {
+            if i == last {
+                let e = self.expr(f)?;
+                self.line(&format!("return {e};"));
+            } else {
+                self.stmt(f, false)?;
+            }
+        }
+        Ok(())
+    }
+
     fn stmt_if(&mut self, args: &[Node], ret: bool) -> Result<()> {
         match args {
             [cond, then] => {
@@ -320,10 +450,10 @@ impl Js {
         let args = &items[1..];
         if let Node::Sym(op, _) = head {
             match op.as_str() {
-                "+" => return shared::infix(self, args, "+", "0"),
-                "*" => return shared::infix(self, args, "*", "1"),
-                "-" => return shared::infix_sub(self, args),
-                "/" => return self.infix_div(args),
+                "+" => return self.arith("+", args),
+                "*" => return self.arith("*", args),
+                "-" => return self.arith("-", args),
+                "/" => return self.arith("/", args),
                 "=" => return self.eq_chain(args),
                 "<" => return shared::cmp(self, args, "<"),
                 ">" => return shared::cmp(self, args, ">"),
@@ -332,10 +462,20 @@ impl Js {
                 "and" => return shared::infix(self, args, "&&", "true"),
                 "or" => return shared::infix(self, args, "||", "false"),
                 "not" => return shared::unary(self, args, "!"),
-                "mod" => return shared::binary(self, args, "%"),
+                "mod" => {
+                    let [a, b] = args else {
+                        return Err(Error::runtime("'mod' expects 2 arguments"));
+                    };
+                    self.need("_isnum");
+                    self.need("_ainl_tname");
+                    self.need("_mod");
+                    let (x, y) = (self.expr(a)?, self.expr(b)?);
+                    return Ok(format!("_mod({x}, {y})"));
+                }
                 "if" => return self.expr_if(args),
                 "let" => return self.expr_let(args, span),
                 "do" => return self.expr_do(args, span),
+                "try" => return self.expr_try(args, span),
                 "quote" => return self.expr_quote(args),
                 "fn" => return self.expr_fn(args, span),
                 "list" => {
@@ -437,13 +577,47 @@ impl Js {
         Ok(format!("{name}({})", self.expr_all(args)?.join(", ")))
     }
 
-    fn infix_div(&mut self, args: &[Node]) -> Result<String> {
+    /// `+ - * /` route through the checked `_add`/`_sub`/`_mul`/`_div` helpers
+    /// rather than JS's operators.
+    ///
+    /// The reason is error parity, not speed: JS coerces (`1 + "s"` is `"1s"`,
+    /// `1/0` is `Infinity`) instead of erroring, and `catch` cannot bind a
+    /// message from an expression that never failed. The helper raises AINL's
+    /// own message so the caught value matches on all five backends. The 0-arg
+    /// and 1-arg cases keep the existing identities so the non-error path is
+    /// unchanged.
+    fn arith(&mut self, op: &str, args: &[Node]) -> Result<String> {
+        let helper = match op {
+            "+" => {
+                if args.is_empty() {
+                    return Ok("0".to_string());
+                }
+                "_add"
+            }
+            "*" => {
+                if args.is_empty() {
+                    return Ok("1".to_string());
+                }
+                "_mul"
+            }
+            "-" => {
+                if args.is_empty() {
+                    return Err(Error::runtime("- expects at least 1 argument"));
+                }
+                "_sub"
+            }
+            _ => {
+                if args.is_empty() {
+                    return Err(Error::runtime("/ expects at least 1 argument"));
+                }
+                "_div"
+            }
+        };
+        self.need("_isnum");
+        self.need("_ainl_tname");
+        self.need(helper);
         let parts = self.expr_all(args)?;
-        match parts.len() {
-            0 => Err(Error::runtime("/ expects at least 1 argument")),
-            1 => Ok(format!("(1 / {})", parts[0])),
-            _ => Ok(format!("({})", parts.join(" / "))),
-        }
+        Ok(format!("{helper}({})", parts.join(", ")))
     }
 
     /// `=` needs structural equality (AINL lists compare element-wise, and a
@@ -476,6 +650,41 @@ impl Js {
             None => "null".to_string(),
         };
         Ok(format!("({c} ? {t} : {e})"))
+    }
+
+    /// `try` in expression position — `(def status (try … (catch (e) …)))` is
+    /// the most natural form of all, so it is not refused.
+    ///
+    /// A JS expression cannot contain statements, so this needs an IIFE: the
+    /// whole `try` becomes a call to a nullary arrow that in turn calls
+    /// `_ainl_try` with the two sides. That keeps the sides as closures (so the
+    /// body's `def`s stay local) *and* closing over the enclosing function's
+    /// locals. The same limit `let` has applies: a side longer than one form is
+    /// a statement sequence and cannot be an expression.
+    fn expr_try(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
+        let f = ainl_core::eval::parse_try(args)?;
+        if f.body.len() > 1 {
+            return Err(self.no_expr("multi-statement try body", span));
+        }
+        if f.handler.len() > 1 {
+            return Err(self.no_expr("multi-statement try handler", span));
+        }
+        self.need("_ainl_try");
+        self.need("_AinlError");
+        self.need("_caught");
+        let body = match f.body.first() {
+            Some(n) => self.expr(n)?,
+            // An empty body is nil, the same as `(do)`.
+            None => "null".to_string(),
+        };
+        let handler = match f.handler.first() {
+            Some(n) => self.expr(n)?,
+            None => "null".to_string(),
+        };
+        Ok(format!(
+            "(() => _ainl_try(() => {body}, ({e}) => {handler}))()",
+            e = sanitize(f.param)
+        ))
     }
 
     fn expr_let(&mut self, args: &[Node], span: ainl_core::Span) -> Result<String> {
@@ -695,23 +904,28 @@ const RUNTIME: &[(&str, &str)] = &[
         "function _test(name, actual, expected) {\n  if (typeof name !== \"string\") throw new Error(\"test expects a str name, got \" + _typename(name));\n  if (typeof expected !== \"string\") throw new Error(\"test expects a str expected value, got \" + _typename(expected));\n  const got = _disp(actual);\n  if (got === expected) return true;\n  throw new Error(\"test failed: \" + name + \": expected \" + expected + \", got \" + got);\n}",
     ),
     ("_str", "function _str(...xs) { return xs.map(_disp).join(\"\"); }"),
-    ("_len", "function _len(x) { return x.length; }"),
-    ("_first", "function _first(x) { return x.length ? x[0] : null; }"),
-    ("_rest", "function _rest(x) { return x.slice(1); }"),
-    ("_nth", "function _nth(x, i) { return (0 <= i && i < x.length) ? x[i] : null; }"),
-    ("_cons", "function _cons(h, t) { return [h].concat(t); }"),
-    ("_push", "function _push(t, ...xs) { return t.concat(xs); }"),
+    (
+        // `len` accepts a list, a str or a hash in AINL. JS `.length` also
+        // works on a function, which AINL would reject, so the check is explicit.
+        "_len",
+        "function _len(...a) { if (a.length !== 1) _error(\"len expects (len x)\"); const x = a[0]; if (x instanceof _Hash || Array.isArray(x) || typeof x === \"string\") return x.length; _error(\"len expects list, str, or hash, got \" + _ainl_tname(x)); }",
+    ),
+    ("_first", "function _first(...a) { if (a.length !== 1) _error(\"first expects (first list)\"); _alist(\"first\", a[0]); return a[0].length ? a[0][0] : null; }"),
+    ("_rest", "function _rest(...a) { if (a.length !== 1) _error(\"rest expects (rest list)\"); _alist(\"rest\", a[0]); return a[0].slice(1); }"),
+    ("_nth", "function _nth(...a) { if (a.length !== 2) _error(\"nth expects (nth list int)\"); if (!Array.isArray(a[0]) || a[0] instanceof _Hash) _error(\"nth expects (nth list int)\"); return (0 <= a[1] && a[1] < a[0].length) ? a[0][a[1]] : null; }"),
+    ("_cons", "function _cons(...a) { if (a.length !== 2) _error(\"cons expects (cons value list)\"); _alist(\"cons\", a[1]); return [a[0]].concat(a[1]); }"),
+    ("_push", "function _push(...a) { if (a.length < 2) _error(\"push expects (push list value...)\"); _alist(\"push\", a[0]); return a[0].concat(a.slice(1)); }"),
     (
         "_hash",
-        "function _hash(...kvs) {\n  const out = new _Hash();\n  for (let i = 0; i < kvs.length; i += 2) {\n    const k = kvs[i], v = kvs[i + 1];\n    const pair = out.find(p => _eq(p[0], k));\n    if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  }\n  return out;\n}",
+        "function _hash(...kvs) {\n  if (kvs.length % 2 !== 0) _error(\"hash expects an even number of key/value arguments, got \" + kvs.length);\n  const out = new _Hash();\n  for (let i = 0; i < kvs.length; i += 2) {\n    const k = kvs[i], v = kvs[i + 1];\n    const pair = out.find(p => _eq(p[0], k));\n    if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  }\n  return out;\n}",
     ),
     (
         "_get",
-        "function _get(h, k) {\n  const pair = h.find(p => _eq(p[0], k));\n  return pair ? pair[1] : null;\n}",
+        "function _get(h, k) {\n  _ahash(\"get\", h);\n  const pair = h.find(p => _eq(p[0], k));\nreturn pair ? pair[1] : null;\n}",
     ),
     (
         "_assoc",
-        "function _assoc(h, k, v) {\n  const out = _Hash.from(h, p => p.slice());\n  const pair = out.find(p => _eq(p[0], k));\n  if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  return out;\n}",
+        "function _assoc(h, k, v) {\n  _ahash(\"assoc\", h);\n  const out = _Hash.from(h, p => p.slice());\n  const pair = out.find(p => _eq(p[0], k));\n  if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  return out;\n}",
     ),
     (
         "_has",
@@ -721,7 +935,88 @@ const RUNTIME: &[(&str, &str)] = &[
     // keys/vals return plain lists, not hashes.
     ("_keys", "function _keys(h) { return Array.from(h, p => p[0]); }"),
     ("_vals", "function _vals(h) { return Array.from(h, p => p[1]); }"),
-    ("_error", "function _error(...xs) { throw new Error(xs.map(_disp).join(\" \")); }"),
+    (
+        // AINL-level errors get their own class rather than a bare `Error`.
+        // `catch` binds the message it sees, and a dedicated type also keeps a
+        // `catch` from swallowing a genuine JS bug in the generated code (a
+        // TypeError from a mistake in *this* transpiler is not an AINL-level
+        // error and should propagate).
+        "_AinlError",
+        "class _AinlError extends Error {}",
+    ),
+    ("_error", "function _error(...xs) { throw new _AinlError(xs.map(_disp).join(\" \")); }"),
+    (
+        // The value a `catch` binds: `{"message" <str>, "kind" "runtime"}`.
+        // Built here rather than by calling `_hash` so the key ORDER is fixed by
+        // construction — every backend prints a map in insertion order, and
+        // `message` before `kind` is what makes the caught value byte-identical
+        // across all five.
+        //
+        // `_Hash.from(pairs)`, NOT `new _Hash(pairs)`: `_Hash extends Array`, and
+        // the `Array` constructor given a single non-numeric argument produces an
+        // array HOLDING that argument — `new Array(pairs)` is `[pairs]`, not
+        // `pairs`. So `new _Hash(pairs)` built a ONE-element hash whose only
+        // "pair" was the whole pairs array, every `(get e "message")` missed, and
+        // a program that caught ten errors printed ten `nil`. `_Hash.from` is the
+        // flattening call this file's own `_assoc`/`_keys` already use.
+        "_caught",
+        "function _caught(e) { return _Hash.from([[\"message\", String(e.message)], [\"kind\", \"runtime\"]]); }",
+    ),
+    (
+        // The `try` itself. A dedicated helper (rather than an inline
+        // `try {`) is what lets statement position and expression position share
+        // one lowering: both are just a call with the two sides as arrows.
+        "_ainl_try",
+        "function _ainl_try(body, handler) {\n  try { return body(); }\n  catch (e) { if (!(e instanceof _AinlError)) throw e; return handler(_caught(e)); }\n}",
+    ),
+    (
+        // Checked arithmetic.
+        //
+        // These exist because a `catch` binds the MESSAGE it sees, and JS's own
+        // behaviour is not AINL's: `1/0` is `Infinity` (no throw at all),
+        // `1 + "s"` is `"1s"` (silent coercion), and `[] + 1` is `"1"`. Before
+        // `catch` that difference was invisible — the program just produced a
+        // wrong value. The moment it became catchable it was a 5-backend
+        // divergence on the error path, so the arithmetic is re-checked here and
+        // AINL's own message raised.
+        //
+        // `_isnum` is `typeof x === "number"`, which already excludes booleans
+        // (JS has no separate bool type) — so `(true + 1)` correctly reports
+        // `got bool`, matching the other backends.
+        "_add",
+        "function _add(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return xs.reduce((a, b) => a + b, 0); }",
+    ),
+    (
+        "_mul",
+        "function _mul(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return xs.reduce((a, b) => a * b, 1); }",
+    ),
+    (
+        "_sub",
+        "function _sub(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) return -a; for (const x of rest) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return rest.reduce((r, x) => r - x, a); }",
+    ),
+    (
+        // The zero check is the whole point here: JS returns `Infinity` for
+        // `1/0` rather than throwing, so without it `(/ 1 0)` would silently
+        // succeed on JS and fail on the other four.
+        "_div",
+        "function _div(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) { if (a === 0) _error(\"division by zero\"); return 1 / a; } for (const x of rest) { if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); if (x === 0) _error(\"division by zero\"); } return rest.reduce((r, x) => r / x, a); }",
+    ),
+    (
+        "_mod",
+        "function _mod(a, b) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (!_isnum(b)) _error(\"expected a number, got \" + _ainl_tname(b)); if (b === 0) _error(\"mod by zero\"); return a % b; }",
+    ),
+    (
+        // Type guards for the list and hash builtins. Same reason as the
+        // arithmetic helpers: a host TypeError's text is not AINL's, and a
+        // `catch` would bind it. The builtin passes its own name in because
+        // AINL's wording leads with it (`first expects list, got int`).
+        "_alist",
+        "function _alist(who, x) { if (!Array.isArray(x) || x instanceof _Hash) _error(who + \" expects list, got \" + _ainl_tname(x)); }",
+    ),
+    (
+        "_ahash",
+        "function _ahash(who, x) { if (!(x instanceof _Hash)) _error(who + \" expects a hash, got \" + _ainl_tname(x)); }",
+    ),
     // ---- Stage 3.1 stdlib ----
     // JS's own behavior diverges from the interpreter's in ways that matter
     // here, so each helper pins the interpreter's rule:
@@ -736,17 +1031,24 @@ const RUNTIME: &[(&str, &str)] = &[
     // The `require` calls are lazy inside the helpers so a program that only
     // uses, say, `trim` never loads fs.
     ("_isnum", "function _isnum(x) { return typeof x === \"number\"; }"),
+    // The three file builtins below raise AINL's own message rather than
+    // letting node's exception escape. That matters because `catch` binds the
+    // message it sees, and a host message differs per target: node would give
+    // `ENOENT: no such file or directory, open 'x.txt'`, Python
+    // `FileNotFoundError: [Errno 2] ...`, Ruby `Errno::ENOENT`. The C runtime
+    // and the interpreter both say `read-file: cannot read 'x.txt'`, so that is
+    // what all five must say — a `catch` comparing messages is then portable.
     (
         "_read_file",
-        "function _read_file(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"read-file expects a str path\");\n  return require(\"fs\").readFileSync(path, \"utf8\");\n}",
+        "function _read_file(path) {\n  if (typeof path !== \"string\") _error(\"read-file expects a str path, got \" + _ainl_tname(path));\n  try { return require(\"fs\").readFileSync(path, \"utf8\"); }\n  catch (e) {\n    if (e && e.code === \"EISDIR\") _error(\"read-file: cannot read '\" + path + \"': it is a directory\");\n    _error(\"read-file: cannot read '\" + path + \"'\");\n  }\n}",
     ),
     (
         "_write_file",
-        "function _write_file(path, content) {\n  if (typeof path !== \"string\") throw new TypeError(\"write-file expects a str path\");\n  if (typeof content !== \"string\") throw new TypeError(\"write-file expects str content\");\n  require(\"fs\").writeFileSync(path, content);\n}",
+        "function _write_file(path, content) {\n  if (typeof path !== \"string\") _error(\"write-file expects a str path, got \" + _ainl_tname(path));\n  if (typeof content !== \"string\") _error(\"write-file expects str content, got \" + _ainl_tname(content));\n  try { require(\"fs\").writeFileSync(path, content); }\n  catch (e) {\n    if (e && e.code === \"EISDIR\") _error(\"write-file: cannot write '\" + path + \"': it is a directory\");\n    _error(\"write-file: cannot write '\" + path + \"'\");\n  }\n}",
     ),
     (
         "_append_file",
-        "function _append_file(path, content) {\n  if (typeof path !== \"string\") throw new TypeError(\"append-file expects a str path\");\n  if (typeof content !== \"string\") throw new TypeError(\"append-file expects str content\");\n  require(\"fs\").appendFileSync(path, content);\n}",
+        "function _append_file(path, content) {\n  if (typeof path !== \"string\") _error(\"append-file expects a str path, got \" + _ainl_tname(path));\n  if (typeof content !== \"string\") _error(\"append-file expects str content, got \" + _ainl_tname(content));\n  try { require(\"fs\").appendFileSync(path, content); }\n  catch (e) {\n    if (e && e.code === \"EISDIR\") _error(\"append-file: cannot append '\" + path + \"': it is a directory\");\n    _error(\"append-file: cannot append '\" + path + \"'\");\n  }\n}",
     ),
     // ---- Tier 1 file I/O ----
     // The path helpers implement AINL's own rules rather than delegating to
