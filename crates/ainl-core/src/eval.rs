@@ -542,6 +542,456 @@ fn install_prelude(env: &Env) {
             .collect::<Vec<_>>()
             .join(" ")
     )));
+
+    // ---- stdlib (Stage 3.1) -----------------------------------------------
+    //
+    // Every builtin here has a byte-for-byte twin in the AOT C runtime
+    // (crates/ainl-cc/src/runtime.c) and a per-target mapping in all three
+    // transpilers. Two deliberate design rules keep the four backends
+    // provably identical rather than merely similar:
+    //
+    // * ASCII-only case folding and whitespace trimming. The C runtime has no
+    //   locale-independent `toupper` guarantee and Python/JS/Ruby each strip a
+    //   *different* Unicode whitespace set, so `upcase`/`downcase`/`trim`
+    //   operate on this explicit ASCII set in all four. See `is_ascii_ws`.
+    // * No backend is allowed to invent a value where another errors. So the
+    //   cases the three host languages disagree on — an empty `split`
+    //   separator, an empty `replace` target, a negative `sqrt`/`sleep` — are
+    //   *rejected* with one shared message instead of returning a
+    //   backend-specific result.
+    install_stdlib(env);
+}
+
+/// Bind the Stage 3.1 standard library (file I/O, strings, env/process, time,
+/// math) into `env`. Split out of [`install_prelude`] so the prelude's original
+/// 27 core builtins stay readable as one block.
+fn install_stdlib(env: &Env) {
+    macro_rules! b {
+        ($name:literal, $f:expr) => {
+            env.define($name, Value::Builtin { name: $name, f: $f });
+        };
+    }
+
+    // file I/O
+    b!("read-file", builtin_read_file);
+    b!("write-file", builtin_write_file);
+    b!("append-file", builtin_append_file);
+
+    // strings
+    b!("split", builtin_split);
+    b!("join", builtin_join);
+    b!("trim", builtin_trim);
+    b!("replace", builtin_replace);
+    b!("upcase", |a| builtin_case(a, true));
+    b!("downcase", |a| builtin_case(a, false));
+    b!("contains", builtin_contains);
+
+    // env / process
+    b!("env-get", builtin_env_get);
+    b!("exit", builtin_exit);
+
+    // time
+    b!("now", builtin_now);
+    b!("sleep", builtin_sleep);
+
+    // math
+    b!("abs", builtin_abs);
+    b!("min", |a| builtin_minmax(a, false));
+    b!("max", |a| builtin_minmax(a, true));
+    b!("floor", builtin_floor);
+    b!("sqrt", builtin_sqrt);
+}
+
+// ---- stdlib: shared argument coercion --------------------------------------
+
+/// The characters `trim` strips: ASCII space, tab, LF, CR, FF, VT.
+///
+/// Deliberately *not* `char::is_whitespace` (which also accepts U+00A0, U+2028,
+/// …) and deliberately locale-independent in C. Ruby/JS/Python each strip a
+/// different Unicode set, so pinning the interpreter to ASCII is what lets the
+/// three transpiler targets match it exactly. The transpilers use the same
+/// six-character class.
+fn is_ascii_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B')
+}
+
+fn as_str_arg<'a>(v: &'a Value, who: &str) -> Result<&'a str> {
+    match v {
+        Value::Str(s) => Ok(s),
+        other => Err(Error::runtime(format!(
+            "{who} expects a str, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(read-file path)` / `(write-file path content)` / … — the path operand,
+/// with the "a str path" wording the file builtins share.
+fn as_path_arg<'a>(v: &'a Value, who: &str) -> Result<&'a str> {
+    match v {
+        Value::Str(s) => Ok(s),
+        other => Err(Error::runtime(format!(
+            "{who} expects a str path, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The content operand of the two writing file builtins.
+fn as_content_arg<'a>(v: &'a Value, who: &str) -> Result<&'a str> {
+    match v {
+        Value::Str(s) => Ok(s),
+        other => Err(Error::runtime(format!(
+            "{who} expects str content, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The numeric operand of the stdlib math builtins, reported under the builtin's
+/// own name (`"sqrt expects a number, got str"`) rather than `as_f64`'s generic
+/// wording — a new builtin should name itself in its own error.
+fn as_num_arg(v: &Value, who: &str) -> Result<f64> {
+    match v {
+        Value::Int(i) => Ok(*i as f64),
+        Value::Float(x) => Ok(*x),
+        other => Err(Error::runtime(format!(
+            "{who} expects a number, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+// ---- stdlib: file I/O ------------------------------------------------------
+
+/// `(read-file path)` → the file's contents as one string.
+///
+/// A missing or unreadable file is a runtime error, not a nil result: a script
+/// that silently reads "" from a typo'd path is the classic way to waste an
+/// afternoon. The C runtime raises the same message, and the transpiler targets
+/// raise their host's own file exception (documented in docs/SYNTAX.md §3).
+fn builtin_read_file(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("read-file expects (read-file path)"));
+    };
+    let path = as_path_arg(p, "read-file")?;
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Value::str(s)),
+        Err(_) => Err(Error::runtime(format!("read-file: cannot read '{path}'"))),
+    }
+}
+
+/// `(write-file path content)` / `(append-file path content)` → `nil`.
+///
+/// One implementation for both: the only difference is the `OpenOptions` mode
+/// and the verb the error message uses.
+fn write_file_inner(args: &[Value], who: &str, verb: &str, append: bool) -> Result<Value> {
+    let [p, c] = args else {
+        return Err(Error::runtime(format!(
+            "{who} expects ({who} path content)"
+        )));
+    };
+    let path = as_path_arg(p, who)?;
+    let content = as_content_arg(c, who)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    match opts.open(path) {
+        Err(_) => Err(Error::runtime(format!("{who}: cannot {verb} '{path}'"))),
+        Ok(mut f) => match std::io::Write::write_all(&mut f, content.as_bytes()) {
+            Err(_) => Err(Error::runtime(format!("{who}: cannot {verb} '{path}'"))),
+            Ok(()) => Ok(Value::Nil),
+        },
+    }
+}
+
+fn builtin_write_file(args: &[Value]) -> Result<Value> {
+    write_file_inner(args, "write-file", "write", false)
+}
+
+fn builtin_append_file(args: &[Value]) -> Result<Value> {
+    write_file_inner(args, "append-file", "append to", true)
+}
+
+// ---- stdlib: strings -------------------------------------------------------
+
+/// `(split str separator)` → list of strings.
+///
+/// An empty separator is rejected rather than defined: Python raises, JS splits
+/// into characters, and Ruby raises — three answers for one call. Erroring is
+/// the only choice the four backends can share.
+fn builtin_split(args: &[Value]) -> Result<Value> {
+    let [s, sep] = args else {
+        return Err(Error::runtime("split expects (split str separator)"));
+    };
+    let s = as_str_arg(s, "split")?;
+    let sep = as_str_arg(sep, "split")?;
+    if sep.is_empty() {
+        return Err(Error::runtime("split expects a non-empty separator"));
+    }
+    let parts: Vec<Value> = s.split(sep).map(Value::str).collect();
+    Ok(Value::List(ConsCell::from_values(parts)))
+}
+
+/// `(join list separator)` → the elements concatenated, `separator` between
+/// each pair. Every element must be a string, again so that a non-string
+/// element is a defined error instead of JS's silent `"1,2"` coercion.
+fn builtin_join(args: &[Value]) -> Result<Value> {
+    let [lst, sep] = args else {
+        return Err(Error::runtime("join expects (join list separator)"));
+    };
+    let Value::List(l) = lst else {
+        return Err(Error::runtime(format!(
+            "join expects a list, got {}",
+            lst.type_name()
+        )));
+    };
+    let sep = match sep {
+        Value::Str(s) => s,
+        other => {
+            return Err(Error::runtime(format!(
+                "join expects a str separator, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let mut out = String::new();
+    let mut cur = l;
+    let mut first = true;
+    while let Some(h) = cur.first() {
+        let Value::Str(s) = h else {
+            return Err(Error::runtime("join expects a list of str"));
+        };
+        if !first {
+            out.push_str(sep);
+        }
+        first = false;
+        out.push_str(s);
+        match cur.rest() {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    Ok(Value::str(out))
+}
+
+/// `(trim str)` — strip leading and trailing ASCII whitespace (see
+/// [`is_ascii_ws`]).
+fn builtin_trim(args: &[Value]) -> Result<Value> {
+    let [s] = args else {
+        return Err(Error::runtime("trim expects (trim str)"));
+    };
+    let s = as_str_arg(s, "trim")?;
+    Ok(Value::str(s.trim_matches(is_ascii_ws)))
+}
+
+/// `(replace str old new)` — every non-overlapping occurrence of `old`.
+///
+/// An empty `old` is rejected: Python inserts at every position, JS and Ruby
+/// return the string unchanged, and the C runtime would need its own choice.
+/// The four backends agree by refusing.
+fn builtin_replace(args: &[Value]) -> Result<Value> {
+    let [s, old, new] = args else {
+        return Err(Error::runtime("replace expects (replace str old new)"));
+    };
+    let s = as_str_arg(s, "replace")?;
+    let old = as_str_arg(old, "replace")?;
+    let new = as_str_arg(new, "replace")?;
+    if old.is_empty() {
+        return Err(Error::runtime("replace expects a non-empty target"));
+    }
+    Ok(Value::str(s.replace(old, new)))
+}
+
+/// `(upcase str)` / `(downcase str)` — ASCII case folding only (see
+/// [`is_ascii_ws`] for why).
+fn builtin_case(args: &[Value], up: bool) -> Result<Value> {
+    let who = if up { "upcase" } else { "downcase" };
+    let [s] = args else {
+        return Err(Error::runtime(format!("{who} expects ({who} str)")));
+    };
+    let s = as_str_arg(s, who)?;
+    Ok(Value::str(if up {
+        s.to_ascii_uppercase()
+    } else {
+        s.to_ascii_lowercase()
+    }))
+}
+
+/// `(contains haystack needle)` → bool. An empty needle is `true`, matching
+/// every host language.
+fn builtin_contains(args: &[Value]) -> Result<Value> {
+    let [hay, needle] = args else {
+        return Err(Error::runtime("contains expects (contains str sub)"));
+    };
+    let hay = as_str_arg(hay, "contains")?;
+    let needle = as_str_arg(needle, "contains")?;
+    Ok(Value::Bool(hay.contains(needle)))
+}
+
+// ---- stdlib: env / process -------------------------------------------------
+
+/// `(env-get name)` → the variable's value, or `nil` when unset. `nil` (rather
+/// than an error) is what makes `(if (env-get "X") ...)` usable.
+fn builtin_env_get(args: &[Value]) -> Result<Value> {
+    let [name] = args else {
+        return Err(Error::runtime("env-get expects (env-get name)"));
+    };
+    let name = as_str_arg(name, "env-get")?;
+    Ok(match std::env::var(name) {
+        Ok(v) => Value::str(v),
+        Err(_) => Value::Nil,
+    })
+}
+
+/// `(exit code)` — terminate the process with `code`. Does not return.
+///
+/// Not callable from a library context (it ends the process), so it is tested
+/// through a subprocess rather than in-process. stdout is flushed first:
+/// `process::exit` skips destructors, and while Rust's `Stdout` is a
+/// `LineWriter` (so whole lines are already out), an explicit flush keeps the
+/// guarantee local to this function instead of resting on that detail.
+fn builtin_exit(args: &[Value]) -> Result<Value> {
+    let [code] = args else {
+        return Err(Error::runtime("exit expects (exit code)"));
+    };
+    let Value::Int(i) = code else {
+        return Err(Error::runtime(format!(
+            "exit expects an int, got {}",
+            code.type_name()
+        )));
+    };
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(*i as i32);
+}
+
+// ---- stdlib: time ----------------------------------------------------------
+
+/// `(now)` → whole seconds since the Unix epoch.
+///
+/// Seconds (not milliseconds) keeps the value inside AINL's i64 range for the
+/// next ~292 billion years, and matches what the three target runtimes' own
+/// idioms return.
+fn builtin_now(args: &[Value]) -> Result<Value> {
+    if !args.is_empty() {
+        return Err(Error::runtime("now expects (now)"));
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(Value::Int(secs))
+}
+
+/// `(sleep seconds)` → `nil`. Negative and NaN are rejected so all four
+/// backends agree (Python raises on negative, JS ignores it, Ruby raises).
+fn builtin_sleep(args: &[Value]) -> Result<Value> {
+    let [s] = args else {
+        return Err(Error::runtime("sleep expects (sleep seconds)"));
+    };
+    let secs = as_num_arg(s, "sleep")?;
+    // NaN is rejected too: it is neither >= 0 nor < 0, and a "sleep that never
+    // sleeps" is exactly the silent-wrong-answer case this check prevents.
+    if secs.is_nan() || secs < 0.0 {
+        return Err(Error::runtime("sleep expects a non-negative number"));
+    }
+    if secs > 0.0 {
+        use std::thread::sleep;
+        use std::time::Duration;
+        // Cap each nap at a year so an absurdly large request (reachable as
+        // `(sleep 1e300)`) still sleeps instead of overflowing Duration's
+        // ~584-year ceiling, and so the loop always makes progress.
+        const MAX_NAP: f64 = 31_536_000.0;
+        let mut left = secs;
+        while left > 0.0 {
+            let chunk = if left > MAX_NAP { MAX_NAP } else { left };
+            if let Ok(d) = Duration::try_from_secs_f64(chunk) {
+                sleep(d);
+            }
+            left -= chunk;
+        }
+    }
+    Ok(Value::Nil)
+}
+
+// ---- stdlib: math ----------------------------------------------------------
+
+/// `(abs n)` — integer-preserving, promoting to float only where i64 cannot
+/// represent the answer (`abs` of i64::MIN), exactly like unary `-`.
+fn builtin_abs(args: &[Value]) -> Result<Value> {
+    let [n] = args else {
+        return Err(Error::runtime("abs expects (abs n)"));
+    };
+    match n {
+        Value::Int(i) => match i.checked_abs() {
+            Some(r) => Ok(Value::Int(r)),
+            None => Ok(Value::Float((*i as f64).abs())),
+        },
+        Value::Float(x) => Ok(Value::Float(x.abs())),
+        other => Err(Error::runtime(format!(
+            "abs expects a number, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(min a b ...)` / `(max a b ...)` — variadic, at least one argument, folding
+/// pairwise. Ties keep the *first* of the equal values (the `<`/`>` comparison
+/// is strict), which is what `min`/`max` do in Python, Ruby and `Math.min`/
+/// `Math.max` too.
+fn builtin_minmax(args: &[Value], max: bool) -> Result<Value> {
+    let who = if max { "max" } else { "min" };
+    let Some(first) = args.first() else {
+        return Err(Error::runtime(format!("{who} expects at least 1 argument")));
+    };
+    let mut best = first.clone();
+    let mut b = as_num_arg(&best, who)?;
+    for v in &args[1..] {
+        let x = as_num_arg(v, who)?;
+        if if max { x > b } else { x < b } {
+            best = v.clone();
+            b = x;
+        }
+    }
+    Ok(best)
+}
+
+/// `(floor n)` → an int, like Python's `math.floor` and Ruby's `Float#floor`.
+/// An int argument is returned unchanged (no float round-trip, so no precision
+/// surprise on large i64s). A float that floors outside i64 range stays a float.
+fn builtin_floor(args: &[Value]) -> Result<Value> {
+    let [n] = args else {
+        return Err(Error::runtime("floor expects (floor n)"));
+    };
+    if let Value::Int(i) = n {
+        return Ok(Value::Int(*i));
+    }
+    let x = as_num_arg(n, "floor")?;
+    let f = x.floor();
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
+        Ok(Value::Int(f as i64))
+    } else {
+        Ok(Value::Float(f))
+    }
+}
+
+/// `(sqrt n)` → a float, always. A negative argument is an error rather than
+/// the NaN Python/Ruby would raise and JS/AOT would quietly return.
+fn builtin_sqrt(args: &[Value]) -> Result<Value> {
+    let [n] = args else {
+        return Err(Error::runtime("sqrt expects (sqrt n)"));
+    };
+    let x = as_num_arg(n, "sqrt")?;
+    if x < 0.0 {
+        return Err(Error::runtime("sqrt expects a non-negative number"));
+    }
+    Ok(Value::Float(x.sqrt()))
 }
 
 fn arg1(a: &[Value]) -> Result<&Value> {
@@ -1059,5 +1509,401 @@ mod tests {
             elapsed.as_millis() < 500,
             "20k cons build took {elapsed:?} — list builtins may have regressed to O(n²)"
         );
+    }
+
+    // ---- stdlib (Stage 3.1) -----------------------------------------------
+    //
+    // One test per builtin, plus the error-message tests that pin the wording
+    // the C runtime and the three transpiler targets are held to. File-touching
+    // builtins use a per-test temp directory; `exit` (which ends the process)
+    // is exercised in `crates/ainl-core/tests/stdlib_cli.rs` via a subprocess.
+
+    /// A unique scratch path under the OS temp dir, for one builtin test.
+    /// The test removes it on entry (a leftover from an aborted run must not
+    /// make the test read stale content) and the caller removes it after.
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ainl-stdlib-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn as_i64(v: &Value) -> i64 {
+        match v {
+            Value::Int(i) => *i,
+            other => panic!("expected int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_builtins_round_trip_write_append_read() {
+        let dir = scratch_path("file-io");
+        let path = dir.join("notes.txt");
+        let p = path.to_str().unwrap().to_string();
+
+        // write-file creates (or truncates) and returns nil.
+        assert_eq!(
+            crate::run_str(&format!("(write-file {p:?} \"alpha\\nbeta\\n\")")).unwrap(),
+            Value::Nil
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+
+        // read-file returns the whole file, newline included.
+        assert_eq!(
+            crate::run_str(&format!("(read-file {p:?})")).unwrap(),
+            Value::str("alpha\nbeta\n")
+        );
+
+        // append-file adds to the end, leaving the existing content intact.
+        crate::run_str(&format!("(append-file {p:?} \"gamma\\n\")")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+
+        // write-file on an existing path truncates rather than appending.
+        crate::run_str(&format!("(write-file {p:?} \"only\")")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "only");
+
+        // An empty string is a legitimate file (not a no-op that leaves the
+        // previous content in place).
+        crate::run_str(&format!("(write-file {p:?} \"\")")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_on_a_missing_path_is_a_clear_runtime_error() {
+        let dir = scratch_path("file-missing");
+        let missing = dir.join("nope.txt").to_str().unwrap().to_string();
+        let err = crate::run_str(&format!("(read-file {missing:?})"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("read-file: cannot read"),
+            "read-file must say what failed and where, got: {err}"
+        );
+        // The path itself is in the message, so a typo is visible without a
+        // debugger.
+        assert!(err.contains("nope.txt"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn string_builtins_split_join_trim_replace_case_contains() {
+        // split → list, including the leading-empty-field case every host
+        // language agrees on ("a,b".split(",") = ["a", "b"]; ",a" = ["", "a"]).
+        assert_eq!(
+            crate::run_str(r#"(split "a,b,c" ",")"#).unwrap(),
+            crate::run_str(r#"(list "a" "b" "c")"#).unwrap()
+        );
+        assert_eq!(
+            crate::run_str(r#"(split "one two  three" " ")"#).unwrap(),
+            crate::run_str(r#"(list "one" "two" "" "three")"#).unwrap()
+        );
+        // A separator that never occurs yields a single-element list.
+        assert_eq!(
+            crate::run_str(r#"(split "abc" ",")"#).unwrap(),
+            crate::run_str(r#"(list "abc")"#).unwrap()
+        );
+        // A multi-character separator works.
+        assert_eq!(
+            crate::run_str(r#"(split "a::b::c" "::")"#).unwrap(),
+            crate::run_str(r#"(list "a" "b" "c")"#).unwrap()
+        );
+
+        // join is the inverse of split.
+        assert_eq!(
+            crate::run_str(r#"(join (split "x,y,z" ",") ",")"#).unwrap(),
+            Value::str("x,y,z")
+        );
+        // join of the empty list is the empty string (no separator, no quotes).
+        assert_eq!(
+            crate::run_str(r#"(join (list) ",")"#).unwrap(),
+            Value::str("")
+        );
+        // join of one element never emits the separator.
+        assert_eq!(
+            crate::run_str(r#"(join (list "solo") ",")"#).unwrap(),
+            Value::str("solo")
+        );
+
+        // trim strips ASCII whitespace on both ends, nothing in the middle.
+        assert_eq!(
+            crate::run_str(r#"(trim "  hi  ")"#).unwrap(),
+            Value::str("hi")
+        );
+        assert_eq!(
+            crate::run_str(r#"(trim "\t\n hi \r\n")"#).unwrap(),
+            Value::str("hi")
+        );
+        // An all-whitespace string trims to empty.
+        assert_eq!(crate::run_str(r#"(trim "   ")"#).unwrap(), Value::str(""));
+        // A string with no leading/trailing space is unchanged.
+        assert_eq!(
+            crate::run_str(r#"(trim "hi there")"#).unwrap(),
+            Value::str("hi there")
+        );
+
+        // replace rewrites every non-overlapping occurrence.
+        assert_eq!(
+            crate::run_str(r#"(replace "a-b-c" "-" "+")"#).unwrap(),
+            Value::str("a+b+c")
+        );
+        assert_eq!(
+            crate::run_str(r#"(replace "aaaa" "aa" "b")"#).unwrap(),
+            Value::str("bb")
+        );
+        // No match leaves the string alone.
+        assert_eq!(
+            crate::run_str(r#"(replace "abc" "z" "y")"#).unwrap(),
+            Value::str("abc")
+        );
+        // The replacement may itself contain the target — it is not rescanned.
+        assert_eq!(
+            crate::run_str(r#"(replace "a" "a" "aa")"#).unwrap(),
+            Value::str("aa")
+        );
+
+        // upcase/downcase are ASCII-only, by design (see `is_ascii_ws`).
+        assert_eq!(
+            crate::run_str(r#"(upcase "hello")"#).unwrap(),
+            Value::str("HELLO")
+        );
+        assert_eq!(
+            crate::run_str(r#"(downcase "HeLLo")"#).unwrap(),
+            Value::str("hello")
+        );
+        assert_eq!(
+            crate::run_str(r#"(upcase "a-b_c 1")"#).unwrap(),
+            Value::str("A-B_C 1")
+        );
+
+        // contains is a substring test returning a bool.
+        assert_eq!(
+            crate::run_str(r#"(contains "haystack" "stack")"#).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::run_str(r#"(contains "haystack" "needle")"#).unwrap(),
+            Value::Bool(false)
+        );
+        // An empty needle is always contained.
+        assert_eq!(
+            crate::run_str(r#"(contains "x" "")"#).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn stdlib_string_builtins_reject_the_host_disagreements() {
+        // An empty split separator: Python raises, JS splits per character,
+        // Ruby raises. AINL refuses, so all four agree.
+        for (src, want) in [
+            (r#"(split "abc" "")"#, "split expects a non-empty separator"),
+            (
+                r#"(replace "abc" "" "x")"#,
+                "replace expects a non-empty target",
+            ),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+        // A non-string operand reports the builtin's own name and the type.
+        for (src, want) in [
+            (r#"(trim 1)"#, "trim expects a str, got int"),
+            (r#"(upcase (list 1))"#, "upcase expects a str, got list"),
+            (r#"(contains "a" 1)"#, "contains expects a str, got int"),
+            (r#"(split 1 ",")"#, "split expects a str, got int"),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_get_reads_the_environment_and_is_nil_when_unset() {
+        // Set into this process's env so the test sees it.
+        // (std::env::set_var is unsafe in edition 2024, hence the lock; the
+        // value is process-global either way.)
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded within the lock; no other thread reads it.
+        unsafe { std::env::set_var("AINL_STDLIB_TEST", "present") };
+
+        assert_eq!(
+            crate::run_str(r#"(env-get "AINL_STDLIB_TEST")"#).unwrap(),
+            Value::str("present")
+        );
+        // An unset variable is nil, not an error — that's what makes
+        // `(if (env-get "X") ...)` work.
+        assert_eq!(
+            crate::run_str(r#"(env-get "AINL_STDLIB_DEFINITELY_UNSET")"#).unwrap(),
+            Value::Nil
+        );
+        // An empty value is still a value (a str, not nil).
+        unsafe { std::env::set_var("AINL_STDLIB_EMPTY", "") };
+        assert_eq!(
+            crate::run_str(r#"(env-get "AINL_STDLIB_EMPTY")"#).unwrap(),
+            Value::str("")
+        );
+        unsafe {
+            std::env::remove_var("AINL_STDLIB_TEST");
+            std::env::remove_var("AINL_STDLIB_EMPTY");
+        }
+        // A non-string name is rejected under the builtin's own name.
+        let err = crate::run_str("(env-get 1)").unwrap_err().to_string();
+        assert!(err.contains("env-get expects a str, got int"), "got: {err}");
+    }
+
+    #[test]
+    fn now_is_plausible_seconds_since_the_epoch_and_is_monotonic_enough() {
+        // 2020-01-01T00:00:00Z. If this trips, the machine's clock is wrong
+        // (or `now` regressed to something smaller than seconds).
+        const YEAR_2020: i64 = 1_577_836_800;
+        let t = as_i64(&crate::run_str("(now)").unwrap());
+        assert!(t > YEAR_2020, "now() returned {t}, implausibly small");
+        // Sanity on the far end: below year 10000 (~2.5e11) and within i64.
+        assert!(t < 253_402_300_800, "now() returned {t}, implausibly large");
+        // `(now)` takes no arguments and must not silently ignore them.
+        let err = crate::run_str("(now 1)").unwrap_err().to_string();
+        assert!(err.contains("now expects (now)"), "got: {err}");
+    }
+
+    #[test]
+    fn sleep_accepts_zero_and_a_short_nap_and_returns_nil() {
+        assert_eq!(crate::run_str("(sleep 0)").unwrap(), Value::Nil);
+        // 0.01s is long enough to observe, short enough to keep the suite fast.
+        let start = std::time::Instant::now();
+        assert_eq!(crate::run_str("(sleep 0.01)").unwrap(), Value::Nil);
+        assert!(
+            start.elapsed().as_millis() >= 5,
+            "sleep(0.01) returned in under 5ms — did it actually sleep?"
+        );
+        // Negative is an error, not a silent no-op (Python raises, JS ignores).
+        let err = crate::run_str("(sleep -1)").unwrap_err().to_string();
+        assert!(
+            err.contains("sleep expects a non-negative number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn math_builtins_abs_min_max_floor_sqrt() {
+        // abs stays integer; abs of i64::MIN promotes to float (no i64 answer).
+        assert_eq!(crate::run_str("(abs -7)").unwrap(), Value::Int(7));
+        assert_eq!(crate::run_str("(abs 7)").unwrap(), Value::Int(7));
+        assert_eq!(crate::run_str("(abs -2.5)").unwrap(), Value::Float(2.5));
+        assert_eq!(
+            crate::run_str("(abs -9223372036854775808)").unwrap(),
+            Value::Float(9223372036854775808.0)
+        );
+
+        // min/max are variadic and fold pairwise.
+        assert_eq!(crate::run_str("(min 3 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(crate::run_str("(max 3 1 2)").unwrap(), Value::Int(3));
+        assert_eq!(crate::run_str("(min 5)").unwrap(), Value::Int(5));
+        assert_eq!(crate::run_str("(max 1.5 2)").unwrap(), Value::Float(2.0));
+        // Mixed int/float comparison is numeric, not per-type.
+        assert_eq!(crate::run_str("(min 2 1.5)").unwrap(), Value::Float(1.5));
+        // Ties keep the first argument (the < / > comparison is strict), so a
+        // min over equal values is the first one.
+        assert_eq!(crate::run_str("(min 2 2)").unwrap(), Value::Int(2));
+        assert_eq!(crate::run_str("(max 2.5 2.5)").unwrap(), Value::Float(2.5));
+        // min/max are numeric-only: a list operand is a type error, not a
+        // lexicographic comparison (this is what makes the C/JS/Python/Ruby
+        // mappings agree without per-target sorting semantics).
+        let err = crate::run_str("(min (list 1) 1)").unwrap_err().to_string();
+        assert!(err.contains("min expects a number, got list"), "got: {err}");
+        // Negatives and zero.
+        assert_eq!(crate::run_str("(min 0 -3 -1)").unwrap(), Value::Int(-3));
+        assert_eq!(crate::run_str("(max 0 -3 -1)").unwrap(), Value::Int(0));
+
+        // floor always yields an int; an int argument passes through unchanged
+        // (no float round-trip, so a large i64 keeps every bit).
+        assert_eq!(crate::run_str("(floor 2.7)").unwrap(), Value::Int(2));
+        assert_eq!(crate::run_str("(floor -2.1)").unwrap(), Value::Int(-3));
+        assert_eq!(crate::run_str("(floor 4)").unwrap(), Value::Int(4));
+        assert_eq!(
+            crate::run_str("(floor 9007199254740993)").unwrap(),
+            Value::Int(9007199254740993)
+        );
+
+        // sqrt is always a float.
+        assert_eq!(crate::run_str("(sqrt 16)").unwrap(), Value::Float(4.0));
+        assert_eq!(
+            crate::run_str("(sqrt 2)").unwrap(),
+            Value::Float(std::f64::consts::SQRT_2)
+        );
+        assert_eq!(crate::run_str("(sqrt 0)").unwrap(), Value::Float(0.0));
+        // A negative argument is an error, not a silent NaN.
+        let err = crate::run_str("(sqrt -1)").unwrap_err().to_string();
+        assert!(
+            err.contains("sqrt expects a non-negative number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn math_builtins_report_their_own_name_in_type_errors() {
+        for (src, want) in [
+            ("(abs \"x\")", "abs expects a number, got str"),
+            ("(sqrt \"x\")", "sqrt expects a number, got str"),
+            ("(floor (list 1))", "floor expects a number, got list"),
+            ("(min 1 \"x\")", "min expects a number, got str"),
+            ("(max \"x\")", "max expects a number, got str"),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+        // min/max need at least one argument.
+        for (src, want) in [
+            ("(min)", "min expects at least 1 argument"),
+            ("(max)", "max expects at least 1 argument"),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vm_and_the_tree_walk_agree_on_every_stdlib_builtin() {
+        // The tree-walk is the semantic reference the VM is checked against;
+        // a stdlib builtin that only one of them wires up is a silent
+        // divergence, so both are run over the same source and compared.
+        let cases = [
+            r#"(split "a,b" ",")"#,
+            r#"(join (list "a" "b") "-")"#,
+            r#"(trim "  x  ")"#,
+            r#"(replace "a-a" "a" "b")"#,
+            r#"(upcase "ab")"#,
+            r#"(downcase "AB")"#,
+            r#"(contains "abc" "b")"#,
+            r#"(abs -3)"#,
+            "(min 3 1)",
+            "(max 3 1)",
+            "(floor 1.9)",
+            "(sqrt 9)",
+            r#"(env-get "AINL_STDLIB_UNSET_XYZ")"#,
+        ];
+        for src in cases {
+            let vm = crate::run_str(src).unwrap_or_else(|e| panic!("VM failed on `{src}`: {e}"));
+            let tw = crate::run_in_tree_walk(src)
+                .unwrap_or_else(|e| panic!("tree-walk failed on `{src}`: {e}"));
+            assert_eq!(vm, tw, "VM and tree-walk disagree on `{src}`");
+        }
     }
 }
