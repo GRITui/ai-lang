@@ -27,11 +27,17 @@ ai-native-lang/
 │   ├── MASTER_PLAN.md    # full two-phase project plan
 │   ├── SYNTAX.md         # the AI-ingestion grammar guide (feed this to any model)
 │   ├── ARCHITECTURE.md   # how the pieces fit together
-│   └── PERFORMANCE.md    # execution speed (interpreter) + the 2M step-cap finding
+│   ├── PERFORMANCE.md    # execution speed (interpreter) + the 2M step-cap finding
+│   └── RELEASE.md        # release pipeline, checksums, portability
 ├── crates/
 │   ├── ainl-core/        # lexer + parser + AST + evaluator (Rust, zero deps)
-│   └── ainl-cli/         # the `ainl` binary: run / repl / fmt / ast
+│   ├── ainl-transpile/   # AINL -> Python / JavaScript / Ruby
+│   ├── ainl-cc/          # AINL -> C codegen (AOT backend)
+│   └── ainl-cli/         # the `ainl` binary: run / repl / compile / transpile / doctor
 ├── examples/             # sample .ainl programs
+├── scripts/
+│   ├── install.sh        # the one-line installer (verifies SHA256 first)
+│   └── check-*.sh        # the CI gates, runnable locally
 └── Cargo.toml            # Rust workspace
 ```
 
@@ -75,40 +81,73 @@ the next experiment. Full method, raw results, and the reproducible harness:
 
 ## Install
 
-Needs the [Rust toolchain](https://rustup.rs) (`rustc`/`cargo`).
+One line. It picks the right binary for your platform, verifies its SHA256
+against the release's `SHA256SUMS`, and installs to `~/.local/bin` (no root):
 
 ```sh
-# from a checkout — installs the `ainl` binary to ~/.cargo/bin
-cargo install --path crates/ainl-cli
+curl -fsSL https://raw.githubusercontent.com/GRITui/ai-lang/main/scripts/install.sh | sh
+```
 
-# or straight from GitHub
+Then confirm the install works — `doctor` runs the interpreter, the stdlib,
+the grammar export, all three transpilers, and the AOT code generator, and
+exits non-zero if anything fails:
+
+```sh
+ainl --version     # ainl 0.3.0 aarch64-apple-darwin (a46e7ad00b4d)
+ainl doctor        # 7 checks; exit 0 only if all pass
+ainl eval '(* 6 7)'   # 42
+```
+
+Pin a version with `AINL_VERSION=0.3.0`, or install to a specific directory
+with `AINL_BIN_DIR=…`. The installer **refuses to install anything it cannot
+verify**: a release with no `SHA256SUMS`, or an asset whose checksum does not
+match, is an error rather than a silent install.
+
+<details>
+<summary>Other install paths</summary>
+
+Prebuilt binaries for Linux x86_64 (fully static, musl) and macOS aarch64 are
+attached to [GitHub releases](https://github.com/GRITui/ai-lang/releases) with
+their checksums:
+
+```sh
+curl -LO https://github.com/GRITui/ai-lang/releases/download/v0.3.0/ainl-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/GRITui/ai-lang/releases/download/v0.3.0/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf ainl-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+./ainl-v0.3.0-x86_64-unknown-linux-musl/ainl eval '(* 6 7)'   # 42
+```
+
+Or build from source (needs the [Rust toolchain](https://rustup.rs)):
+
+```sh
 cargo install --git https://github.com/GRITui/ai-lang ainl-cli
-
-ainl version
-ainl eval '(* 6 7)'        # 42
+# or, from a checkout:
+cargo build --release && ./target/release/ainl doctor
 ```
 
-Prebuilt binaries are attached to [GitHub releases](https://github.com/GRITui/ai-lang/releases). The **v0.2.0** release ships a fully-static **Linux x86_64 (musl)** binary — one file, no dependencies, runs on any Linux box or container:
+`ainl compile` (AOT to a standalone C binary) additionally needs a host C
+compiler. Without one, `ainl doctor` reports it as **SKIP**, not a failure —
+everything else in the language works without `cc`.
 
-```sh
-curl -LO https://github.com/GRITui/ai-lang/releases/download/v0.2.0/ainl-v0.2.0-x86_64-unknown-linux-musl.tar.gz
-tar xzf ainl-v0.2.0-x86_64-unknown-linux-musl.tar.gz
-./ainl-v0.2.0-x86_64-unknown-linux-musl/ainl eval '(* 6 7)'   # 42
-```
+</details>
 
-plus a macOS aarch64 asset. See [docs/RELEASE.md](docs/RELEASE.md) for the release pipeline and staticness verification.
+See [docs/RELEASE.md](docs/RELEASE.md) for the release pipeline, checksums, and
+staticness verification.
 
 ## Quick start
 
-```sh
-# build from source (needs the Rust toolchain: https://rustup.rs)
-cargo build --release
+From a checkout, after `cargo build --release`:
 
+```sh
 # run a program
 ./target/release/ainl run examples/hello.ainl
 
 # start a REPL
 ./target/release/ainl repl
+
+# AOT-compile a program to a standalone native binary (needs cc)
+./target/release/ainl compile examples/fib.ainl -o fib && ./fib
 
 # inspect the parsed AST (useful for tooling / source maps)
 ./target/release/ainl ast examples/fib.ainl
@@ -121,6 +160,9 @@ cargo build --release
 
 # project AINL into runnable, readable Python (bidirectional interop, §1.4)
 ./target/release/ainl transpile examples/fib.ainl --to python
+
+# the grammar a constrained decoder can be given
+./target/release/ainl grammar --gbnf
 ```
 
 ## The language in 10 seconds

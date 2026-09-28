@@ -178,6 +178,54 @@ jobs:
           name: ainl-aot-standalone-musl
           path: hello.musl
 
+  packaging:
+    name: packaging (install.sh + SHA256SUMS + doctor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The installer's security properties (verify-before-unpack, refuse an
+      # unverified release, atomic rename, idempotent upgrade) are regression
+      # risks, not one-time work — they are asserted here against a local fake
+      # release over file://, so no network or published tag is involved.
+      - name: install.sh end-to-end (verified install + refusal paths)
+        run: ./scripts/check-install.sh
+
+      - name: SHA256SUMS step (as the release job runs it)
+        run: ./scripts/check-sums.sh
+
+      - name: install.sh is POSIX sh (dash parses it)
+        run: |
+          # The installer is run as `… | sh`, where sh is dash on Debian/Ubuntu
+          # and busybox ash on Alpine. A bashism that only shows up there would
+          # break every real install while passing macOS.
+          if command -v dash >/dev/null 2>&1; then
+            dash -n scripts/install.sh && echo "dash: ok"
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq dash
+            dash -n scripts/install.sh && echo "dash: ok"
+          fi
+
+      - name: doctor without a C compiler must SKIP, not FAIL
+        run: ./scripts/check-doctor-no-cc.sh
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest
