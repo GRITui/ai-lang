@@ -68,7 +68,7 @@ fn aot_dir(name: &str) -> PathBuf {
 
 fn compile_aot(src: &str, name: &str) -> PathBuf {
     let forms = ainl_core::parse(src).expect("parse");
-    let c = ainl_cc::generate(&forms);
+    let c = ainl_cc::generate(&forms).expect("aot codegen");
     let dir = aot_dir(name);
     let c_path = dir.join(format!("{name}.c"));
     let bin = dir.join(name);

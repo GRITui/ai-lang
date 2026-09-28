@@ -54,7 +54,7 @@ fn ainl_bin() -> PathBuf {
 
 fn compile_aot(src: &str, name: &str) -> PathBuf {
     let forms = ainl_core::parse(src).expect("parse");
-    let c = ainl_cc::generate(&forms);
+    let c = ainl_cc::generate(&forms).expect("aot codegen");
     let dir = std::env::temp_dir().join(format!("ainl-aot-stdlib-{name}"));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let c_path = dir.join(format!("{name}.c"));
@@ -825,7 +825,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         );
         // 2. ...and the codegen emits it as a builtin, not a scope lookup.
         let forms = ainl_core::parse(&format!("({name})")).expect("parse");
-        let c = ainl_cc::generate(&forms);
+        let c = ainl_cc::generate(&forms).expect("aot codegen");
         assert!(
             c.contains("v_builtin("),
             "`{name}` did not compile to a builtin call:\n{c}"

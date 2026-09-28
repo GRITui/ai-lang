@@ -1,0 +1,37 @@
+; AINL multi-file example: a word-frequency tool split across three files.
+;
+;   ainl run examples/wordcount/main.ainl
+;   AINL_FILE=/path/to/other.txt ainl run examples/wordcount/main.ainl
+;
+; main.ainl      — input handling, wiring, output
+; lib/text.ainl  — tokenizing
+; lib/stats.ainl — counting and reporting; imports text itself
+;
+; Read the imports top-down, because this example exists to make the two rules
+; that are easiest to get wrong visible in real code:
+;
+; 1. main imports BOTH modules flatly, and `stats` imports `text` too. `stats`
+;    uses `words` but does NOT re-export it, so the `(import "lib/text.ainl")`
+;    in main is what puts it in scope. Comment that line out and the program
+;    fails with `unbound symbol 'words'` — that is the point: a module's public
+;    surface is the names it `def`s, not everything its scope happens to hold.
+;
+; 2. `stats` imports its sibling as the BARE name "text", not "lib/text.ainl".
+;    A path-like specifier resolves against the importing file's directory
+;    first, so "lib/text.ainl" from inside lib/ would look for
+;    lib/lib/text.ainl. A bare name starts at the working directory and falls
+;    back to the importing file's directory, which is what "my neighbour" means.
+
+(import "lib/stats.ainl")
+(import "lib/text.ainl")
+
+; AINL has no argv builtin, so the input path comes from the environment —
+; `env-get` is the only channel a program has to its caller. Run from the
+; repository root, or set AINL_FILE to a path this file can read.
+(def path (or (env-get "AINL_FILE") "examples/wordcount/sample.txt"))
+
+(if (not (file-exists path))
+  (error "no such file: " path)
+  nil)
+
+(print (report (word-count (words (read-file path)))))

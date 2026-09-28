@@ -984,7 +984,14 @@ pub fn run_str(src: &str) -> Result<Value> {
 /// call gets a fresh step budget (the VM's step counter is local to `run`).
 pub fn run_in(src: &str, env: &Env) -> Result<Value> {
     let forms = crate::parse(src)?;
-    let code = compile_top(&forms)?;
+    run_forms(&forms, env)
+}
+
+/// Compile + run already-parsed forms in `env`, returning the last form's
+/// value. The form-list counterpart of [`run_in`], which the module loader
+/// needs: it has the AST in hand and must not re-parse text it already holds.
+pub fn run_forms(forms: &[Node], env: &Env) -> Result<Value> {
+    let code = compile_top(forms)?;
     run(&code, env)
 }
 

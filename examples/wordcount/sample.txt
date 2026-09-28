@@ -1,0 +1,3 @@
+; The quick brown fox jumps over the lazy dog.
+; the fox, the dog, and the fox again.
+; A quick brown dog outruns a lazy fox.

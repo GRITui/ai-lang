@@ -27,7 +27,7 @@ fn compile_aot(src: &str, name: &str) -> Option<PathBuf> {
         panic!("cc not found: the AOT backend needs a host C compiler");
     }
     let forms = ainl_core::parse(src).expect("parse");
-    let c = ainl_cc::generate(&forms);
+    let c = ainl_cc::generate(&forms).expect("aot codegen");
     let dir = std::env::temp_dir().join(format!("ainl-aot-test-{name}"));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let c_path = dir.join(format!("{name}.c"));

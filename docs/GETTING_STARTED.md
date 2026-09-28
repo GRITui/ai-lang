@@ -189,6 +189,41 @@ terminators.
 
 Full reference: [SYNTAX.md](SYNTAX.md).
 
+## 4b. Splitting a program across files
+
+`(import "lib/math.ainl")` binds another file's `def`s into the one you are
+writing. `(import "lib/math.ainl" as m)` binds one name holding a map of them.
+Imports are resolved before your code runs, and only at the top level of a file.
+
+A worked three-file program ships in `examples/wordcount/`:
+
+```sh
+ainl run examples/wordcount/main.ainl
+# words: 17
+#   3  ;
+#   5  the
+#   ...
+```
+
+`main.ainl` wires it together, `lib/text.ainl` tokenizes, and `lib/stats.ainl`
+counts — and `stats` imports `text` itself, which makes the rule about exports
+visible in real code: `stats` uses `words` but does not re-export it, so `main`
+has to import `text` too.
+
+Two things to know before you write your own:
+
+- **A module importing a sibling uses the bare name.** From inside `lib/`,
+  `(import "math")` finds `lib/math.ainl`; `(import "lib/math.ainl")` would look
+  for `lib/lib/math.ainl`. A path-like specifier (one containing `/`) resolves
+  against the importing file's directory first; a bare name resolves against the
+  working directory first.
+- **`import` works in the interpreter only.** `ainl compile` (AOT) and the
+  Python/JS/Ruby transpilers refuse a program containing it, by design — see
+  [SYNTAX.md §3b](SYNTAX.md#3b-modules-import) for why. Keep a program's
+  modules at the interpreter if you want to ship it to a host language.
+
+Full rules — exports, collisions, cycles, and error text: [SYNTAX.md §3b](SYNTAX.md#3b-modules-import).
+
 ## 5. Transpile to a language you know
 
 The same program projects losslessly to idiomatic-ish Python, JavaScript, or

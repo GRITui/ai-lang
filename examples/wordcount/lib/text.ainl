@@ -1,0 +1,43 @@
+; Text helpers — the part most worth testing on its own, which is the whole
+; reason it is a separate file.
+;
+; AINL cannot index a string (`(nth "abc" 1)` is an error — `nth` takes a list),
+; so everything here is `split` + list operations. That constrains what a
+; tokenizer here can honestly claim, so it is stated rather than implied: words
+; are whitespace-separated and `trim`med, which handles the punctuation that
+; touches a word's ends but not an apostrophe in the middle.
+;
+; `trim` removes whitespace only at the *ends* of a string, so a newline in the
+; middle of a line survives a space-split as part of a word. Replacing newlines
+; with spaces first is what makes this work on a whole file; it is the kind of
+; detail that is invisible until you read a text file, which is why it is
+; written down here.
+
+(def flatten (fn (text) (replace text "\n" " ")))
+
+; Split on whitespace and drop the empties. `split` keeps *trailing* empty
+; fields (docs/SYNTAX.md §3), so a file ending in a newline would otherwise
+; contribute a final empty word; the `= w ""` check is what removes it.
+;
+; The accumulator is mutated by `def` directly in the `while` body, which does
+; NOT open a scope (docs/SYNTAX.md §2a) — so `out` and `i` are the enclosing
+; `let`'s own bindings and the mutations stick. Wrapping the body in a nested
+; `(let ((w ...)) ...)` looks tidier and silently breaks this: a `let` body *is*
+; a new scope, so `def out` inside it would create a binding that vanishes at
+; the end of the iteration, leaving every function here returning `()`. That
+; mistake is the reason the loop is written flat, and it is worth reading twice.
+(def tokenize
+  (fn (text)
+    (let ((raw (split (trim (flatten text)) " "))
+           (out (list))
+           (i 0))
+      (while (< i (len raw))
+        (def w (trim (nth raw i)))
+        (if (= w "")
+          nil
+          (def out (push out w)))
+        (def i (+ i 1)))
+      out)))
+
+; The pipeline the caller wants: fold case, then split.
+(def words (fn (text) (tokenize (downcase text))))

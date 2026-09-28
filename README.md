@@ -199,6 +199,14 @@ Kept here because a pitch that only lists wins is not a pitch you can trust.
   all 20 were byte-identical degenerate templates. The grammar held at 100%;
   the model had nothing to say. Syntax was never the bottleneck — model
   capability was.
+- **`import` is interpreter-only.** Multi-file programs run on the interpreter
+  and the tree-walking evaluator; `ainl compile` and the Python/JS/Ruby
+  transpilers **refuse** a program containing an import. `import` is a keyword
+  in all three hosts, so an unhandled directive would lower into the host's own
+  import machinery and produce a program that builds cleanly and does the wrong
+  thing. Inlining modules would change their evaluation semantics, so the
+  backends decline rather than guess. A program with no import is unaffected on
+  every backend. ([docs/SYNTAX.md §3b](docs/SYNTAX.md#3b-modules-import))
 
 ## Install
 
@@ -237,6 +245,7 @@ reports it as **SKIP**, not a failure — everything else works without `cc`.
 cargo build --release
 
 ainl run examples/hello.ainl                  # interpret
+ainl run examples/wordcount/main.ainl          # multi-file: (import "lib/...")
 ainl repl                                      # interactive REPL
 ainl repl --stdin < session.ainl > out.txt     # scriptable REPL session
 ainl compile examples/fib.ainl -o fib && ./fib # AOT → native binary

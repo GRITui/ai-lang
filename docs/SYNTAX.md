@@ -44,6 +44,10 @@ comment   ::= ";" ... end-of-line          ; ignored
 | `quote` | `(quote form)` | Return `form` as data (symbols/lists) without evaluating. |
 | `and` | `(and a b ...)` | Short-circuit; returns first falsey or the last value. |
 | `or` | `(or a b ...)` | Short-circuit; returns first truthy or `false`. |
+| `import` | `(import "m.ainl")` / `(import "m.ainl" as m)` | Top-level only. Loads a module file and binds its top-level `def`s into this file's scope, or one name `m` holding a map of them. See §3b. |
+
+`import` is the one special form that is not an expression: it produces
+bindings, not a value, and it is resolved before any other form runs.
 
 ## 2a. Scoping: which forms open a new environment
 
@@ -268,6 +272,107 @@ line gets a fresh step budget (a runaway `while` fails alone).
 `--stdin` is the same loop with the banner and prompts suppressed — it is how
 the tests drive it and how you script it. See
 [GETTING_STARTED.md](GETTING_STARTED.md) for a worked session.
+
+## 3b. Modules: `import`
+
+A program can be split across files. `import` binds another file's `def`s into
+the current program.
+
+| Form | Meaning |
+|------|---------|
+| `(import "path/to/mod.ainl")` | Bind **every top-level `def`** in the module into this file's scope. |
+| `(import "path/to/mod.ainl" as m)` | Bind **one** name, `m` — a map of the module's exports. |
+
+`import` is **top-level only**. An import inside a `fn`, `let`, `do`, or `while`
+body is an error, not a late-binding feature. Imports are resolved before any of
+your code runs, so a module's names are always in scope where you use them.
+
+### The namespaced form is a map
+
+`m` is an ordinary AINL map, so it needs no access syntax of its own:
+
+```lisp
+(import "lib/math.ainl" as m)
+(get m "square")          ; the function
+((get m "square") 7)      ; => 49 — call it like any other value
+(has m "square")           ; => true
+(keys m)                  ; => ("square" "cube") — insertion order
+```
+
+### What a module exposes
+
+A module's exports are **the names it `def`s at its own top level** — not
+everything in its scope. A module that imports another does *not* re-export it:
+
+```lisp
+; math.ainl
+(def square (fn (n) (* n n)))
+
+; shapes.ainl
+(import "math")            ; uses square…
+(def area (fn (s) (* s s))) ; …but exports only `area`
+
+; main.ainl
+(import "shapes")
+(import "math")            ; REQUIRED: `square` is not re-exported
+```
+
+A module body is evaluated with only the builtins in scope: it cannot see the
+importing file's names.
+
+### Resolving the path
+
+Given a specifier, in this order:
+
+1. **Absolute** (`/opt/m.ainl`) — used as-is.
+2. **Path-like** (contains `/`) — the *importing file's* directory first, then
+   the working directory. A module asking for a sibling means "next to me".
+3. **Bare name** (`math`) — the working directory first, then the importing
+   file's directory.
+
+A candidate with **no extension** gets `.ainl` appended, so `(import "math")`
+and `(import "math.ainl")` are the same file. An explicit extension is
+respected as written. When nothing resolves, the error lists every path tried.
+
+**A module importing a sibling uses the bare name.** `(import "math")` from
+inside `lib/` finds `lib/math.ainl`; `(import "lib/math.ainl")` from there would
+look for `lib/lib/math.ainl`.
+
+### Name collisions are an error, never a shadow
+
+A flat `(import ...)` may not bind a name that is already bound — a builtin, an
+earlier import, or a name *this file* `def`s (in either order). The error names
+the conflict and points at the fix:
+
+```
+import: 'len' is already defined (by the prelude), so "lib/shadow.ainl" cannot bind it.
+Rename one of them, or import the module under a name: (import "lib/shadow.ainl" as <alias>)
+and reach it with (get <alias> "len")
+```
+
+A silently shadowed binding is invisible at the call site, so the language
+refuses instead. Use `as` when you genuinely want both.
+
+**Re-importing the same file is a no-op**, not a collision. A module is read
+and evaluated **once per path**, so a diamond (`a` and `b` both import `c`) runs
+`c` exactly once. A file that imports itself, directly or transitively, is a
+**circular import** error that names the cycle.
+
+### Backend scope: the interpreter only
+
+`import` works with `ainl run` and `ainl repl` — the interpreter/VM **and** the
+tree-walking evaluator behind it, which are held to agreeing on it.
+
+The **AOT C backend and the three transpilers (Python / JS / Ruby) refuse a
+program containing `import`**, with an `interpreter-only` error naming the
+byte offset. This is deliberate, not an omission: a transpiler emits one source
+file with no module-resolution phase, and `import` is a *keyword* in Python,
+Ruby and JavaScript — an unhandled directive would lower into the host's own
+import machinery and produce a program that builds cleanly and does the wrong
+thing. A program with no `import` is unaffected on every backend.
+
+(Scope note: the REPL and `import` are independent. The REPL adds no syntax of
+its own — see §3a.)
 
 ## 4. Canonical examples
 

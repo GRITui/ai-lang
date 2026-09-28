@@ -7,3 +7,9 @@ license.workspace = true
 
 [dependencies]
 ainl-core = { path = "../ainl-core" }
+
+# Dev-only: the refusal tests assert that every transpiler declines `import`,
+# which is a claim about ainl-transpile as much as about codegen. Keeping the
+# tests in ainl-cc means one place owns the "backends must refuse" contract.
+[dev-dependencies]
+ainl-transpile = { path = "../ainl-transpile" }

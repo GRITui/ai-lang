@@ -109,7 +109,14 @@ fn cmd_run(path: Option<&String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match ainl_core::run_str(&src) {
+    // `run_named_in`, not `run_str`: a program's `import` directives resolve
+    // against the file's own directory, so `ainl run` must hand the path down
+    // or the same program behaves differently depending on the cwd.
+    match ainl_core::run_named_in(
+        &src,
+        std::path::Path::new(path),
+        &ainl_core::Env::with_prelude(),
+    ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -289,7 +296,16 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let c = ainl_cc::generate(&forms);
+    // `generate` can now refuse a program (an `import` it cannot lower), so
+    // the refusal is surfaced here rather than becoming a confusing failure
+    // further down the C pipeline.
+    let c = match ainl_cc::generate(&forms) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if c_only {
         match out {
             Some(o) => {

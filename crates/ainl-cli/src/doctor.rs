@@ -290,7 +290,10 @@ fn check_aot() -> Check {
     let Ok(forms) = ainl_core::parse("(print 1)") else {
         return Check::new(NAME, Status::Fail, "cannot parse the AOT probe program");
     };
-    let c = ainl_cc::generate(&forms);
+    let c = match ainl_cc::generate(&forms) {
+        Ok(c) => c,
+        Err(e) => return Check::new(NAME, Status::Fail, format!("codegen refused: {e}")),
+    };
     if c.is_empty() {
         return Check::new(NAME, Status::Fail, "generated C is empty");
     }

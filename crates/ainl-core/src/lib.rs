@@ -9,6 +9,7 @@ pub mod deserialize;
 pub mod error;
 pub mod eval;
 pub mod grammar;
+pub mod import;
 pub mod json_value;
 pub mod lexer;
 pub mod parser;
@@ -20,6 +21,7 @@ pub use deserialize::json_to_forms;
 pub use error::{Error, Result};
 pub use eval::Env;
 pub use grammar::{Dialect, GBNF};
+pub use import::Executor;
 pub use parser::{Node, Span};
 pub use serialize::{forms_to_json, LineIndex};
 pub use value::{ConsCell, Value};
@@ -42,6 +44,52 @@ pub fn parse_to_json(src: &str, source_name: Option<&str>) -> Result<String> {
 pub fn run_str(src: &str) -> Result<Value> {
     let env = Env::with_prelude();
     run_in(src, &env)
+}
+
+/// Run a *named* program file on the bytecode VM, with `import` resolution
+/// relative to the file's own directory.
+///
+/// This is the entry point `ainl run` uses. A program is `import`ed by
+/// *location*, so the file's directory is part of its meaning: running the same
+/// text with [`run_str`] resolves its imports against the process working
+/// directory instead, and a program that works with one may not with the other.
+/// [`run_named_in`] is the same thing in an existing environment, which is what
+/// the REPL needs.
+///
+/// Imports are resolved *before* any of the program's own forms run, and a
+/// module's bindings are defined into `env` first, so a `def` in the importing
+/// file always wins over an imported name of the same spelling — except that
+/// this is enforced as an error up front rather than silently (see
+/// `import`'s collision rule), so in practice the two cannot disagree.
+pub fn run_named_in(src: &str, path: &std::path::Path, env: &Env) -> Result<Value> {
+    run_named_with(src, path, env, import::Executor::Vm)
+}
+
+/// The tree-walking twin of [`run_named_in`], for differential testing: same
+/// file, same environment, same modules — evaluated by the other interpreter.
+/// This is what makes "both interpreters agree about `import`" a testable claim
+/// rather than an assertion.
+pub fn run_named_tree_walk_in(src: &str, path: &std::path::Path, env: &Env) -> Result<Value> {
+    run_named_with(src, path, env, import::Executor::TreeWalk)
+}
+
+fn run_named_with(
+    src: &str,
+    path: &std::path::Path,
+    env: &Env,
+    executor: import::Executor,
+) -> Result<Value> {
+    let forms = parse(src)?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let loader = import::Loader::new(executor);
+    let prepared = import::prepare(&forms, src, dir, &loader)?;
+    for (name, value) in prepared.names {
+        env.define(name, value);
+    }
+    match executor {
+        import::Executor::Vm => vm::run_forms(&prepared.forms, env),
+        import::Executor::TreeWalk => eval::run_forms(&prepared.forms, env),
+    }
 }
 
 /// Parse and evaluate a program in an existing environment (used by the REPL so
@@ -68,9 +116,5 @@ pub fn run_in_tree_walk(src: &str) -> Result<Value> {
 pub fn tree_walk_in(src: &str, env: &Env) -> Result<Value> {
     eval::reset_limits();
     let forms = parse(src)?;
-    let mut last = Value::Nil;
-    for form in &forms {
-        last = eval::eval(form, env)?;
-    }
-    Ok(last)
+    eval::run_forms(&forms, env)
 }

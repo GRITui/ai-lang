@@ -1,0 +1,45 @@
+; Counting and reporting.
+;
+; This module imports its neighbour, which is the case the export rule is about:
+; `text`'s `words` is in scope *here*, but is not re-exported, so a program that
+; imports this file still has to import `text` itself to call `words`.
+;
+; Note the specifier is the BARE name "text", not "lib/text.ainl". A path-like
+; specifier resolves against the importing file's directory first, so
+; "lib/text.ainl" from inside lib/ would look for lib/lib/text.ainl.
+
+(import "text")
+
+; word -> count, as an AINL map. Maps are ordered association lists, so
+; `(keys h)` is insertion order and `(vals h)` lines up with it — which is what
+; makes the report below deterministic without a sort.
+;
+; As in text.ainl, the loop body is written flat: a nested `(let ((w ...)) ...)`
+; would open a scope, and the `def h` inside it would mutate a binding that dies
+; with the iteration — the function would return an empty map every time.
+(def word-count
+  (fn (toks)
+    (let ((h (hash))
+           (i 0))
+      (while (< i (len toks))
+        (def w (nth toks i))
+        (def h (assoc h w (+ 1 (if (has h w) (get h w) 0))))
+        (def i (+ i 1)))
+      h)))
+
+; One line per word: "  n  word". The padding is cosmetic; the numbers are
+; what a reader checks.
+(def report
+  (fn (h)
+    (let ((out "")
+           (ks (keys h))
+           (i 0))
+      (while (< i (len ks))
+        (def k (nth ks i))
+        (def out (str out "  " (str (get h k)) "  " k "\n"))
+        (def i (+ i 1)))
+      (str "words: " (str (len ks)) "\n" out))))
+
+; A worked value, so the module is readable on its own: this is what
+; `(word-count (words "a b a"))` is worth.
+(def example-counts (word-count (words "the cat the hat")))

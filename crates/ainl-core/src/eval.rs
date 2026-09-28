@@ -131,6 +131,22 @@ impl Env {
         self.0.parent.as_ref().and_then(|p| p.get(name))
     }
 
+    /// Every name bound in *this* scope (not its parents), with its value.
+    ///
+    /// Used by the module loader to collect the bindings a program file's
+    /// imports contribute, without exposing the `Scope` internals. Order is
+    /// unspecified — callers that need a stable order must sort or build it
+    /// themselves, which is why the loader uses a fresh `Env` per import and
+    /// carries its own ordering in `Imports`.
+    pub fn bindings(&self) -> Vec<(String, Value)> {
+        self.0
+            .vars
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// A fresh global environment with all builtins bound.
     pub fn with_prelude() -> Env {
         let env = Env::new();
@@ -202,6 +218,23 @@ impl Default for Env {
     fn default() -> Self {
         Env::new()
     }
+}
+
+/// Evaluate already-parsed top-level forms in `env`, returning the last form's
+/// value. The form-list counterpart of evaluating a source string, used by the
+/// module loader, which holds the AST and must not re-parse text it already
+/// has.
+///
+/// Resets the step budget first, so each call is a fresh run — the same
+/// contract as `vm::run_forms`. The depth counter needs no reset: the RAII
+/// guard always decrements on the way out, success or error.
+pub fn run_forms(forms: &[Node], env: &Env) -> Result<Value> {
+    reset_limits();
+    let mut last = Value::Nil;
+    for form in forms {
+        last = eval(form, env)?;
+    }
+    Ok(last)
 }
 
 pub fn eval(node: &Node, env: &Env) -> Result<Value> {

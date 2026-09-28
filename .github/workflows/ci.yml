@@ -79,6 +79,44 @@ jobs:
       - name: Verify transpiled output matches the interpreter
         run: ./scripts/check-transpile.sh
 
+  modules:
+    name: modules (import resolves; AOT + transpilers refuse)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Two halves, and the second is the one that would have caught a real
+      # defect: the multi-file example must run, AND the three backends that
+      # cannot resolve modules must refuse it. `import` is a keyword in Python,
+      # Ruby and JavaScript, so an unhandled directive would transpile to a call
+      # into the host's own import machinery — a program that builds cleanly
+      # and does the wrong thing.
+      - name: Module resolution + backend refusal gate
+        run: ./scripts/check-modules.sh
+
+      # Every behavioral claim in SYNTAX.md §3b, executed against the real
+      # binary. Doc claims written from memory are the ones that rot: the
+      # resolution order, the "does not re-export" rule and the collision text
+      # were all plausible and all wrong on first draft. This turns the section
+      # from prose into a test.
+      - name: Documented import behavior matches the interpreter
+        run: ./scripts/check-docs-import.sh
+
   aot:
     name: AOT (C -> cc) byte-identical + step cap
     runs-on: ubuntu-latest
