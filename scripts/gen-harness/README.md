@@ -1,26 +1,56 @@
 # AINL constrained-decoding proof harness
 
-This directory holds the proof-of-concept for AINL's core thesis: **a small
-local model, run through a real GBNF-constrained decoder, can be forced to
-emit only syntactically valid AINL.**
+Two harnesses live here, sharing the same detectors and the same three metrics:
 
-It runs a small GGUF model (Qwen2.5-0.5B-Instruct Q4_K_M) through llama.cpp's
-`llama-cli --grammar-file` using the grammar exported by `ainl grammar`, on a
-set of task prompts, in two modes:
+- **`run_generation.py`** — local `llama-cli` (Qwen2.5-0.5B). The original run.
+- **`run_gateway.py`** — a remote OpenAI-compatible gateway (Qwen3.8-27B-FP8 on
+  vLLM). The current Stage 3.4 result: **9/10 correct**.
 
-- **constrained** — the AINL GBNF is applied (the thesis under test)
-- **unconstrained** — no grammar (baseline: the model asked to emit AINL)
-
-For each generation it records three checks:
+Shared scoring rules, defined once so the two paths cannot disagree:
 
 | check | detector | meaning |
 |---|---|---|
 | **GBNF membership** | `gbnf_fast.py` (sound, O(n)) | is the output *in the language of the exported GBNF*? — the decisive test |
-| `ainl ast` | the real parser | does it parse as AINL? (supplementary; the parser is a *superset* of the GBNF) |
-| `ainl run` | the real evaluator | does it run without error? (supplementary) |
+| **valid prefix** | `gbnf_prefix.py` | how much of a *truncated* output is a real program (an artifact, not a failure) |
+| **runs** | `ainl run` | exits 0, no runtime error |
+| **correct** | stdout comparison | runs AND stdout equals the expected value in the suite |
 
-"Does it *do* what was asked?" is **not** auto-judged — the raw output is saved
-(`results/{constrained,unconstrained}/<i>.ainl`) for human inspection.
+"Does it *do* what was asked?" is only auto-judged where the expected stdout is
+known in advance (`suite_checkable.json`); raw output is always saved for human
+inspection.
+
+## Running against a remote gateway
+
+```sh
+export HERMES_CUSTOM_GATEWAY_9ARM_CO_API_KEY=...   # never commit a key
+python3 scripts/gen-harness/build_grounded_suite.py   # syntax-grounded prompts
+python3 scripts/gen-harness/run_gateway.py \
+    --suite scripts/gen-harness/suite_checkable_grounded.json \
+    --out scripts/gen-harness/results-gateway-qwen3.8-27b
+```
+
+`--resume` reuses generations already in `results.jsonl`; `--rescore-only`
+re-scores the ledger without calling the network at all. A remote gateway will
+eventually time out (this one returns Cloudflare 524s), and without a ledger a
+long run is lost whole.
+
+`score_from_disk.py` re-derives the tables from the saved `.ainl` files, which
+is what you want if a run died before writing its summary.
+
+### Three gateway behaviours worth knowing
+
+1. **Send a browser User-Agent.** The default `Python-urllib` UA is blocked by
+   Cloudflare (Error 1010) *before* auth — indistinguishable from a bad key.
+2. **The constraint parameter is `structured_outputs.grammar`.** On this vLLM
+   build `guided_grammar` returns HTTP 200 and is silently ignored. Verify any
+   constraint with an impossible grammar (`root ::= "Z"`): a live one returns
+   exactly `Z`, an ignored one returns whatever the prompt asked for.
+3. **It is a reasoning model.** It burns leading tokens on `reasoning_content`
+   and returns `content: null` with `finish_reason: length` when the budget is
+   too small. Pass `chat_template_kwargs: {"enable_thinking": false}`.
+
+The 0.5B local run below used `llama-cli` on PATH. The original 20-prompt
+results are in `results/`.
 
 ## Why GBNF membership is the sound detector
 

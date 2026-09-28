@@ -1,4 +1,183 @@
-# Constrained generation (proof of concept)
+# Constrained generation
+
+AINL's core thesis is that a grammar-constrained decoder can be forced to emit
+only syntactically valid AINL. This page records the experiments, in order:
+
+- **[0.5B local](#the-05b-local-run)** — the first proof. The constraint works
+  (100% GBNF-valid constrained vs 0% unconstrained), but the model is
+  degenerate: 0/20 outputs ran, and all 20 were byte-identical.
+- **[1B local](#the-larger-model-run-llama-32-1b)** — Stage 3.4, first attempt.
+  Still degenerate: **0/12** correct.
+- **[27B remote](#stage-34-the-larger-model-run--qwen38-27b-fp8-gateway)** — the
+  current result. A larger model **does** produce correct programs:
+  **9/10**. Verdict: **(a) correct**.
+
+## Verdict summary
+
+| run | model | GBNF-valid | runs | **correct** |
+|---|---|---|---|---|
+| [0.5B local](#the-05b-local-run) | Qwen2.5-0.5B | 20/20 | 0/20 | n/a (not auto-judged) |
+| [1B local](#the-larger-model-run-llama-32-1b) | Llama-3.2-1B | 10/12 | 1/12 | **0/12** |
+| [27B gateway](#stage-34-the-larger-model-run--qwen38-27b-fp8-gateway) | Qwen3.8-27B-FP8 | 10/10 | 10/10 | **9/10** |
+
+---
+
+## Stage 3.4: the larger-model run — Qwen3.8-27B-FP8 (gateway)
+
+The card for this stage assumed an OpenAI-compatible API could only support the
+**unconstrained** half, because "a remote API can't load our .gbnf file". That
+assumption is wrong for a **vLLM** backend: it serves GBNF structured outputs
+over the normal API. Both halves therefore run here, and the constrained arm is
+a real constrained decode, not a prompt instruction.
+
+### Verdict: (a) correct
+
+The 27B model writes AINL that runs and prints the right answer on 9 of 10
+prompts. The 1B model managed 0 of 12. The 27B is the first model in this
+project to produce semantically correct AINL.
+
+### Method
+
+- **Model:** `qwen3.8-27b-fp8` (Qwen3.8-27B-FP8, a reasoning model) served by
+  vLLM behind an OpenAI-compatible gateway.
+- **Constraint:** the same `ainl grammar --gbnf` output used everywhere else —
+  nothing hand-written.
+- **Prompts:** 12 checkable-answer tasks (`suite_checkable.json`); each has a
+  known expected stdout, so "correct" is mechanical, not judged by eye.
+- **Modes:** **constrained** (GBNF applied) and **unconstrained**, same model,
+  same prompts, `temperature 0`.
+- **Metrics:** GBNF membership (the sound detector), `ainl run` exits 0, and
+  stdout exactly equals the expected value.
+
+### Three gateway quirks (each one silently corrupts results)
+
+1. **The User-Agent must be overridden.** The default `Python-urllib` UA is
+   rejected by Cloudflare with Error 1010 *before* authentication runs. It
+   presents exactly like an invalid key, and it is what made an earlier attempt
+   conclude the gateway key was stale. A browser UA gets HTTP 200.
+2. **`guided_grammar` is silently ignored.** The LiteLLM-style parameter
+   returns HTTP 200 and changes nothing — worse than an error, because the run
+   looks fine while measuring nothing. The parameter that actually constrains
+   is **`structured_outputs.grammar`**. Proven with an impossible grammar
+   (`root ::= "Z"`): asked to write an essay about the Roman empire, a live
+   constraint returns exactly `Z`; an ignored one returns prose.
+3. **It is a reasoning model.** It spends the opening tokens on
+   `reasoning_content` and returns `content: null` with
+   `finish_reason: length` if the budget is too small — which looks like a
+   broken key. Thinking is disabled explicitly via
+   `chat_template_kwargs.enable_thinking`.
+
+### Grounding: the model does not know AINL
+
+Asked for "the sum of 2 and 3" with no description of the language, the model
+emits `PRINT 2 + 3` — a valid S-expression that is **not** AINL, and which fails
+with `runtime error: unbound symbol 'PRINT'`. This is not a small-model
+symptom; the GBNF constrains *shape*, not *vocabulary*, so it accepts the wrong
+language just as happily as the right one.
+
+`build_grounded_suite.py` therefore primes both arms equally with the real
+reference (special forms, builtins, two worked examples, drawn from
+`docs/SYNTAX.md`, which is written for model ingestion). Grounding is applied
+**identically to both arms**, so it cannot bias the constrained/unconstrained
+comparison — that comparison remains the headline. It only stops the
+experiment from being a test of whether a large model can guess an unknown
+language.
+
+With grounding, `fib-10` becomes:
+
+```lisp
+(def fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))
+(print (fib 10))          ; prints 55
+```
+
+### Results — 10 of 12 prompts
+
+| # | id | expected | C gbnf | C run | **C correct** | U gbnf | U run | U correct |
+|---|---|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| 0 | sum-2-3 | 5 | Y | Y | **Y** | Y | Y | Y |
+| 1 | print-42 | 42 | Y | Y | **Y** | Y | Y | Y |
+| 2 | hello | hello, world | Y | Y | **Y** | Y | Y | Y |
+| 3 | sq-12 | 144 | Y | Y | **Y** | Y | Y | Y |
+| 4 | fib-10 | 55 | Y | Y | **Y** | Y | Y | Y |
+| 5 | fact-5 | 120 | Y | Y | **Y** | Y | Y | Y |
+| 6 | max2-7-9 | 9 | Y | Y | **Y** | Y | Y | Y |
+| 7 | len-5 | 5 | Y | Y | **Y** | Y | Y | Y |
+| 8 | first-10 | 10 | Y | Y | **Y** | Y | Y | Y |
+| 9 | double-1-2-3 | (2 4 6) | Y | Y | **N** | Y | Y | N |
+
+| mode | GBNF-valid | runs | **correct** | distinct outputs |
+|---|---|---|---|---|
+| **constrained** | **10/10 (100%)** | 10/10 (100%) | **9/10 (90%)** | 10 |
+| unconstrained | 10/10 (100%) | 10/10 (100%) | 9/10 (90%) | 10 |
+
+`map-ada` and `last-1-2-3-4` never completed: the gateway entered a 524
+(read-timeout) storm, taking ~80s for a three-token reply. They are recorded as
+**not run**, not as failures. No generation was truncated in this run.
+
+### The single miss is a real semantic error
+
+`double-1-2-3` fails because the model treats `list` as a two-argument
+constructor:
+
+```lisp
+(def double-each (fn (xs) (if (= (len xs) 0) (list) (list (* 2 (first xs)) (double-each (rest xs))))))
+(print (double-each (list 1 2 3)))   ; -> (2 (4 (6)))  not (2 4 6)
+```
+
+It is syntactically perfect, passes the grammar, runs, and prints a nested
+list instead of a flat one. This is exactly the residual error class the
+project cares about: **the constraint guarantees syntax, not semantics.** It is
+a property of the model, not of the decoder, and no grammar can fix it.
+
+### Constrained vs unconstrained: a tie here, and that is informative
+
+With syntax grounding, both arms score 9/10 and produce **byte-identical**
+outputs on all 10 prompts. The constraint is no longer the binding constraint:
+the model already emits valid AINL unprompted, so there is nothing left for
+the grammar to rescue. The constraint still guarantees 100% GBNF membership, and
+it is what makes this safe to deploy — but on this model it is insurance, not
+an improvement.
+
+The 0.5B run below is the mirror image: there the constraint was the *only*
+thing separating the two modes (100% vs 0%). Constraint value scales inversely
+with model capability.
+
+### Reproduce
+
+```sh
+cargo build --release
+python3 scripts/gen-harness/build_grounded_suite.py
+export HERMES_CUSTOM_GATEWAY_9ARM_CO_API_KEY=...   # never committed
+python3 scripts/gen-harness/run_gateway.py \
+    --suite scripts/gen-harness/suite_checkable_grounded.json \
+    --out scripts/gen-harness/results-gateway-qwen3.8-27b
+```
+
+`run_gateway.py` appends every generation to `results.jsonl` as it goes and
+supports `--resume` / `--rescore-only`. This is not gold-plating: the first full
+suite run lost 14 minutes of work to a 524 on its second-to-last prompt,
+because scores were only written at the very end. `score_from_disk.py`
+re-scores saved `.ainl` artifacts without touching the network.
+
+---
+
+## The larger-model run (Llama-3.2-1B)
+
+The first Stage 3.4 attempt ran Llama-3.2-1B locally against the same 12
+checkable prompts and the same three metrics
+(`scripts/gen-harness/run_checkable.py`,
+[results](https://github.com/GRITui/ai-lang/tree/main/scripts/gen-harness/results-llama-3.2-1b)).
+
+| mode | GBNF-valid | runs | correct |
+|---|---|---|---|
+| constrained | 10/12 | 1/12 | **0/12** |
+| unconstrained | 0/12 | 1/12 | **0/12** |
+
+**Verdict: (c) still degenerate.** A 1B model cannot write AINL. This run is
+the baseline the 27B result above is measured against, and it is why the
+experiment moved to a 27B model rather than declaring victory on syntax alone.
+
+## The 0.5B local run
 
 This is the first demonstration that AINL's core thesis is real: **a small
 local model, run through a real GBNF-constrained decoder, can be forced to
