@@ -6,6 +6,9 @@ only syntactically valid AINL. This page records the experiments, in order:
 - **[0.5B local](#the-05b-local-run)** — the first proof. The constraint works
   (100% GBNF-valid constrained vs 0% unconstrained), but the model is
   degenerate: 0/20 outputs ran, and all 20 were byte-identical.
+- **[0.5B re-run (2026-09-28)](#c2-re-run-2026-09-28)** — the same 20 prompts
+  re-run against the current tree. Byte-identical to the original; kept so
+  the headline numbers are a current measurement rather than a quotation.
 - **[1B local](#the-larger-model-run-llama-32-1b)** — Stage 3.4, first attempt.
   Still degenerate: **0/12** correct.
 - **[27B remote](#stage-34-the-larger-model-run--qwen38-27b-fp8-gateway)** — the
@@ -17,6 +20,7 @@ only syntactically valid AINL. This page records the experiments, in order:
 | run | model | GBNF-valid | runs | **correct** |
 |---|---|---|---|---|
 | [0.5B local](#the-05b-local-run) | Qwen2.5-0.5B | 20/20 | 0/20 | n/a (not auto-judged) |
+| [0.5B re-run](#c2-re-run-2026-09-28) | Qwen2.5-0.5B | 20/20 | 0/20 | n/a (byte-identical to the above) |
 | [1B local](#the-larger-model-run-llama-32-1b) | Llama-3.2-1B | 10/12 | 1/12 | **0/12** |
 | [27B gateway](#stage-34-the-larger-model-run--qwen38-27b-fp8-gateway) | Qwen3.8-27B-FP8 | 10/10 | 10/10 | **9/10** |
 
@@ -158,6 +162,47 @@ supports `--resume` / `--rescore-only`. This is not gold-plating: the first full
 suite run lost 14 minutes of work to a 524 on its second-to-last prompt,
 because scores were only written at the very end. `score_from_disk.py`
 re-scores saved `.ainl` artifacts without touching the network.
+
+---
+
+## C2 re-run (2026-09-28)
+
+The 20-prompt 0.5B harness was re-run against the current tree so the numbers
+the pitch quotes are a current measurement, not a quotation from an earlier
+commit. Two preconditions were verified before running, so the reproduction is
+meaningful:
+
+- **The grammar is unchanged.** `crates/ainl-core/src/grammar.rs` is
+  byte-identical to the C2 commit (`sha256 386e2628…`, verified with
+  `git show d7a992c:… | shasum`). The constraint under test is the same
+  constraint.
+- **The decoder is unchanged.** llama-cli `0.5.0 (build 11146)`, the same
+  version as the original run.
+
+Result — [`results.csv`](../scripts/gen-harness/results-rerun-2026-09-28/results.csv)
+is **byte-identical** to the [original](#the-05b-local-run):
+
+| mode | GBNF membership | `ainl ast` parse | `ainl run` |
+|---|---|---|---|
+| **constrained** | **20/20 (100%)** | 20/20 (100%) | 0/20 (0%) |
+| unconstrained | 0/20 (0%) | 20/20 (100%) | 0/20 (0%) |
+
+The degeneracy reproduces as well: all 20 constrained outputs are a **single
+distinct byte-identical** LeetCode-flavored template, and it fails identically:
+
+```console
+$ ainl run scripts/gen-harness/results-rerun-2026-09-28/constrained/0.ainl
+runtime error: unbound symbol '/leetcode'
+```
+
+So the 0.5B result is not a one-off: 100% valid syntax, 0% semantics, on the
+current tree and the current grammar. Reproduce with:
+
+```sh
+python3 scripts/gen-harness/run_generation.py \
+    --model /path/to/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+    --out scripts/gen-harness/results-rerun-2026-09-28
+```
 
 ---
 
