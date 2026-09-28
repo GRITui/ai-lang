@@ -27,10 +27,20 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 FAKE_RELEASES="$WORK/releases"
 VERSION="v9.9.9-doctor-test"
-TARGET="aarch64-apple-darwin"
+
+# The fixture must publish the asset for the *host running the test*, not a
+# hardcoded one: the installer asks for the host's target, so on an ubuntu
+# runner it correctly requests x86_64-unknown-linux-musl and a macOS-named
+# fixture has nothing to serve. (This is exactly how the first CI run failed.)
+. scripts/lib-target.sh
+TARGET=$(detect_target) || { echo "FAIL: cannot detect host target"; exit 1; }
 ASSET="ainl-${VERSION}-${TARGET}.tar.gz"
+echo "== fixture for this host: $TARGET =="
+
 RELDIR="$FAKE_RELEASES/$VERSION"
 mkdir -p "$RELDIR"
+# The tarball's top-level directory is named after the asset, which is what
+# the release pipeline produces and what the installer unpacks.
 STAGE="$WORK/stage/ainl-${VERSION}-${TARGET}"
 mkdir -p "$STAGE"
 cp "$BIN" "$STAGE/ainl"

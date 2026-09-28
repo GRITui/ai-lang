@@ -223,6 +223,14 @@ jobs:
             dash -n scripts/install.sh && echo "dash: ok"
           fi
 
+      # install.sh cannot source lib-target.sh (it is piped to `sh` and must be
+      # self-contained), so the platform→target mapping exists twice. This job
+      # runs on Linux while the tests are also run on macOS by developers, and
+      # it is what caught the fixtures serving a macOS-named asset on an
+      # ubuntu runner.
+      - name: platform mapping in sync (install.sh vs lib-target.sh)
+        run: ./scripts/check-target-sync.sh
+
       - name: doctor without a C compiler must SKIP, not FAIL
         run: ./scripts/check-doctor-no-cc.sh
 
@@ -232,6 +240,14 @@ jobs:
       # inherited environment, and no C compiler.
       - name: clean-env install (env -i, fresh HOME, no cc)
         run: ./scripts/check-install-clean-env.sh
+
+      # Re-runs the whole packaging suite under a faked Linux `uname`. The
+      # first CI run of this work passed on macOS and failed on ubuntu because
+      # the fixtures hardcoded the macOS asset name; this makes the
+      # host-dependent branch testable from any machine, not only from the one
+      # whose CI runner happens to match.
+      - name: platform matrix (packaging suite as macOS and as Linux)
+        run: ./scripts/check-platform-matrix.sh
 
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)

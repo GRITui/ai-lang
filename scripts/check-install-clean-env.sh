@@ -26,7 +26,11 @@ fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 VERSION="v9.9.9-acceptance"
-TARGET="aarch64-apple-darwin"
+
+# The host's own asset name — the installer will ask for exactly this, so a
+# hardcoded macOS name would leave an ubuntu runner with nothing to install.
+. scripts/lib-target.sh
+TARGET=$(detect_target) || { echo "FAIL: cannot detect host target"; exit 1; }
 ASSET="ainl-${VERSION}-${TARGET}.tar.gz"
 REL="$WORK/rel/$VERSION"
 
@@ -90,8 +94,29 @@ echo "== the installed binary, run from the clean env =="
 ver=$(env -i HOME="$CLEAN/home" PATH="$CLEAN/bin:$INSTALLED_DIR" "$INSTALLED" --version 2>&1)
 echo "    \$ ainl --version"
 echo "$ver" | sed 's/^/    /'
-if echo "$ver" | grep -q "ainl 0.2.0"; then pass "ainl --version reports the version"; else bad "unexpected --version output"; fi
-if echo "$ver" | grep -q "aarch64-apple-darwin"; then pass "reports the build target"; else bad "no target in --version"; fi
+
+# The expected version comes from Cargo.toml, not a literal, so bumping the
+# version for a release does not silently break this test.
+WANT_V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+if echo "$ver" | grep -q "^ainl $WANT_V "; then
+  pass "ainl --version reports the workspace version ($WANT_V)"
+else
+  bad "expected 'ainl $WANT_V …', got: $ver"
+fi
+# The *build* target is baked in by build.rs from the Rust compile target, not
+# from `uname` — so it is whatever this binary was actually compiled for. The
+# asset *name* above comes from `uname` and can be faked (see
+# check-platform-matrix.sh); the build target cannot. Asserting it is one of the
+# real release targets therefore proves the bake-in works without pretending a
+# macOS binary can report itself as Linux.
+case "$ver" in
+  *aarch64-apple-darwin*|*x86_64-unknown-linux-musl*)
+    pass "reports a real build target"
+    ;;
+  *)
+    bad "no known build target in --version: $ver"
+    ;;
+esac
 if echo "$ver" | grep -qE '\([0-9a-f]{12}\)'; then pass "reports the source commit"; else bad "no commit in --version"; fi
 
 echo

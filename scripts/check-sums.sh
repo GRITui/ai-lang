@@ -26,8 +26,15 @@ fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 VERSION="v9.9.9-sums-test"
+
+# Both platform assets, named exactly as release.yml names them. The host's
+# own asset is what the installer will request; the other is here so the sums
+# file covers a realistic two-asset release.
 A_LIN="ainl-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 A_MAC="ainl-${VERSION}-aarch64-apple-darwin.tar.gz"
+. scripts/lib-target.sh
+TARGET=$(detect_target) || { echo "FAIL: cannot detect host target"; exit 1; }
+echo "== this host's target: $TARGET =="
 
 fail=0
 pass() { echo "ok   $1"; }
@@ -94,12 +101,14 @@ mkdir -p "$REL"
 for pair in "ainl-$VERSION-x86_64-unknown-linux-musl:$A_LIN" \
             "ainl-$VERSION-aarch64-apple-darwin:$A_MAC"; do
   art=${pair%%:*}; file=${pair##*:}
-  stage="$WORK/stage/$art/ainl-$VERSION-aarch64-apple-darwin"
+  # Each tarball's top-level dir is named after its own asset, which is what
+  # the release pipeline produces.
+  stage="$WORK/stage/$art/ainl-${VERSION}-${TARGET}"
   rm -rf "$WORK/stage/$art"
   mkdir -p "$stage"
   cp "$ROOT/target/release/ainl" "$stage/ainl"
   cp README.md LICENSE-MIT "$stage/"
-  ( cd "$WORK/stage/$art" && tar czf "$REL/$file" "ainl-$VERSION-aarch64-apple-darwin" )
+  ( cd "$WORK/stage/$art" && tar czf "$REL/$file" "ainl-${VERSION}-${TARGET}" )
 done
 # Regenerate the sums over the *real* assets, exactly as the release job does.
 ( cd "$REL" && sha256sum "$A_LIN" "$A_MAC" > SHA256SUMS )
