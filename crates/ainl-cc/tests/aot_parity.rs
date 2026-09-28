@@ -66,11 +66,17 @@ fn run_capture(cmd: &mut Command) -> String {
 /// instead re-derive it by running the AINL file through a tiny driver: the
 /// simplest faithful comparison is the CLI's own `run`.
 fn interpreter_stdout(path: &Path) -> String {
-    let ainl = repo_root().join("target/release/ainl");
-    let ainl = if ainl.exists() {
-        ainl
-    } else {
-        repo_root().join("target/debug/ainl")
+    // Debug before release: `cargo test` rebuilds only the debug binary, so a
+    // release binary found first here can be stale (and the cargo cache's key
+    // is Cargo.toml-only, so it can carry one across runs). See aot_stdlib.rs
+    // for the full story.
+    let ainl = {
+        let debug = repo_root().join("target/debug/ainl");
+        if debug.exists() {
+            debug
+        } else {
+            repo_root().join("target/release/ainl")
+        }
     };
     if !ainl.exists() {
         panic!(

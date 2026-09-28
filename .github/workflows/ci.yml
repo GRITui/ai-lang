@@ -28,7 +28,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       - name: Format check
         run: cargo fmt --all --check
@@ -58,7 +64,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       # python3, node, and ruby are preinstalled on ubuntu-latest runners.
       - name: Build release binary
@@ -83,7 +95,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       # cc is preinstalled on ubuntu runners.
       - name: Verify cc is present
@@ -114,7 +132,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       - name: Build release binary
         run: cargo build --release
@@ -170,7 +194,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       - name: Build release binary
         run: cargo build --release

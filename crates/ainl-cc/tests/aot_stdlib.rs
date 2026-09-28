@@ -28,18 +28,28 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Locate the `ainl` binary to compare against.
+///
+/// Debug is preferred over release deliberately, and the order matters. These
+/// tests are usually run by `cargo test`, which builds the *debug* binary and
+/// leaves any pre-existing `target/release/ainl` untouched. Preferring release
+/// first meant a stale release binary won whenever one happened to be lying
+/// around -- and the assertions failed with `unbound symbol 'read-file'`, i.e.
+/// the tests silently compared against a binary predating Stage 3.1. In CI
+/// that release binary came from the cargo cache, whose key is
+/// `hashFiles('**/Cargo.toml')` and so does not change when only .rs files do.
 fn ainl_bin() -> PathBuf {
-    let release = repo_root().join("target/release/ainl");
-    if release.exists() {
-        return release;
-    }
     let debug = repo_root().join("target/debug/ainl");
+    if debug.exists() {
+        return debug;
+    }
+    let release = repo_root().join("target/release/ainl");
     assert!(
-        debug.exists(),
+        release.exists(),
         "ainl binary not built; run `cargo build` first ({})",
-        debug.display()
+        release.display()
     );
-    debug
+    release
 }
 
 fn compile_aot(src: &str, name: &str) -> PathBuf {

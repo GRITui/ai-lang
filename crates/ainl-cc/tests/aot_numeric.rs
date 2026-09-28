@@ -98,11 +98,17 @@ fn interpreter_stdout(src: &str, name: &str) -> String {
         .ancestors()
         .nth(2)
         .expect("workspace root");
-    let ainl = root.join("target/release/ainl");
-    let ainl = if ainl.exists() {
-        ainl
-    } else {
-        root.join("target/debug/ainl")
+    // Debug before release: `cargo test` rebuilds only the debug binary, so a
+    // release binary found first here can be stale (and the cargo cache's key
+    // is Cargo.toml-only, so it can carry one across runs). See aot_stdlib.rs
+    // for the full story.
+    let ainl = {
+        let debug = root.join("target/debug/ainl");
+        if debug.exists() {
+            debug
+        } else {
+            root.join("target/release/ainl")
+        }
     };
     assert!(
         ainl.exists(),
