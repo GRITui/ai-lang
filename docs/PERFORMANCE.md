@@ -135,7 +135,7 @@ and document it) is unchanged.
 
 `crates/ainl-cc` compiles the AST to a **single self-contained C file** — the
 micro-runtime (value model, refcounting, cons cells, symbol interning, scopes,
-closures, 27 builtins, step counter) is inlined into the output, so the compiled
+closures, 46 builtins, step counter) is inlined into the output, so the compiled
 program links against nothing but libc. `ainl compile prog.ainl -o prog` runs
 `cc`; `ainl run` is untouched and still goes through the VM.
 

@@ -108,6 +108,27 @@ counter                                    ; => 0
 
 **Control**: `(error msg...)` abort with a runtime error.
 
+**String functions**: `(split s sep)` → a list, `(join list sep)` → a string, `(trim s)`, `(replace s old new)`, `(upcase s)` / `(downcase s)`, `(contains hay needle)` → bool.
+
+`upcase`/`downcase` fold **ASCII only** (`a`–`z`), and `trim` strips only the ASCII whitespace set — space, tab, newline, carriage return, form feed, vertical tab. This is deliberate: the alternative (Unicode-aware case folding and whitespace) is not implementable in the AOT C runtime without pulling in a Unicode library, and the four backends have to agree exactly. A consequence worth knowing: `"héllo"` and `"日本"` are unaffected by `upcase`, and a non-breaking space is not trimmed.
+
+Two edge cases are **rejected rather than guessed**, because the hosts disagree about them and a language that behaves differently in a compiled binary than in its interpreter is worse than one that refuses:
+
+- `(split s "")` → error. (JavaScript splits into individual characters, Rust and C split into a trailing empty field, Python raises.)
+- `(replace s "" new)` → error. (Python inserts `new` at every position, JavaScript and C return the input unchanged, Ruby raises.)
+
+`split` keeps **trailing empty fields**: `(split "a,b," ",")` is `("a" "b" "")`, not `("a" "b")`.
+
+**File IO**: `(read-file path)` → the file's contents as a string. `(write-file path content)` creates or **truncates**. `(append-file path content)` appends. All three take a string path and string content and error otherwise; a missing file, or a path that cannot be opened, is a runtime error. Opening is binary on every backend, so a file's bytes are exactly what `read-file` returns — including `\r\n`, which is not translated. A very common idiom is `(split (read-file path) "\n")`, which is why `split` keeps trailing empties above.
+
+**Environment / process**: `(env-get name)` → the value of the environment variable, or `nil` if unset. `(exit code)` ends the process with that status. `code` must be an integer.
+
+**Time**: `(now)` → whole Unix-epoch seconds as an integer. `(sleep secs)` pauses for `secs` seconds; a fractional value is allowed. `(sleep)` and a zero duration return immediately. A negative or NaN duration is an error.
+
+**Math**: `(abs n)`, `(floor n)` → an integer, `(sqrt n)`. `(min a b...)` / `(max a b...)` take **one or more** numbers and return the smallest/largest; mixed ints and floats compare numerically, a tie returns the *first* of the tied values, and a non-numeric argument is an error. They are deliberately numeric-only — not generic "compare anything" — because the hosts disagree about comparing lists and strings (`[1] < [2]` is a type error in Python but fine in JavaScript, and Ruby's `Comparable` will happily compare a String against an Integer). `(sqrt -1)` is an error, not `NaN`.
+
+**Why each of these has a hand-written rule per backend.** AINL has four execution backends — the interpreter/VM, the AOT-compiled C binary, and the Python, JavaScript and Ruby transpiler targets — and a builtin is only real when all five agree. Most of them do, because they map to the host's own facility. The ones above don't, and each of those cases has a test pinning the AINL answer: ASCII case folding and trimming, an empty split separator, an empty replace target, numeric-only `min`/`max`, and the errors for a negative `sqrt` or `sleep`. `crates/ainl-core/src/eval.rs` is the normative implementation and the other four are written to match it; `crates/ainl-cc/tests/aot_stdlib.rs` and the three `*_stdlib.rs` transpiler suites are what keep them there.
+
 ## 4. Canonical examples
 
 ```lisp
