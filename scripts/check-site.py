@@ -52,7 +52,7 @@ print("local assets  :", assets or "none — fully self-contained")
 # Headline numbers must match the README exactly (single source of truth).
 nums = ["20/20", "0/20", "10/10", "9/10", "47.3", "0.576", "30 969.0",
         "0.604", "35.4", "5.9", "2.25", "1.77", "1.27", "0.69", "51",
-        "+108%", "+64%", "+95%", "561", "46"]
+        "+108%", "+64%", "+95%", "561", "52"]
 missing = [n for n in nums if n not in html or n not in readme]
 print("numbers in both:", "all %d match" % len(nums) if not missing else f"MISSING {missing}")
 
