@@ -161,8 +161,11 @@ impl Env {
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut cur = Some(self.clone());
         while let Some(env) = cur {
-            for (k, _) in env.0.vars.borrow().iter() {
-                names.insert(k.clone());
+            // `bindings()` rather than reaching into `vars`: the values are
+            // irrelevant here, and the public accessor is what keeps this from
+            // being a map-key iteration.
+            for (k, _) in env.bindings() {
+                names.insert(k);
             }
             cur = env.0.parent.clone();
         }
