@@ -111,19 +111,45 @@ fn run_interpreter(src: &str) -> (bool, PathBuf) {
     (ok, path)
 }
 
-/// The first line of a failed run's stderr, normalized for the one difference
-/// that is *not* the runtime's doing: the `ainl` CLI renders an
-/// `ainl_core::Error` through its `Display`, which prefixes "runtime error: ",
-/// while a compiled binary prints `g_errmsg` raw. That prefix is the CLI's, not
-/// the runtime's — the message itself is what the two backends must agree on.
-/// (This predates Stage 3.1: every Stage 2 builtin behaves the same way.)
+/// The first line of a failed run's stderr, normalized for the differences
+/// that are *not* the runtime's doing:
+///
+/// 1. The `ainl` CLI renders an `ainl_core::Error` through its `Display`,
+///    which prefixes "runtime error: ", while a compiled binary prints
+///    `g_errmsg` raw. That prefix is the CLI's, not the runtime's.
+/// 2. A position suffix (` at line N, col M (byte B)`) is present on the
+///    interpreter's error and absent on the AOT one.
+///
+/// (2) is the documented backend difference, not a silent divergence — see
+/// docs/SYNTAX.md "Error messages" and the note in `ainl-cc`'s `generate`.
+/// The AOT backend emits a *standalone C program*: the source text is not
+/// embedded in the binary, so a line/column is not merely unavailable to the
+/// runtime, it does not exist. Emitting a fabricated one would be worse than
+/// omitting it, so the AOT message stops at the description. The rule this
+/// test enforces is therefore: **the message body — what went wrong — must
+/// match byte-for-byte, and the position suffix is interpreter-only.**
+///
+/// Stripping the suffix here (rather than skipping the assertions) keeps the
+/// test honest: a change to the *wording* of a message still fails it.
 fn norm_err(s: &[u8]) -> String {
     let text = String::from_utf8_lossy(s);
     let first = text.lines().next().unwrap_or("").trim();
-    first
-        .strip_prefix("runtime error: ")
-        .unwrap_or(first)
-        .to_string()
+    let first = first.strip_prefix("runtime error: ").unwrap_or(first);
+    strip_pos_suffix(first)
+}
+
+/// Drop a trailing ` at line N, col M (byte B)` (or ` at byte B`) from a
+/// diagnostic, leaving the description intact.
+fn strip_pos_suffix(msg: &str) -> String {
+    // " at byte N" is always the tail when there is no line/col.
+    if let Some(i) = msg.rfind(" at byte ") {
+        return msg[..i].to_string();
+    }
+    // Otherwise " at line N, col M (byte B)".
+    if let Some(i) = msg.rfind(" at line ") {
+        return msg[..i].to_string();
+    }
+    msg.to_string()
 }
 
 /// A stdlib builtin that must produce the same stdout in the interpreter and

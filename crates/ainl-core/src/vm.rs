@@ -81,6 +81,19 @@ impl Scope {
 struct Compiler {
     code: FnCode,
     scope: Scope,
+    /// Span of the node currently being lowered, stamped onto every
+    /// instruction emitted for it.
+    ///
+    /// Saved and restored around each [`Compiler::compile_expr`], so an
+    /// instruction emitted *after* a nested subexpression (a `Pop`, a `MakeFn`)
+    /// still carries the span of the form that owns it rather than the last
+    /// leaf visited.
+    cur_span: Span,
+    /// Names bound outside this compilation unit, for suggestion candidates
+    /// only — they are never resolved as locals. The REPL needs this: it
+    /// compiles one submission at a time, so a name bound on an earlier line
+    /// is in the environment but in none of the forms it is compiling.
+    extra_names: Vec<String>,
 }
 
 impl Compiler {
@@ -88,6 +101,8 @@ impl Compiler {
         Compiler {
             code: FnCode::new("<top>"),
             scope: Scope::default(),
+            cur_span: Span::new(0, 0),
+            extra_names: Vec::new(),
         }
     }
 
@@ -105,6 +120,8 @@ impl Compiler {
                 locals,
                 env_active: false,
             },
+            cur_span: Span::new(0, 0),
+            extra_names: Vec::new(),
         }
     }
 
@@ -120,6 +137,8 @@ impl Compiler {
                 locals: bind_names,
                 env_active: false,
             },
+            cur_span: Span::new(0, 0),
+            extra_names: Vec::new(),
         }
     }
 
@@ -128,7 +147,7 @@ impl Compiler {
     }
 
     fn emit(&mut self, instr: Instr) {
-        self.code.body.push(instr);
+        self.code.push(instr, self.cur_span);
     }
 
     fn emit_jump(&mut self, kind: fn(usize) -> Instr) -> usize {
@@ -166,9 +185,32 @@ impl Compiler {
             Some(slot) => self.emit(Instr::LoadSlot(slot)),
             None => {
                 let i = self.name_idx(name);
+                // Resolve the close-match suggestion *here*, at compile time:
+                // the compiler knows every name the program will ever bind
+                // (including a `def` further down the file, which the runtime
+                // env does not hold yet), so it is the only place that can
+                // produce the same answer the tree-walking evaluator does.
+                // Storing it keeps the hot loop free of any suggestion work.
+                let cands = self.all_known_names();
+                if let Some(m) = crate::suggest::close_match(name, cands) {
+                    self.code.name_suggestions.insert(i, m);
+                }
                 self.emit(Instr::Load(i));
             }
         }
+    }
+
+    /// Every name the compiler can see: the prelude's builtins plus every
+    /// `def`-bound name collected in this scope chain, plus any `extra` the
+    /// caller supplied.
+    fn all_known_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = crate::eval::builtin_names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        names.extend(self.scope.locals.iter().cloned());
+        names.extend(self.extra_names.iter().cloned());
+        names.into_iter().collect()
     }
 
     fn emit_def_var(&mut self, name: &str) {
@@ -182,7 +224,21 @@ impl Compiler {
     }
 
     /// Compile a single expression (leaves one value on the stack).
+    ///
+    /// Every instruction emitted while lowering `node` is stamped with `node`'s
+    /// span, so a failure at run time can be traced back to the form that
+    /// caused it. The previous span is restored on the way out, so a `Pop` or
+    /// `MakeFn` emitted by the *caller* after this call still points at the
+    /// caller's form.
     fn compile_expr(&mut self, node: &Node) -> Result<()> {
+        let saved = self.cur_span;
+        self.cur_span = node.span();
+        let r = self.compile_expr_inner(node);
+        self.cur_span = saved;
+        r
+    }
+
+    fn compile_expr_inner(&mut self, node: &Node) -> Result<()> {
         match node {
             Node::Int(i, _) => self.push_const(Value::Int(*i)),
             Node::Float(x, _) => self.push_const(Value::Float(*x)),
@@ -205,16 +261,22 @@ impl Compiler {
             return Ok(());
         };
         if let Node::Sym(op, _) = head {
+            // A malformed special form fails on its *shape*; the form's own
+            // span is the most precise position there is, so it is stamped on
+            // the way out. Mirrors the tree-walk's dispatch, which keeps the
+            // two backends' messages identical (4-backend rule).
+            let at = self.cur_span.start;
+            let shape = |r: Result<()>| r.map_err(|e| e.or_at(at));
             match op.as_str() {
-                "def" => return self.sf_def(&items[1..]),
-                "fn" => return self.sf_fn(&items[1..]),
-                "if" => return self.sf_if(&items[1..]),
-                "do" => return self.sf_do(&items[1..]),
-                "let" => return self.sf_let(&items[1..]),
-                "while" => return self.sf_while(&items[1..]),
-                "quote" => return self.sf_quote(&items[1..]),
-                "and" => return self.sf_and(&items[1..]),
-                "or" => return self.sf_or(&items[1..]),
+                "def" => return shape(self.sf_def(&items[1..])),
+                "fn" => return shape(self.sf_fn(&items[1..])),
+                "if" => return shape(self.sf_if(&items[1..])),
+                "do" => return shape(self.sf_do(&items[1..])),
+                "let" => return shape(self.sf_let(&items[1..])),
+                "while" => return shape(self.sf_while(&items[1..])),
+                "quote" => return shape(self.sf_quote(&items[1..])),
+                "and" => return shape(self.sf_and(&items[1..])),
+                "or" => return shape(self.sf_or(&items[1..])),
                 op if is_inlined_op(op) => return self.compile_inlined_op(op, &items[1..]),
                 _ => {}
             }
@@ -508,6 +570,12 @@ impl Compiler {
             self.compile_expr(a)?;
         }
         self.emit(Instr::Call(n));
+        // Record the callee's source name against this `Call` so an arity
+        // error can name the function the reader called, not just "fn".
+        if let Node::Sym(name, _) = &items[0] {
+            let idx = self.body_len() - 1;
+            self.code.call_names.insert(idx, name.clone());
+        }
         Ok(())
     }
 }
@@ -545,7 +613,17 @@ fn collect_defs(forms: &[Node], scope: &mut Scope) {
 /// compile-time errors — the compiler returns `Err` rather than emitting a
 /// runtime-error instruction.
 pub fn compile_top(forms: &[Node]) -> Result<FnCode> {
+    compile_top_seeded(forms, Vec::new())
+}
+
+/// [`compile_top`], with extra names available as suggestion candidates.
+///
+/// The extra names are *not* resolved as locals — they live in a caller's
+/// environment, not in these forms — so this only widens what an unbound-symbol
+/// error can propose.
+fn compile_top_seeded(forms: &[Node], extra_names: Vec<String>) -> Result<FnCode> {
     let mut c = Compiler::new_top();
+    c.extra_names = extra_names;
     collect_defs(forms, &mut c.scope);
     let last = forms.len().saturating_sub(1);
     for (i, form) in forms.iter().enumerate() {
@@ -640,6 +718,32 @@ struct Frame {
     env: Env,
 }
 
+/// The source name of the callee of the `Call` at instruction index `call_ip`,
+/// or `"anonymous"` when the call site was not a symbol.
+///
+/// Only called on error paths: it clones out of the compile-time table, and a
+/// per-call lookup on the hot loop would cost a hash and an allocation for a
+/// diagnostic that almost never fires.
+fn self_callee_name(frames: &[Frame], call_ip: usize) -> String {
+    frames
+        .last()
+        .and_then(|f| f.code.call_names.get(&call_ip))
+        .cloned()
+        .unwrap_or_else(|| "anonymous".to_string())
+}
+
+/// The source span of the instruction at index `ip` in the current frame.
+///
+/// Called only from error paths. Reading the span table on *every* instruction
+/// instead cost roughly 2.5x of the VM's throughput (the 40k benchmark's
+/// speedup gate fell from 8.5x to 3.0x) because the extra indexing breaks the
+/// single-borrow prologue the hot loop is built around. Fetching it here, once
+/// something has already gone wrong, costs nothing measurable and returns
+/// exactly the same value.
+fn cur_span(frames: &[Frame], ip: usize) -> usize {
+    frames.last().map(|f| f.code.span_at(ip).start).unwrap_or(0)
+}
+
 /// Execute a compiled top-level program in `env`. Returns the value of the
 /// final form. `env` is the global (REPL) environment: top-level `def`s are
 /// persisted into it so bindings survive across `run_in` calls.
@@ -676,7 +780,17 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 "step limit exceeded (max {MAX_STEPS} evaluation steps) — likely an infinite loop or runaway recursion"
             )));
         }
-        let instr = frame.code.body[frame.ip];
+        // The index of the instruction about to run, captured as a plain
+        // `usize` so the error paths below can look up its span without
+        // capturing (and so conflicting with) the loop's `&mut Frame` borrow.
+        let ip = frame.ip;
+        let instr = frame.code.body[ip];
+        // The span of the node this instruction came from is deliberately NOT
+        // read here. Reading `spans[ip]` on every instruction cost ~2.5x of the
+        // VM's throughput (the 40k benchmark's speedup gate went 8.5x -> 3.0x)
+        // because it breaks the single-borrow prologue the hot loop is built
+        // around. The error paths below call `span_at(frame.ip - 1)` instead —
+        // the same value, fetched only when something has already gone wrong.
         frame.ip += 1;
 
         match instr {
@@ -699,10 +813,23 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 let v = match frame.locals.get(s).and_then(|o| o.clone()) {
                     Some(v) => v,
                     None => {
-                        let name = &frame.code.locals[s];
-                        match frame.env.get(name) {
+                        let name = frame.code.locals[s].clone();
+                        match frame.env.get(&name) {
                             Some(v) => v,
-                            None => return Err(Error::runtime(format!("unbound symbol '{name}'"))),
+                            None => {
+                                // Same rule as `Instr::Load`: the suggestion
+                                // comes from the compile-time table, because
+                                // the frame's slot names are known here while
+                                // the env may not hold them yet.
+                                let mut e = Error::runtime_at(
+                                    format!("unbound symbol '{name}'"),
+                                    cur_span(&frames, ip),
+                                );
+                                if let Some(m) = frame.code.slot_suggestions.get(&s) {
+                                    e = e.with_suggestion(m.clone());
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                 };
@@ -725,10 +852,23 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
             Instr::Load(i) => {
                 let frame = &frames.last().unwrap();
                 let name = frame.code.names[i].clone();
-                let v = frame
-                    .env
-                    .get(&name)
-                    .ok_or_else(|| Error::runtime(format!("unbound symbol '{name}'")))?;
+                let v = frame.env.get(&name).ok_or_else(|| {
+                    // The suggestion was resolved at *compile* time (see
+                    // `emit_load_var`), when the compiler knew every name in
+                    // scope — including `def`s that had not executed yet. The
+                    // runtime env at this point holds fewer names than the
+                    // program will eventually have, so it cannot re-derive the
+                    // same answer, and doing so would make the VM disagree
+                    // with the tree-walk (4-backend rule).
+                    let mut e = Error::runtime_at(
+                        format!("unbound symbol '{name}'"),
+                        cur_span(&frames, ip),
+                    );
+                    if let Some(m) = frame.code.name_suggestions.get(&i) {
+                        e = e.with_suggestion(m.clone());
+                    }
+                    e
+                })?;
                 stack.push(v);
             }
             Instr::Def(i) => {
@@ -751,48 +891,42 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         Some(r) => stack.push(Value::Int(r)),
                         None => stack.push(Value::Float((*x as f64) + (*y as f64))),
                     },
-                    _ => stack.push(numeric_fold(
-                        &[a, b],
-                        0.0,
-                        0,
-                        |x, y| x + y,
-                        i64::checked_add,
-                    )?),
+                    _ => stack.push(
+                        numeric_fold(&[a, b], 0.0, 0, |x, y| x + y, i64::checked_add)
+                            .map_err(|e| e.or_at(cur_span(&frames, ip)))?,
+                    ),
                 }
             }
             Instr::Mul => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(numeric_fold(
-                    &[a, b],
-                    1.0,
-                    1,
-                    |x, y| x * y,
-                    i64::checked_mul,
-                )?);
+                stack.push(
+                    numeric_fold(&[a, b], 1.0, 1, |x, y| x * y, i64::checked_mul)
+                        .map_err(|e| e.or_at(cur_span(&frames, ip)))?,
+                );
             }
             Instr::Sub => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_sub(&[a, b])?);
+                stack.push(builtin_sub(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
             }
             Instr::Div => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_div(&[a, b])?);
+                stack.push(builtin_div(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
             }
             Instr::Mod => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(builtin_mod(&[a, b])?);
+                stack.push(builtin_mod(&[a, b]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
             }
             Instr::Neg => {
                 let a = stack.pop().unwrap();
-                stack.push(builtin_sub(&[a])?);
+                stack.push(builtin_sub(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
             }
             Instr::Recip => {
                 let a = stack.pop().unwrap();
-                stack.push(builtin_div(&[a])?);
+                stack.push(builtin_div(&[a]).map_err(|e| e.or_at(cur_span(&frames, ip)))?);
             }
 
             // ---- inlined comparisons ----
@@ -871,9 +1005,16 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                 }
                 args.reverse();
                 let callee = stack.pop().unwrap();
+                // The call's instruction index, for the *error* paths below to
+                // look up the callee's source name recorded at compile time.
+                // `ip` was already advanced past this `Call`, so it is the
+                // index. Nothing is resolved here: a HashMap lookup and a
+                // String clone per call would tax the hot loop for a
+                // diagnostic that almost never happens.
+                let call_ip = frame.ip - 1;
                 match callee {
                     Value::Builtin { f, .. } => {
-                        let r = f(&args)?;
+                        let r = f(&args).map_err(|e| e.or_at(cur_span(&frames, ip)))?;
                         stack.push(r);
                     }
                     Value::Closure(c) => {
@@ -883,16 +1024,23 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         let np = fnc.params.len();
                         if fnc.variadic.is_some() {
                             if args.len() < np {
-                                return Err(Error::runtime(format!(
-                                    "fn expects at least {np} args, got {}",
-                                    args.len()
-                                )));
+                                let who = self_callee_name(&frames, call_ip);
+                                return Err(Error::runtime_at(
+                                    format!(
+                                        "arity mismatch: ({who}) takes at least {np} args, got {}",
+                                        args.len()
+                                    ),
+                                    cur_span(&frames, ip),
+                                ));
                             }
                         } else if args.len() != np {
-                            return Err(Error::runtime(format!(
-                                "fn expects {np} args, got {}",
-                                args.len()
-                            )));
+                            let who = self_callee_name(&frames, call_ip);
+                            return Err(crate::eval::arity_mismatch(
+                                &who,
+                                np,
+                                args.len(),
+                                cur_span(&frames, ip),
+                            ));
                         }
                         if frames.len() > MAX_DEPTH {
                             return Err(Error::runtime(format!(
@@ -927,10 +1075,10 @@ pub fn run(top: &FnCode, env: &Env) -> Result<Value> {
                         });
                     }
                     other => {
-                        return Err(Error::runtime(format!(
-                            "cannot call a {}",
-                            other.type_name()
-                        )))
+                        return Err(crate::eval::not_callable(
+                            other.type_name(),
+                            cur_span(&frames, ip),
+                        ));
                     }
                 }
             }
@@ -984,7 +1132,7 @@ pub fn run_str(src: &str) -> Result<Value> {
 /// call gets a fresh step budget (the VM's step counter is local to `run`).
 pub fn run_in(src: &str, env: &Env) -> Result<Value> {
     let forms = crate::parse(src)?;
-    run_forms(&forms, env)
+    run_forms(&forms, env).map_err(|e| e.located_in(src))
 }
 
 /// Compile + run already-parsed forms in `env`, returning the last form's
@@ -1008,4 +1156,20 @@ pub fn run_forms(forms: &[Node], env: &Env) -> Result<Value> {
 pub fn run_form(form: &Node, env: &Env) -> Result<Value> {
     let code = compile_top(std::slice::from_ref(form))?;
     run(&code, env)
+}
+
+/// [`run_form`], but the error is located against `src` and the suggestion
+/// candidates are seeded from `env`.
+///
+/// The REPL holds the whole submission text while it evaluates the forms one at
+/// a time, so it can hand the source down and get a real `at line N, col M`
+/// rather than a bare byte offset.
+///
+/// Seeding matters for the same reason: the REPL compiles each submission
+/// alone, so a name bound on an *earlier* line is in `env` but in none of the
+/// forms being compiled. Without this, a typo of an earlier binding would get
+/// no suggestion in the REPL while a whole-file run would suggest it.
+pub fn run_form_in(form: &Node, env: &Env, src: &str) -> Result<Value> {
+    let code = compile_top_seeded(std::slice::from_ref(form), env.all_names())?;
+    run(&code, env).map_err(|e| e.located_in(src))
 }

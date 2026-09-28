@@ -68,6 +68,7 @@ fn parse_form(toks: &[Tok], pos: &mut usize, depth: usize) -> Result<Node> {
                 return Err(Error::Parse {
                     msg: format!("nesting too deep (max {MAX_NEST_DEPTH} levels)"),
                     at: start,
+                    loc: None,
                 });
             }
             *pos += 1;
@@ -78,6 +79,7 @@ fn parse_form(toks: &[Tok], pos: &mut usize, depth: usize) -> Result<Node> {
                         return Err(Error::Parse {
                             msg: "unclosed '('".into(),
                             at: start,
+                            loc: None,
                         })
                     }
                     Some(Tok::RParen(end)) => {
@@ -92,6 +94,7 @@ fn parse_form(toks: &[Tok], pos: &mut usize, depth: usize) -> Result<Node> {
         Tok::RParen(at) => Err(Error::Parse {
             msg: "unexpected ')'".into(),
             at: *at,
+            loc: None,
         }),
         Tok::Str { text, start, end } => {
             *pos += 1;

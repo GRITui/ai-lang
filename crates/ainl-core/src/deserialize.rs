@@ -63,6 +63,7 @@ pub fn json_to_forms(json: &str) -> Result<Vec<Node>> {
                 return Err(Error::Json {
                     msg: format!("unknown top-level field '{other}'"),
                     at: 0,
+                    loc: None,
                 })
             }
         }
@@ -71,27 +72,32 @@ pub fn json_to_forms(json: &str) -> Result<Vec<Node>> {
         .ok_or_else(|| Error::Json {
             msg: "missing 'version'".into(),
             at: 0,
+            loc: None,
         })?
         .as_str()
         .ok_or_else(|| Error::Json {
             msg: "'version' must be a string".into(),
             at: 0,
+            loc: None,
         })?
         .to_string();
     if version != SUPPORTED_VERSION {
         return Err(Error::Json {
             msg: format!("unsupported version '{version}' (expected '{SUPPORTED_VERSION}')"),
             at: 0,
+            loc: None,
         });
     }
     let _ = source; // recorded by the serializer for provenance; not part of the AST
     let forms = forms.ok_or_else(|| Error::Json {
         msg: "missing 'forms'".into(),
         at: 0,
+        loc: None,
     })?;
     let forms = forms.as_array().ok_or_else(|| Error::Json {
         msg: "'forms' must be an array".into(),
         at: 0,
+        loc: None,
     })?;
 
     let mut nodes = Vec::with_capacity(forms.len());
@@ -99,6 +105,7 @@ pub fn json_to_forms(json: &str) -> Result<Vec<Node>> {
         nodes.push(parse_node(fv, 0, &mut |at, msg| Error::Json {
             msg: format!("forms[{idx}]: {msg}"),
             at,
+            loc: None,
         })?);
     }
     Ok(nodes)
@@ -351,6 +358,7 @@ impl<'a> Parser<'a> {
         Error::Json {
             msg: msg.into(),
             at: self.i,
+            loc: None,
         }
     }
 

@@ -515,6 +515,105 @@ rule exists to prevent.
    an outer binding, even one of the same name; it always shadows instead.
 6. Prefer the shortest correct form — density is the point.
 
+## 5a. Error messages
+
+When AINL fails, the diagnostic is meant to be *acted on*. Every error answers
+three questions, in this order:
+
+1. **What** went wrong — a short phrase naming the thing.
+2. **Where** — a 1-based `at line N, col M` pointing into your source. Never a
+   bare byte offset alone: a byte offset means nothing to someone reading the
+   text. The byte offset is still included, in parentheses, so a tool can
+   correlate the error with `ainl ast --json` output.
+3. **The likely fix**, when one can be inferred, after an em dash.
+
+Columns count **characters**, not bytes, so they match what you see in an
+editor.
+
+```
+<kind> error: <what went wrong> at line N, col M (byte B) — did you mean 'x'?
+```
+
+### The four shapes
+
+| Shape | Example |
+|---|---|
+| Unbound symbol | `unbound symbol 'doubl' at line 3, col 8 (byte 38) — did you mean 'double'?` |
+| Arity mismatch | `arity mismatch: (add2) takes 2 args, got 1 at line 2, col 1 (byte 29)` |
+| Type error | `runtime error: expected a number, got str at line 2, col 1 (byte 12)` |
+| Parse error | `parse error: unexpected ')' at line 1, col 10 (byte 9)` |
+
+Real output, verbatim:
+
+```
+$ cat broken.ainl
+(def double (fn (x) (* 2 x)))
+(print (doubl 21))
+
+$ ainl run broken.ainl
+runtime error: unbound symbol 'doubl' at line 2, col 9 (byte 38) — did you mean 'double'?
+```
+
+### Close-match suggestions
+
+An unbound symbol gets `— did you mean 'x'?` when a name **currently in scope**
+is close to the one you wrote. This is the highest-value part of the error: it
+turns a failed run into a single edit.
+
+The rule, in full:
+
+- **In scope, not a hardcoded list.** Builtins *and* the program's own `def`s
+  and parameters *and* imported names are all candidates. A typo'd local is
+  corrected against the local.
+- **Case-insensitive**, so `PRINT` suggests `print`.
+- **Bounded edit distance**: at most `max(1, len(name) * 0.34)` edits
+  (insert, delete, substitute). A longer name tolerates more slips than a
+  short one.
+- **At least 3 characters.** Every one-character name is distance 1 from every
+  other, so without this a bare `f` would be "corrected" to `*`.
+- **Never an operator.** A candidate made only of punctuation (`+`, `*`, `<=`)
+  is never suggested — someone who typed a word did not mean an operator.
+- **One suggestion, not a menu**, and ties break alphabetically so every
+  backend prints the same string.
+- **Silence when unsure.** If nothing is close enough, there is no suggestion
+  at all. A confident wrong suggestion costs a repair more than no suggestion.
+
+### What is *not* given a position
+
+Two errors carry no line, on purpose:
+
+- **Resource limits** — the step budget (`AINL_MAX_STEPS`, default 2,000,000)
+  and the recursion depth. These are properties of the whole run, not of any
+  one form. Attributing a step-limit failure to the `while` loop that started
+  it would be a guess, and a plausible-looking wrong line is worse than none.
+- **The AOT C backend and the three transpilers** — see below.
+
+### Backend differences (the 4-backend rule)
+
+The interpreter and the bytecode VM produce **byte-identical** stderr for the
+same program; that equality is enforced by `crates/ainl-core/tests/error_format.rs`.
+
+The other two backends differ in one way, and it is structural rather than
+incidental:
+
+| Backend | What goes wrong | Position | Suggestion |
+|---|---|---|---|
+| Interpreter (tree-walk) | yes | yes | yes |
+| Bytecode VM | yes | yes | yes |
+| AOT C | yes | **no** | **no** |
+| Python / JS / Ruby | yes | **no** | **no** |
+
+`ainl compile` emits a **standalone C program**: the source text is not embedded
+in the binary, so a line/column is not merely unavailable to the runtime — it
+does not exist. The C runtime therefore stops at the description. The
+transpilers emit host-language source, and the host raises its own exception
+when the AINL-level check does not fire first.
+
+The rule this preserves: **what went wrong** matches byte-for-byte across all
+four backends. Only the position and the suggestion are interpreter-only, and
+they are never invented where they cannot be known. Run the program with
+`ainl run` when you need a diagnostic a model can act on.
+
 ## 6. Constrained decoding
 
 The grammar above is regular enough to express directly as GBNF/EBNF for

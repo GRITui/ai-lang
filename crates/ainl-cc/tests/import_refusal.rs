@@ -16,7 +16,7 @@
 //! message is about interpreter-only, so a generic "unsupported" or a changed
 //! error string fails the test.
 
-use ainl_core::{parse, Error};
+use ainl_core::parse;
 
 /// The message every backend uses to refuse an import, and the part that makes
 /// the refusal actionable.
@@ -109,8 +109,10 @@ fn aot_allows_a_quoted_import() {
 fn aot_refusal_is_a_proper_error() {
     let forms = parse(r#"(import "m.ainl")"#).expect("parses");
     match ainl_cc::generate(&forms) {
-        Err(Error::Runtime(msg)) => assert!(msg.contains(REFUSAL), "got: {msg}"),
-        Err(other) => panic!("expected a runtime error, got: {other:?}"),
+        Err(e) => {
+            let msg = e.message();
+            assert!(msg.contains(REFUSAL), "got: {msg}");
+        }
         Ok(_) => panic!("codegen accepted a program with imports"),
     }
 }

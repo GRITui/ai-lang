@@ -2,10 +2,11 @@
 
 use crate::error::{Error, Result};
 use crate::parser::Node;
+use crate::suggest;
 use crate::value::{Closure, ConsCell, Value};
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 // ---- resource limits --------------------------------------------------------
@@ -147,6 +148,27 @@ impl Env {
             .collect()
     }
 
+    /// Every name bound anywhere in the scope chain, nearest scope last.
+    ///
+    /// This is the candidate set for a close-match suggestion on an unbound
+    /// symbol: a typo is most often a near-miss on a name that *is* in scope,
+    /// whether that is a builtin or one of the program's own bindings.
+    ///
+    /// Deduplicated and sorted, so a suggestion is the same string on every
+    /// backend and in every run (the 4-backend rule — a `HashMap` iteration
+    /// order would make the suggestion arbitrary).
+    pub fn all_names(&self) -> Vec<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut cur = Some(self.clone());
+        while let Some(env) = cur {
+            for (k, _) in env.0.vars.borrow().iter() {
+                names.insert(k.clone());
+            }
+            cur = env.0.parent.clone();
+        }
+        names.into_iter().collect()
+    }
+
     /// A fresh global environment with all builtins bound.
     pub fn with_prelude() -> Env {
         let env = Env::new();
@@ -244,36 +266,106 @@ pub fn eval(node: &Node, env: &Env) -> Result<Value> {
         Node::Int(i, _) => Ok(Value::Int(*i)),
         Node::Float(x, _) => Ok(Value::Float(*x)),
         Node::Str(s, _) => Ok(Value::str(s.clone())),
-        Node::Sym(name, _) => match name.as_str() {
+        Node::Sym(name, span) => match name.as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             "nil" => Ok(Value::Nil),
             _ => env
                 .get(name)
-                .ok_or_else(|| Error::runtime(format!("unbound symbol '{name}'"))),
+                .ok_or_else(|| unbound_symbol(name, span.start, env)),
         },
-        Node::List(items, _) => eval_list(items, env),
+        Node::List(items, span) => eval_list(items, env, span.start),
     }
 }
 
-fn eval_list(items: &[Node], env: &Env) -> Result<Value> {
+/// The names the prelude binds — the builtins a program can call without
+/// binding them first.
+///
+/// Derived by actually installing the prelude into a throwaway [`Env`] and
+/// reading the names back, rather than kept as a hand-written list. A list
+/// would drift the moment a builtin is added, and a drift here means a
+/// misspelling of the new builtin gets *no* suggestion while a misspelling of
+/// an old one does — a failure nobody would notice until it bit them.
+pub fn builtin_names() -> Vec<String> {
+    thread_local! {
+        static NAMES: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    NAMES.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.is_none() {
+            let env = Env::with_prelude();
+            let mut names: Vec<String> = env.0.vars.borrow().keys().cloned().collect();
+            names.sort();
+            *slot = Some(names);
+        }
+        slot.as_ref().expect("just set").clone()
+    })
+}
+
+/// The canonical unbound-symbol error: the name, where it was written, and the
+/// closest name actually in scope.
+///
+/// One function so the tree-walk, the VM and the module loader cannot drift in
+/// wording (the 4-backend rule) and so the suggestion rule is defined once.
+pub(crate) fn unbound_symbol(name: &str, at: usize, env: &Env) -> Error {
+    unbound_symbol_in(name, at, env.all_names())
+}
+
+/// [`unbound_symbol`] with an explicit candidate set, for the case where the
+/// VM knows of names the environment does not hold yet — a `def`-bound local
+/// slot that is still unbound on this path is still the program's own
+/// vocabulary, and is still the best suggestion.
+pub(crate) fn unbound_symbol_in(name: &str, at: usize, candidates: Vec<String>) -> Error {
+    let e = Error::runtime_at(format!("unbound symbol '{name}'"), at);
+    match suggest::close_match(name, candidates) {
+        Some(m) => e.with_suggestion(m),
+        None => e,
+    }
+}
+
+/// The canonical arity-mismatch error.
+///
+/// `callee` is the name the *call site* used, so the message names the symbol
+/// the reader typed (`arity mismatch: (add) takes 2 args, got 1`) rather than an
+/// internal function label. Shared by the tree-walk's `apply` and the VM's
+/// `Call`, so the two cannot disagree.
+pub(crate) fn arity_mismatch(callee: &str, expected: usize, got: usize, at: usize) -> Error {
+    Error::runtime_at(
+        format!("arity mismatch: ({callee}) takes {expected} args, got {got}"),
+        at,
+    )
+}
+
+/// The canonical "called something that isn't callable" error.
+pub(crate) fn not_callable(what: &str, at: usize) -> Error {
+    Error::runtime_at(format!("cannot call a {what}"), at)
+}
+
+fn eval_list(items: &[Node], env: &Env, call_span: usize) -> Result<Value> {
     let Some(head) = items.first() else {
         // empty list evaluates to nil
         return Ok(Value::Nil);
     };
 
     // Special forms are dispatched by the head symbol before evaluating args.
+    //
+    // A malformed special form (`(def)`, `(let nope 1)`) fails on its *shape*,
+    // and the form's own span is the most precise position available — there
+    // is no deeper node that is "the" culprit. `or_at` stamps it on the way
+    // out, so every one of these shape errors gets `at line N, col M` without
+    // each `sf_*` having to thread a position through.
     if let Node::Sym(op, _) = head {
         match op.as_str() {
-            "def" => return sf_def(&items[1..], env),
-            "fn" => return sf_fn(&items[1..], env),
-            "if" => return sf_if(&items[1..], env),
-            "do" => return sf_do(&items[1..], env),
-            "let" => return sf_let(&items[1..], env),
-            "while" => return sf_while(&items[1..], env),
-            "quote" => return sf_quote(&items[1..]),
-            "and" => return sf_and(&items[1..], env),
-            "or" => return sf_or(&items[1..], env),
+            "def" => return sf_def(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "fn" => return sf_fn(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "if" => return sf_if(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "do" => return sf_do(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "let" => return sf_let(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "while" => return sf_while(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "quote" => return sf_quote(&items[1..]).map_err(|e| e.or_at(call_span)),
+            "and" => return sf_and(&items[1..], env).map_err(|e| e.or_at(call_span)),
+            "or" => return sf_or(&items[1..], env).map_err(|e| e.or_at(call_span)),
             _ => {}
         }
     }
@@ -284,27 +376,45 @@ fn eval_list(items: &[Node], env: &Env) -> Result<Value> {
     for a in &items[1..] {
         args.push(eval(a, env)?);
     }
-    apply(callee, &args)
+    // The head's own text and span are the call site: they are what makes an
+    // arity or "cannot call" error say *which* call was wrong and where.
+    let callee_name = match head {
+        Node::Sym(n, _) => Some(n.as_str()),
+        _ => None,
+    };
+    apply_at(callee, &args, callee_name, call_span)
 }
 
+/// Apply a callable with no call-site information.
+///
+/// Kept for callers that have no AST in hand (a value stored in a map and
+/// invoked later, for instance); its errors carry no position, which is
+/// honest — there is no source form to point at.
 pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
+    apply_at(callee, args, None, 0)
+}
+
+fn apply_at(callee: Value, args: &[Value], callee_name: Option<&str>, at: usize) -> Result<Value> {
+    // Name the call in the message: the symbol the reader typed, or a
+    // structural description for an anonymous callee.
+    let who = callee_name.unwrap_or("anonymous");
     match callee {
-        Value::Builtin { f, .. } => f(args),
+        Value::Builtin { f, .. } => f(args).map_err(|e| e.or_at(at)),
         Value::Closure(clos) => {
             let call_env = clos.env.child();
             let np = clos.params.len();
             if clos.variadic.is_some() {
                 if args.len() < np {
-                    return Err(Error::runtime(format!(
-                        "fn expects at least {np} args, got {}",
-                        args.len()
-                    )));
+                    return Err(Error::runtime_at(
+                        format!(
+                            "arity mismatch: ({who}) takes at least {np} args, got {}",
+                            args.len()
+                        ),
+                        at,
+                    ));
                 }
             } else if args.len() != np {
-                return Err(Error::runtime(format!(
-                    "fn expects {np} args, got {}",
-                    args.len()
-                )));
+                return Err(arity_mismatch(who, np, args.len(), at));
             }
             for (name, val) in clos.params.iter().zip(args.iter()) {
                 call_env.define(name.clone(), val.clone());
@@ -335,10 +445,7 @@ pub fn apply(callee: Value, args: &[Value]) -> Result<Value> {
                 None => Ok(last),
             }
         }
-        other => Err(Error::runtime(format!(
-            "cannot call a {}",
-            other.type_name()
-        ))),
+        other => Err(not_callable(other.type_name(), at)),
     }
 }
 

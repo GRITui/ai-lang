@@ -16,6 +16,7 @@ pub mod json_value;
 pub mod lexer;
 pub mod parser;
 pub mod serialize;
+pub mod suggest;
 pub mod value;
 pub mod vm;
 
@@ -29,9 +30,12 @@ pub use serialize::{forms_to_json, LineIndex};
 pub use value::{ConsCell, Value};
 
 /// Parse a source string into the AST (a sequence of top-level forms).
+///
+/// Errors carry a resolved line/column as well as the raw byte offset, so a
+/// reader (or a model) is told where the problem is in terms of the text.
 pub fn parse(src: &str) -> Result<Vec<Node>> {
-    let toks = lexer::lex(src)?;
-    parser::parse(&toks)
+    let toks = lexer::lex(src).map_err(|e| e.located_in(src))?;
+    parser::parse(&toks).map_err(|e| e.located_in(src))
 }
 
 /// Parse a program and serialize its AST to stable JSON (with source-map
@@ -88,10 +92,11 @@ fn run_named_with(
     for (name, value) in prepared.names {
         env.define(name, value);
     }
-    match executor {
+    let result = match executor {
         import::Executor::Vm => vm::run_forms(&prepared.forms, env),
         import::Executor::TreeWalk => eval::run_forms(&prepared.forms, env),
-    }
+    };
+    result.map_err(|e| e.located_in(src))
 }
 
 /// Parse and evaluate a program in an existing environment (used by the REPL so
@@ -118,5 +123,5 @@ pub fn run_in_tree_walk(src: &str) -> Result<Value> {
 pub fn tree_walk_in(src: &str, env: &Env) -> Result<Value> {
     eval::reset_limits();
     let forms = parse(src)?;
-    eval::run_forms(&forms, env)
+    eval::run_forms(&forms, env).map_err(|e| e.located_in(src))
 }

@@ -14,7 +14,7 @@
 //! the refusal is the contract, and the contract is: refuse, name the reason,
 //! and point at the interpreter.
 
-use ainl_core::{parse, Error};
+use ainl_core::parse;
 
 /// The part of the message that makes the refusal actionable.
 const REFUSAL: &str = "interpreter-only";
@@ -82,8 +82,10 @@ fn aot_refusal_points_at_a_byte_offset() {
 fn aot_refusal_is_a_proper_error_not_a_panic() {
     let forms = parse(r#"(http-get "http://x/")"#).expect("parses");
     match ainl_cc::generate(&forms) {
-        Err(Error::Runtime(msg)) => assert!(msg.contains(REFUSAL), "got: {msg}"),
-        Err(other) => panic!("expected a runtime error, got: {other:?}"),
+        Err(e) => {
+            let msg = e.message();
+            assert!(msg.contains(REFUSAL), "got: {msg}");
+        }
         Ok(_) => panic!("codegen accepted a program with http-get"),
     }
 }

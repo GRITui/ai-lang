@@ -91,12 +91,14 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                             return Err(Error::Lex {
                                 msg: format!("invalid escape '\\{}'", other),
                                 at: j,
+                                loc: None,
                             });
                         }
                         None => {
                             return Err(Error::Lex {
                                 msg: "unterminated escape".into(),
                                 at: j,
+                                loc: None,
                             })
                         }
                     },
@@ -107,6 +109,7 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 return Err(Error::Lex {
                     msg: "unterminated string".into(),
                     at: start,
+                    loc: None,
                 });
             }
         } else {
@@ -124,6 +127,7 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 .map_err(|_| Error::Lex {
                     msg: "invalid utf-8".into(),
                     at: start,
+                    loc: None,
                 })?
                 .to_string();
             toks.push(Tok::Atom { text, start, end });
@@ -287,6 +291,7 @@ mod tests {
             other => Err(Error::Lex {
                 msg: format!("expected one Str token, got {:?}", other),
                 at: 0,
+                loc: None,
             }),
         }
     }

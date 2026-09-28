@@ -164,7 +164,7 @@ impl Repl {
         let mut last = String::new();
         let mut printed = false;
         for form in &forms {
-            match ainl_core::vm::run_form(form, &self.env) {
+            match ainl_core::vm::run_form_in(form, &self.env, src) {
                 Ok(v) => {
                     if !is_undisplayed(&v) {
                         // Only the *last* form's value is echoed, so a
@@ -195,9 +195,20 @@ fn is_undisplayed(v: &Value) -> bool {
     matches!(v, Value::Nil | Value::Sym(_)) || matches!(v, Value::List(l) if l.len == 0)
 }
 
-/// Render an error with the line the submission started on.
+/// Render an error for a REPL session.
+///
+/// The error already carries a resolved `at line N, col M` whenever the failing
+/// node had a position, so this only adds the submission's starting line as a
+/// *fallback* — for the errors that have no node (a resource limit), and for a
+/// submission the REPL parses incrementally. It is deliberately not an
+/// unconditional prefix: with a position already present, `line 1: … at line 1,
+/// col 2` names two different lines and reads as a contradiction.
 fn describe(e: Error, line: usize) -> String {
-    format!("line {line}: {e}")
+    if e.location().is_some() {
+        format!("{e}")
+    } else {
+        format!("line {line}: {e}")
+    }
 }
 
 /// One `read-eval-print` iteration against an explicit reader and writer.
@@ -452,8 +463,9 @@ mod tests {
         let (out, err) = session("(nosuchvar)\n(+ 1 2)\n");
         assert_eq!(out, "3\n", "the session must continue after an error");
         assert!(err.contains("unbound symbol 'nosuchvar'"), "got: {err}");
-        // The line number is what a user can act on.
-        assert!(err.contains("line 1:"), "got: {err}");
+        // The position is what a user can act on: line and column, not a bare
+        // byte offset. `nosuchvar` opens at column 2 of line 1.
+        assert!(err.contains("at line 1, col 2"), "got: {err}");
     }
 
     #[test]
@@ -509,9 +521,13 @@ mod tests {
     }
 
     #[test]
-    fn an_error_line_number_refers_to_the_first_line_of_the_submission() {
+    fn an_error_reports_the_line_within_the_submission_that_failed() {
+        // The submission is one unbalanced form spanning two lines. The error
+        // names the line *inside* the submission the offending token is on,
+        // which is more useful than always naming the submission's first line.
         let (_, err) = session("(+ 1\n   2))\n");
-        assert!(err.contains("line 1:"), "got: {err}");
+        assert!(err.contains("unexpected ')'"), "got: {err}");
+        assert!(err.contains("line 2"), "got: {err}");
     }
 
     #[test]

@@ -190,8 +190,9 @@ fn an_error_prints_to_stderr_and_the_session_continues() {
         "got: {}",
         s.stderr
     );
-    // The line number makes a multi-line session actionable.
-    assert!(s.stderr.contains("line 1:"), "got: {}", s.stderr);
+    // The position makes a multi-line session actionable: line *and* column,
+    // not a bare byte offset. `nosuchvar` opens at column 2 of line 1.
+    assert!(s.stderr.contains("at line 1, col 2"), "got: {}", s.stderr);
 }
 
 #[test]
@@ -208,6 +209,31 @@ fn a_failed_line_leaves_earlier_bindings_intact() {
     let s = repl_stdin("(def a 7)\n(nosuch)\na\n");
     assert_eq!(s.stdout_lines(), ["7"], "the earlier def must survive");
     assert!(s.stderr.contains("unbound symbol"), "got: {}", s.stderr);
+}
+
+#[test]
+fn a_repl_error_suggests_the_close_match() {
+    // End-to-end through the shipped binary: the suggestion has to survive
+    // the whole path (compiler table -> VM -> REPL renderer), not just appear
+    // in a unit test of the matcher.
+    let s = repl_stdin("(prnt 1)\n");
+    assert!(
+        s.stderr.contains("did you mean 'print'?"),
+        "the REPL dropped the suggestion: {}",
+        s.stderr
+    );
+}
+
+#[test]
+fn a_repl_suggests_a_name_bound_on_an_earlier_line() {
+    // The candidate set must include the session's own bindings, not just the
+    // prelude — a REPL builds up state, and that state is the vocabulary.
+    let s = repl_stdin("(def total 10)\n(totl 5)\n");
+    assert!(
+        s.stderr.contains("did you mean 'total'?"),
+        "got: {}",
+        s.stderr
+    );
 }
 
 #[test]

@@ -31,6 +31,7 @@
 //! retained as a fallback and as the semantic reference the VM is checked
 //! against (see `run_in_tree_walk`).
 
+use crate::parser::Span;
 use crate::value::Value;
 use std::rc::Rc;
 
@@ -147,6 +148,50 @@ pub struct FnCode {
     /// closures can look it up and the `LIVE_SCOPES` cycle-breaking works. When
     /// false (no closures in the subtree), the hot loop skips all env updates.
     pub env_active: bool,
+    /// Source span for each instruction in `body`, parallel to it: entry `i` is
+    /// the span of the AST node that `body[i]` was compiled from.
+    ///
+    /// This is what lets the VM report *where* a failure happened, matching the
+    /// tree-walk's `at line N, col M`. Without it the VM could only say what
+    /// went wrong, and the two backends would disagree on stderr — which the
+    /// 4-backend rule forbids.
+    ///
+    /// Parallel rather than embedded in [`Instr`] for one reason: `Instr` is
+    /// `Copy` and 8 bytes wide, and it is matched in the hot loop. Widening it
+    /// to carry a `Span` would grow every push/pop of the operand stack's
+    /// instruction stream for a diagnostic only. A side table costs one
+    /// `Span` per instruction, allocated at compile time only.
+    ///
+    /// **Read it on the error path only.** Indexing this table per instruction
+    /// in the run loop cost about 2.5x of the VM's throughput — the 40k
+    /// benchmark's speedup gate fell from 8.5x to 3.0x — because it breaks the
+    /// single-borrow prologue the hot loop is built around. `vm::cur_span` is
+    /// the only sanctioned reader.
+    ///
+    /// Always the same length as `body`; [`FnCode::push`] keeps them in step.
+    pub spans: Vec<Span>,
+    /// Source name of each call's callee, keyed by the `Call` instruction's
+    /// index in `body`.
+    ///
+    /// The VM pushes a *value* at the callee, so by the time `Call` runs, the
+    /// symbol the reader wrote is gone — and without it an arity error can only
+    /// say "fn expects 2 args", not which of the program's functions was
+    /// called wrongly. The tree-walk still has the AST and can say it. This
+    /// table is what makes the two agree (the 4-backend rule).
+    ///
+    /// Sparse (`HashMap`, not a parallel `Vec`) and read **only on the error
+    /// path**: most programs have few call sites relative to instruction
+    /// count, and the hot loop must not pay for a name lookup per call.
+    pub call_names: std::collections::HashMap<usize, String>,
+    /// Close-match suggestion for each entry in `names`, for the same reason as
+    /// `call_names` above: the *runtime* environment is missing names the
+    /// *compiler* could see (a `def` further down the file has not run yet), so
+    /// only the compiler can produce the same answer the tree-walk produces.
+    ///
+    /// Sparse: only entries that actually have a suggestion are present.
+    pub name_suggestions: std::collections::HashMap<usize, String>,
+    /// The same, for `locals` (the local-slot table), keyed by slot.
+    pub slot_suggestions: std::collections::HashMap<usize, String>,
 }
 
 /// A compiled program is just the top-level [`FnCode`].
@@ -165,7 +210,27 @@ impl FnCode {
             locals: Vec::new(),
             slot_syms: Vec::new(),
             env_active: false,
+            spans: Vec::new(),
+            call_names: std::collections::HashMap::new(),
+            name_suggestions: std::collections::HashMap::new(),
+            slot_suggestions: std::collections::HashMap::new(),
         }
+    }
+
+    /// Append an instruction together with the span of the node it came from.
+    ///
+    /// The only way to add to `body` — keeping `spans` the same length is the
+    /// invariant the VM's error path relies on.
+    pub fn push(&mut self, instr: Instr, span: Span) {
+        self.body.push(instr);
+        self.spans.push(span);
+    }
+
+    /// The source span of instruction `ip`, or `Span::new(0, 0)` if the table
+    /// is somehow shorter (defensive: a wrong position is better than a panic
+    /// on an error path).
+    pub fn span_at(&self, ip: usize) -> Span {
+        self.spans.get(ip).copied().unwrap_or(Span::new(0, 0))
     }
 
     /// Rebuild the precomputed slot name symbols from `locals`. Called after

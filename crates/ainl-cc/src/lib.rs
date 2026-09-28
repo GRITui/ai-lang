@@ -102,6 +102,20 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
 /// Refusing at compile time is the honest answer, and it is the same contract
 /// the three transpilers give (see `ainl-transpile`), so all four backends
 /// agree on which programs they can build.
+///
+/// # Error positions (a documented backend difference)
+///
+/// The interpreter and the bytecode VM report `at line N, col M` and a
+/// close-match suggestion, because they hold the source text. This backend
+/// emits a **standalone C program** that does not embed the source, so a
+/// line/column does not exist at run time — not "is hard to get", but does not
+/// exist. The runtime therefore stops at the description, e.g.
+/// `read-file: cannot read 'x.txt'`, and never invents a position.
+///
+/// What this backend still owes the 4-backend rule is that **the description
+/// itself matches byte-for-byte**; only the position suffix is missing. That
+/// is exactly what `crates/ainl-cc/tests/aot_stdlib.rs` enforces, and the rule
+/// is documented for users in docs/SYNTAX.md §5a "Error messages".
 pub fn generate(forms: &[Node]) -> Result<String> {
     if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
         return Err(ainl_core::Error::runtime(format!(
