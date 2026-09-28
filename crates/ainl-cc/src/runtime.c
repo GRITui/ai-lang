@@ -134,6 +134,8 @@ enum {
   /* Tier 1 JSON. Appended at the end for the same reason as the Tier 1 file
    * ids above: every earlier id keeps the value it has always had. */
   B_JSON_PARSE, B_JSON_SERIALIZE,
+  /* Tier 2 testing. Appended last for the same reason. */
+  B_TEST,
   B_COUNT
 };
 
@@ -2213,6 +2215,7 @@ static Value builtin_sqrt(Value *args, int nargs) {
  * implementation, which is grouped with the other Tier 1 code further down. */
 static Value builtin_json_parse(Value *args, int nargs);
 static Value builtin_json_serialize(Value *args, int nargs);
+static Value builtin_test(Value *args, int nargs);
 
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
@@ -2331,6 +2334,8 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_json_parse(args, nargs);
     case B_JSON_SERIALIZE:
       return builtin_json_serialize(args, nargs);
+    case B_TEST:
+      return builtin_test(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -3272,6 +3277,37 @@ static Value builtin_json_serialize(Value *args, int nargs) {
   return v_str_take(b.p);
 }
 
+/* ---- testing (Tier 2) -------------------------------------------------- */
+/* (test name expr expected) -> true, or a runtime error naming the test, the
+ * expected value and the actual value.
+ *
+ * A failure raises rather than printing, so the message is one string the
+ * 4-backend rule can hold byte-for-byte: the same shared body every other
+ * error builtin produces. Like every other AOT diagnostic it carries no source
+ * position — the standalone binary does not embed the source, so there is no
+ * line/column to print. See docs/SYNTAX.md 5a. */
+static Value builtin_test(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("test expects (test name expr expected)");
+    return v_nil();
+  }
+  if (args[0].tag != V_STR) {
+    set_err("test expects a str name, got %s", type_name(&args[0]));
+    return v_nil();
+  }
+  if (args[2].tag != V_STR) {
+    set_err("test expects a str expected value, got %s", type_name(&args[2]));
+    return v_nil();
+  }
+  char actual[8192];
+  value_to_string(&args[1], actual, sizeof(actual));
+  if (strcmp(args[2].u.s->data, actual) == 0)
+    return v_bool(1);
+  set_err("test failed: %s: expected %s, got %s", args[0].u.s->data,
+          args[2].u.s->data, actual);
+  return v_nil();
+}
+
 /* ---- prelude ----------------------------------------------------------- */
 static void scope_install_prelude(Scope *env) {
   struct {
@@ -3299,6 +3335,8 @@ static void scope_install_prelude(Scope *env) {
       {"path-base", B_PATH_BASE}, {"path-dir", B_PATH_DIR},
       /* Tier 1 JSON */
       {"json-parse", B_JSON_PARSE}, {"json-serialize", B_JSON_SERIALIZE},
+      /* Tier 2 testing */
+      {"test", B_TEST},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

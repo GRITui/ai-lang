@@ -17,6 +17,7 @@ pub mod lexer;
 pub mod parser;
 pub mod serialize;
 pub mod suggest;
+pub mod testing;
 pub mod value;
 pub mod vm;
 

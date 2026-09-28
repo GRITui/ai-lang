@@ -54,10 +54,18 @@ impl Js {
     }
 
     fn finish(mut self) -> String {
-        let disp_used = self
-            .needed
-            .iter()
-            .any(|n| matches!(*n, "_print" | "_str" | "_error" | "_repr" | "_disp"));
+        // Tier 2 testing first: `_test` renders the actual value, so it is a
+        // member of the display cluster below — naming it there is what pulls
+        // in `_disp`, `_repr`, `_Hash` and `_Sym`.
+        if self.needed.contains("_test") {
+            self.needed.insert("_typename");
+        }
+        let disp_used = self.needed.iter().any(|n| {
+            matches!(
+                *n,
+                "_print" | "_str" | "_error" | "_repr" | "_disp" | "_test"
+            )
+        });
         if disp_used {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
@@ -117,6 +125,14 @@ impl Js {
             self.needed.insert("_json_ser");
             self.needed.insert("_json_str");
             self.needed.insert("_json_float");
+        }
+        // Tier 2 testing: `_test` renders the actual value and names a bad
+        // operand's type, so it needs `_disp` and `_typename` (which branches
+        // on `_Sym` and `_Hash`). The RUNTIME table is emitted in declaration
+        // order, so all three precede `_test`.
+        if self.needed.contains("_test") {
+            self.needed.insert("_typename");
+            self.needed.insert("_disp");
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
@@ -348,6 +364,12 @@ impl Js {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Tier 2 testing ----
+                // A failure raises with the same message the interpreter and
+                // the AOT C runtime produce, so stderr stays byte-equal across
+                // all four backends. `_test` compares the *rendered* value,
+                // which is the same thing the assertion spells.
+                "test" => return self.call_builtin("_test", args, Some("_test")),
                 // ---- Stage 3.1 stdlib ----
                 // Each maps to the host's own idiom (fs.readFileSync,
                 // process.env, Date.now()/1000, Math.sqrt) so the emitted JS
@@ -664,6 +686,14 @@ const RUNTIME: &[(&str, &str)] = &[
         "function _eq(a, b) {\n  if (Array.isArray(a) && Array.isArray(b)) {\n    if (a.length !== b.length) return false;\n    for (let i = 0; i < a.length; i++) { if (!_eq(a[i], b[i])) return false; }\n    return true;\n  }\n  if (a instanceof _Sym && b instanceof _Sym) return a.name === b.name;\n  return a === b;\n}",
     ),
     ("_print", "function _print(...xs) { console.log(xs.map(_disp).join(\" \")); }"),
+    (
+        "_typename",
+        "function _typename(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (x === true || x === false) return \"bool\";\n  if (x instanceof _Sym) return \"sym\";\n  if (x instanceof _Hash) return \"hash\";\n  if (Array.isArray(x)) return \"list\";\n  if (typeof x === \"string\") return \"str\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  return \"?\";\n}",
+    ),
+    (
+        "_test",
+        "function _test(name, actual, expected) {\n  if (typeof name !== \"string\") throw new Error(\"test expects a str name, got \" + _typename(name));\n  if (typeof expected !== \"string\") throw new Error(\"test expects a str expected value, got \" + _typename(expected));\n  const got = _disp(actual);\n  if (got === expected) return true;\n  throw new Error(\"test failed: \" + name + \": expected \" + expected + \", got \" + got);\n}",
+    ),
     ("_str", "function _str(...xs) { return xs.map(_disp).join(\"\"); }"),
     ("_len", "function _len(x) { return x.length; }"),
     ("_first", "function _first(x) { return x.length ? x[0] : null; }"),

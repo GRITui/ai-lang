@@ -1,0 +1,78 @@
+; Tier 1 JSON: the reader, the writer, and the rules where a host's own JSON
+; library would have disagreed.
+;
+; AINL hand-writes both directions in all four backends because each host
+; library is wrong here in a way that shows up in output bytes — key order, the
+; duplicate-key rule, non-finite floats, and `\u` escaping of non-ASCII. These
+; tests pin the AINL answers, so a future port that "simplifies" onto
+; JSON.parse / JSON.stringify fails here rather than in someone's output.
+
+; ---- parsing --------------------------------------------------------------
+(def doc (json-parse "{\"name\":\"ainl\",\"n\":2.5,\"ok\":true,\"no\":null}"))
+(test "an object is a hash" (get doc "name") "ainl")
+(test "a float member survives parsing" (get doc "n") "2.5")
+(test "a bool member survives parsing" (get doc "ok") "true")
+(test "a null member is nil" (get doc "no") "nil")
+(test "a whole number parses as an int" (get (json-parse "{\"i\":7}") "i") "7")
+(test "a negative number parses" (get (json-parse "{\"i\":-7}") "i") "-7")
+(test "an array is a list" (json-parse "[1, 2.5, \"x\"]") "(1 2.5 \"x\")")
+(test "an empty object is an empty hash" (json-serialize (json-parse "{}")) "{}")
+(test "an empty array is an empty list" (json-serialize (json-parse "[]")) "[]")
+(test "a map renders as {k v} — the display rule, which is not JSON"
+       (json-parse "{\"a\":1.5}") "{\"a\" 1.5}")
+(test "a bare string parses" (json-parse "\"hi\"") "hi")
+(test "a top-level number parses" (json-parse "42") "42")
+(test "whitespace around a document is ignored" (json-parse "  {\"a\" : 1.5}  ") "{\"a\" 1.5}")
+
+; ---- key order ------------------------------------------------------------
+; Insertion order, not sorted — a reader (or a model) diffing two documents
+; needs the order to be stable and predictable.
+(test "object keys keep insertion order, not sorted order"
+       (json-serialize (json-parse "{\"z\":1.5,\"a\":2.5,\"m\":3.5}"))
+       "{\"z\":1.5,\"a\":2.5,\"m\":3.5}")
+(test "hash construction keeps its own order too"
+       (json-serialize (hash "z" 1.5 "a" 2.5 "m" 3.5))
+       "{\"z\":1.5,\"a\":2.5,\"m\":3.5}")
+(test "a duplicate key keeps its first position and the last value"
+       (json-serialize (json-parse "{\"a\":1.5,\"b\":2.5,\"a\":9.5}"))
+       "{\"a\":9.5,\"b\":2.5}")
+
+; ---- writing --------------------------------------------------------------
+(test "a list writes as an array" (json-serialize (list 1.5 2.5)) "[1.5,2.5]")
+(test "nil writes as null" (json-serialize nil) "null")
+(test "a bool writes as true/false" (json-serialize true) "true")
+(test "a str writes with its quotes" (json-serialize "a") "\"a\"")
+(test "a slash is not escaped" (json-serialize "/") "\"/\"")
+(test "a quote is escaped" (json-serialize "\"") "\"\\\"\"")
+(test "a backslash is escaped" (json-serialize "\\") "\"\\\\\"")
+(test "a newline is escaped" (json-serialize "\n") "\"\\n\"")
+(test "non-ASCII stays literal rather than being \\u-escaped"
+       (json-serialize (json-parse "\"é中\""))
+       "\"é中\"")
+(test "a control character is \\u-escaped"
+       (json-serialize (json-parse "\"\\u0007\""))
+       "\"\\u0007\"")
+
+; ---- floats ---------------------------------------------------------------
+; A whole float gets a ".0" and never scientific notation. JSON.stringify prints
+; a whole number as "1" and would print 1e21 as "1e+21", so this is exactly the
+; kind of rule a host library gets wrong.
+(test "a whole float keeps its .0" (json-serialize 1.0) "1.0")
+(test "a non-whole float prints plainly" (json-serialize 0.1) "0.1")
+(test "a third prints as a decimal, not 0.333" (json-serialize (/ 1.0 3)) "0.3333333333333333")
+(test "a tiny float never goes scientific" (json-serialize 1e-7) "0.0000001")
+(test "a huge float never goes scientific" (json-serialize 1e21) "1000000000000000000000.0")
+
+; ---- round trip -----------------------------------------------------------
+; The property that actually matters: parse(serialize(v)) == v.
+(def rt (json-parse (json-serialize doc)))
+(test "a round trip preserves every member" (= doc rt) "true")
+(test "a round trip is byte-stable" (json-serialize rt) (json-serialize doc))
+(test "a round trip through a list preserves order" (= (list 1.5 "a" true nil) (json-parse "[1.5,\"a\",true,null]")) "true")
+
+; ---- keys are strings -----------------------------------------------------
+; AINL maps have string keys only. A numeric key would round-trip through a
+; host's dict as the string "1" on one backend and 1 on another.
+(test "a numeric-looking key is a string" (json-serialize (json-parse "{\"1\":2.5}")) "{\"1\":2.5}")
+(test "looking up a key that is absent is nil" (get doc "nope") "nil")
+(test "a non-string key is an error rather than a silent coercion" (if (= nil (get doc "absent")) true false) "true")

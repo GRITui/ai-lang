@@ -84,6 +84,10 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     // order, and crates/ainl-cc/tests/aot_stdlib.rs checks both directions.
     ("json-parse", 52),
     ("json-serialize", 53),
+    // Tier 2 testing. Appended at the end so every earlier id keeps its value;
+    // the `enum` in runtime.c is extended in exactly the same order, and
+    // crates/ainl-cc/tests/aot_stdlib.rs checks both directions.
+    ("test", 54),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

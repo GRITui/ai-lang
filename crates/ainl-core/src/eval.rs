@@ -769,6 +769,11 @@ fn install_stdlib(env: &Env) {
     // float spelling, non-finite floats are an error).
     crate::json_value::install(env);
 
+    // Testing. `(test name expr expected)` — see testing.rs for why a failure
+    // is an error rather than a printed line. The interpreter and the VM share
+    // this one implementation, which is why their stderr is identical for free.
+    crate::testing::install(env);
+
     // HTTP. Plain HTTP over TCP, interpreter-only by design: the zero-dep
     // rule is what keeps the AOT binary standalone, and every TLS stack is a
     // C-transitive dependency tree. `https://` is refused with an error that

@@ -842,6 +842,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         "path-dir",
         "json-parse",
         "json-serialize",
+        "test",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -864,7 +865,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 54, "update this list when the prelude changes");
+    assert_eq!(names.len(), 55, "update this list when the prelude changes");
 
     // The other direction, which is the one that actually catches drift: every
     // name the prelude binds must be either in the table above (reachable by
@@ -891,7 +892,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        56,
+        57,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),

@@ -112,6 +112,8 @@ counter                                    ; => 0
 
 **Control**: `(error msg...)` abort with a runtime error.
 
+**Testing**: `(test name expr expected)` → `true`, or abort with a message naming the test, the expected value and the actual one. See §3d.
+
 **String functions**: `(split s sep)` → a list, `(join list sep)` → a string, `(trim s)`, `(replace s old new)`, `(upcase s)` / `(downcase s)`, `(contains hay needle)` → bool.
 
 `upcase`/`downcase` fold **ASCII only** (`a`–`z`), and `trim` strips only the ASCII whitespace set — space, tab, newline, carriage return, form feed, vertical tab. This is deliberate: the alternative (Unicode-aware case folding and whitespace) is not implementable in the AOT C runtime without pulling in a Unicode library, and the four backends have to agree exactly. A consequence worth knowing: `"héllo"` and `"日本"` are unaffected by `upcase`, and a non-breaking space is not trimmed.
@@ -469,6 +471,91 @@ guarantee, and each host language's HTTP library disagrees with the others
 about redirects, header casing, timeouts and verification defaults — which is
 the "builds cleanly, does something subtly different" failure the four-backend
 rule exists to prevent.
+
+## 3d. Testing: `test` and `ainl test`
+
+A test is `expr == expected`. Nothing more: no fixtures, no mocking, no async,
+no test objects, no setup/teardown. AINL programs are small enough that the
+whole test is the assertion and its expectation.
+
+```lisp
+(test "adds two numbers" (+ 1 2) "3")
+```
+
+Passes, yielding `true`. Fails, aborting the program with:
+
+```
+runtime error: test failed: adds two numbers: expected 4, got 3 at line 1, col 1 (byte 0)
+```
+
+`name` and `expected` are both **strings**, and this is the one rule a caller has
+to know:
+
+- `name` must be a string, because the message has to name the test.
+- `expected` is a string because it is compared against the value's **rendered**
+  form — the exact text the failure report prints. That is deliberate: the
+  assertion and its own report can then never disagree, and it removes the last
+  place a value could print differently on two backends. Write the expectation
+  the way `print` would show the value: a list is `"(1 2)"`, a whole float is
+  `"1.0"`, `nil` is `"nil"`, a map is `"{\"k\" v}"`.
+
+Note what that implies: `1` and `1.0` are `=` in AINL but are *not* the same
+assertion, because they render differently. `(test "t" 1.0 "1")` fails.
+
+### Why a failure is an error, not a printed line
+
+`(test ...)` could have printed `ok`/`FAIL` and returned a bool. It raises
+instead, for one reason: the four backends must agree byte-for-byte on stdout
+*and* stderr, and a printed failure would make the message a stdout concern —
+so its parity would depend on each host's shim flushing and formatting a value
+at exactly the same instant. An error reuses the mechanism `error` and
+`read-file` already use and that all four backends already agree on: one shared
+message body. `crates/ainl-cc/tests/test_parity.rs` enforces it.
+
+### Running a suite
+
+```sh
+ainl test              # runs ./tests
+ainl test path/        # every *.ainl in a directory
+ainl test one.ainl     # a single file
+ainl test tests/ -q    # --quiet: summary only
+```
+
+A **test file is an ordinary AINL program** — no registration, no naming
+convention, no special file type. It runs through the same entry point as
+`ainl run`, so `import` resolution and the prelude are identical. A harness
+whose runner differs from the thing it tests is a harness that can pass while
+the program fails.
+
+Files are discovered in **sorted** order, so a report is the same on every
+machine. Each file is independent: a failing test aborts *its* file, and the
+runner continues with the next one, so one broken test does not hide every test
+after it.
+
+**Exit codes are the contract.** 0 only when every test passed. Non-zero on any
+failure, on any file that errored, and on a suite that contains no tests at all —
+"no tests found" must not read to CI as "all tests passed".
+
+```
+ok   tests/file_io.ainl (30 passed)
+FAIL tests/json.ainl — 36 passed, 1 failed: parses an empty array
+     runtime error: test failed: parses an empty array: expected "[]", got "" at line 41, col 1
+
+36 passed, 1 failed, 0 errors across 2 files
+```
+
+A **failed test** and an **errored file** are reported differently, because only
+one of them is fixed by editing a test: a file that fails to parse, or that
+raises outside a `(test ...)`, is reported as `ERROR`.
+
+### Backend scope: all four
+
+`test` is an ordinary builtin and is supported on **all four backends** — the
+interpreter, the bytecode VM, the AOT C runtime, and the Python, JS and Ruby
+transpilers. The only difference is the one §5a already documents: the
+interpreter and the VM append a position, because they hold the source, and the
+AOT binary does not, because it embeds none. The **message body is identical
+everywhere**, which is what `test_parity.rs` asserts.
 
 ## 4. Canonical examples
 

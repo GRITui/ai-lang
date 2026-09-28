@@ -188,6 +188,36 @@ jobs:
       - name: AOT parity + step-counter gate
         run: ./scripts/check-aot.sh
 
+  testing:
+    name: ainl test (test runner works; exit code is the contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The card's acceptance test, end to end against the real binary: the
+      # library and parity suites prove the `test` builtin behaves, and this
+      # proves the *runner* does — discover a directory, report a summary, exit
+      # non-zero on failure. A runner that printed a nice summary and always
+      # exited 0 would pass every other suite in this repo, and this is the job
+      # that would catch it.
+      - name: ainl test runner end to end
+        run: ./scripts/check-ainl-test.sh
+
   aot-standalone:
     name: AOT binary runs on clean Linux (musl, static)
     runs-on: ubuntu-latest

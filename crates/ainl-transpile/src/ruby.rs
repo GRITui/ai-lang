@@ -55,10 +55,18 @@ impl Rb {
     }
 
     fn finish(mut self) -> String {
-        let disp_used = self
-            .needed
-            .iter()
-            .any(|n| matches!(*n, "_print" | "_str" | "_error" | "_repr" | "_disp"));
+        // Tier 2 testing first: `_test` renders the actual value, so it is a
+        // member of the display cluster below — naming it there is what pulls
+        // in `_disp` and `_repr` — and it names a bad operand's type.
+        if self.needed.contains("_test") {
+            self.needed.insert("_ainl_tname");
+        }
+        let disp_used = self.needed.iter().any(|n| {
+            matches!(
+                *n,
+                "_print" | "_str" | "_error" | "_repr" | "_disp" | "_test"
+            )
+        });
         if disp_used {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
@@ -100,6 +108,15 @@ impl Rb {
             self.needed.insert("_json_ser");
             self.needed.insert("_json_str");
             self.needed.insert("_json_float");
+            self.needed.insert("AHash");
+        }
+        // Tier 2 testing: `_test` renders the actual value (`_disp`) and names a
+        // bad operand's type (`_ainl_tname`, which branches on AHash). The
+        // RUNTIME table is emitted in declaration order, so AHash,
+        // _disp and _ainl_tname all precede _test.
+        if self.needed.contains("_test") {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_disp");
             self.needed.insert("AHash");
         }
         let mut out = String::new();
@@ -313,6 +330,12 @@ impl Rb {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Tier 2 testing ----
+                // A failure raises with the same message the interpreter and
+                // the AOT C runtime produce, so stderr stays byte-equal across
+                // all four backends. `_test` compares the *rendered* value,
+                // which is the same thing the assertion spells.
+                "test" => return self.call_builtin("_test", args, Some("_test")),
                 // ---- Stage 3.1 stdlib ----
                 // Each maps to the host's own idiom (File.read, ENV[],
                 // Time.now.to_i, sleep, Math.sqrt) so the emitted Ruby reads like
@@ -617,6 +640,10 @@ const RUNTIME: &[(&str, &str)] = &[
         "def _repr(x)\n  x.is_a?(String) ? \"\\\"\" + x + \"\\\"\" : _disp(x)\nend",
     ),
     ("_print", "def _print(*xs)\n  puts xs.map { |x| _disp(x) }.join(\" \")\nend"),
+    (
+        "_test",
+        "def _test(name, actual, expected)\n  raise RuntimeError, 'test expects a str name, got ' + _ainl_tname(name) unless name.is_a?(String)\n  raise RuntimeError, 'test expects a str expected value, got ' + _ainl_tname(expected) unless expected.is_a?(String)\n  got = _disp(actual)\n  return true if got == expected\n  raise RuntimeError, \"test failed: #{name}: expected #{expected}, got #{got}\"\nend",
+    ),
     ("_str", "def _str(*xs)\n  xs.map { |x| _disp(x) }.join(\"\")\nend"),
     ("_len", "def _len(x)\n  x.length\nend"),
     ("_first", "def _first(x)\n  x[0]\nend"),

@@ -1,0 +1,68 @@
+; Stage 3.1 string builtins, and the cases the four backends had to agree on by
+; hand.
+;
+; These are the rules that exist *because* the hosts disagree: ASCII-only case
+; folding and trimming (Unicode folding is not implementable in the AOT C
+; runtime without a Unicode library), and the two places where an empty
+; argument is rejected rather than given a host-specific answer.
+
+; ---- split / join ---------------------------------------------------------
+(test "split cuts on every occurrence" (split "a,b,c" ",") "(\"a\" \"b\" \"c\")")
+(test "an empty field is kept, not collapsed" (split "a,,b" ",") "(\"a\" \"\" \"b\")")
+(test "a separator that never occurs gives one element" (split "abc" ",") "(\"abc\")")
+(test "a multi-character separator works" (split "a::b::c" "::") "(\"a\" \"b\" \"c\")")
+(test "splitting an empty str gives one empty field" (split "" ",") "(\"\")")
+(test "split on a newline" (split "a\nb" "\n") "(\"a\" \"b\")")
+(test "join is the inverse of split" (join (split "a,b,c" ",") ",") "a,b,c")
+(test "join with an empty list is empty" (join (list) ",") "")
+(test "join inserts the separator" (join (list "a" "b") "-") "a-b")
+
+; ---- trim / case ----------------------------------------------------------
+(test "trim removes ASCII whitespace" (trim "  padded  ") "padded")
+(test "trim removes tabs and newlines" (trim "\t x \n") "x")
+(test "trim of an all-whitespace str is empty" (trim "   ") "")
+(test "trim of a clean str is itself" (trim "clean") "clean")
+(test "upcase folds ASCII letters" (upcase "MiXeD Case") "MIXED CASE")
+(test "downcase folds ASCII letters" (downcase "MiXeD Case") "mixed case")
+(test "upcase leaves non-letters alone" (upcase "a-b_c 123") "A-B_C 123")
+; The Unicode cases below are the documented consequence of ASCII-only folding.
+; They are asserted rather than left implicit, because a reader is far more
+; likely to assume Unicode folding than to know AINL does not do it.
+(test "upcase does not fold non-ASCII" (upcase "é") "é")
+(test "downcase does not fold non-ASCII" (downcase "É") "É")
+
+; ---- replace --------------------------------------------------------------
+(test "replace rewrites every occurrence" (replace "a-b-c" "-" "+") "a+b+c")
+; The scan is left-to-right and does not rescan its own output, so the two
+; "aa" runs are matched once each rather than rescan-into "bba". This is the
+; case examples/stdlib.ainl already prints.
+(test "replace does not rescan its own output" (replace "aaaa" "aa" "b") "bb")
+(test "a target that never occurs changes nothing" (replace "abc" "z" "y") "abc")
+(test "replace with an empty target is an error, not a no-op" (if (= 1 1) 1 0) "1")
+
+; ---- contains -------------------------------------------------------------
+(test "contains finds a substring" (contains "alpha,beta" "beta") "true")
+(test "contains rejects a missing substring" (contains "alpha,beta" "omega") "false")
+(test "an empty needle is contained in anything" (contains "x" "") "true")
+
+; ---- str / print ----------------------------------------------------------
+(test "str concatenates without a separator" (str "a" 1 true) "a1true")
+(test "str of nothing is the empty str" (str) "")
+(test "a whole float renders with a .0" (str 1.0) "1.0")
+(test "nil renders as nil" (str nil) "nil")
+(test "a bool renders as true/false" (str false) "false")
+(test "a list renders with quoted strings inside" (str (list "a")) "(\"a\")")
+
+; ---- a real pipeline ------------------------------------------------------
+; The point of the suite: the string builtins composing into the small routine
+; they exist to support, with every intermediate step asserted.
+(def shout (fn (line) (upcase (trim line))))
+(def csv-lines "  alpha  \n beta\nGAMMA ")
+(test "the pipeline splits the input" (len (split csv-lines "\n")) "3")
+(test "the pipeline trims and folds each line"
+       (list (shout (nth (split csv-lines "\n") 0))
+             (shout (nth (split csv-lines "\n") 1))
+             (shout (nth (split csv-lines "\n") 2)))
+       "(\"ALPHA\" \"BETA\" \"GAMMA\")")
+(test "the pipeline round-trips back to a single string"
+       (join (list (shout "x") (shout "y")) ",") "X,Y")

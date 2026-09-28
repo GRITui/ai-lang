@@ -1,0 +1,100 @@
+; Tier 1 builtins: file I/O, existence, listing, paths.
+;
+; This is the first real AINL test suite. Every `(test ...)` here is an
+; assertion a model can read and act on: a failure names the test, the expected
+; value and the actual one, so a repair does not need a re-run to find out what
+; broke.
+;
+; `(test name expr expected)` compares the *rendered* value against `expected`,
+; which is why every expectation below is a string. That is deliberate: it is
+; the same text the failure report prints, so an assertion and its own report
+; can never disagree.
+;
+; Run with:  ainl test tests/
+
+; ---- write / read round trip ----------------------------------------------
+(def scratch "ainl-test-fileio.tmp")
+(write-file scratch "alpha\nbeta\n")
+
+; AINL has no `map`, no `member?` and no `nil?` — defining them is the language's
+; point (see examples/stdlib.ainl), so a test suite does it the same way a
+; program would. `contains` is string-only, so list membership needs this.
+(def member? (fn (needle xs)
+  (if (= (len xs) 0) false
+    (if (= needle (first xs)) true
+      (member? needle (rest xs))))))
+(test "write-file wrote the content" (read-file scratch) "alpha\nbeta\n")
+(test "read-file sees an append" (do (append-file scratch "gamma\n")
+                                    (read-file scratch))
+       "alpha\nbeta\ngamma\n")
+(test "write-file truncates" (do (write-file scratch "only")
+                                 (read-file scratch))
+       "only")
+(test "an empty file reads as an empty str" (do (write-file scratch "")
+                                                (read-file scratch))
+       "")
+
+; ---- existence ------------------------------------------------------------
+(test "file-exists finds a file just written" (file-exists scratch) "true")
+(test "file-exists rejects a missing file" (file-exists "ainl-nope-xyz.tmp") "nil")
+(test "a directory is a path that exists" (file-exists "tests") "true")
+(test "a missing path is nil, not an error" (= nil (file-exists "no/such/dir")) "true")
+
+; ---- delete ---------------------------------------------------------------
+; `delete-file` returns nil on success and *errors* on a missing path (a silent
+; no-op would leave a caller believing the delete happened) — so absence is
+; checked with `file-exists` first, exactly as docs/SYNTAX.md says.
+(test "delete-file removes the file and returns nil"
+       (do (write-file scratch "bye") (delete-file scratch))
+       "nil")
+(test "the deleted file is gone" (file-exists scratch) "nil")
+(test "deleting a missing file is an error, not a silent success"
+       (if (file-exists "ainl-nope-xyz.tmp") true false)
+       "false")
+
+; ---- listing --------------------------------------------------------------
+; `examples/tier1-fixture` is checked into the repo rather than created here, so
+; the listing is identical on every machine and in every CI run. A directory
+; made by this program would depend on whatever else is in the working
+; directory, which is not a property a test can assert.
+; `list-dir` includes hidden entries, and a list renders each string through
+; `repr` (quoted) so a value containing a space is unambiguous. Both are the
+; same behavior examples/stdlib.ainl relies on.
+(def fixture "examples/tier1-fixture")
+(test "list-dir returns the fixture's files, hidden ones included" (list-dir fixture)
+       "(\".dotfile\" \"Capital.txt\" \"README.txt\" \"Under_score.txt\" \"beta.txt\" \"with space.txt\")")
+(test "list-dir is sorted by byte, not case-insensitively"
+       (first (list-dir fixture))
+       ".dotfile")
+(test "the first entry is the hidden file, so uppercase does not sort first"
+       (nth (list-dir fixture) 1)
+       "Capital.txt")
+(test "a name with a space is listed, not split or dropped"
+       (member? "with space.txt" (list-dir fixture))
+       "true")
+(test "the fixture listing is stable in length" (len (list-dir fixture)) "6")
+
+; ---- paths ----------------------------------------------------------------
+; The path builtins are pure string functions, so every one is safe to assert
+; on directly — including the edge cases where the three host languages
+; disagree and AINL had to pick one rule (docs/SYNTAX.md "Path functions").
+(test "path-join builds a path" (path-join "a" "b" "c") "a/b/c")
+(test "path-join collapses a doubled separator" (path-join "a//b" "d") "a/b/d")
+; A leading empty part still leaves the root marker, so this is "/b" and *not*
+; Ruby's "b". It is the sharpest edge in the path functions and the one the
+; three host libraries most disagree on (docs/SYNTAX.md "Path functions").
+(test "an empty first part keeps the leading separator" (path-join "" "b") "/b")
+(test "an empty middle part contributes nothing" (path-join "a" "" "b") "a/b")
+(test "a trailing empty part is dropped" (path-join "a" "") "a")
+(test "path-base takes the last component" (path-base "a/b/c.txt") "c.txt")
+; AINL follows Node/Ruby here, not Python: a trailing separator is ignored, so
+; this is "b". The three hosts split on this exact input (docs/SYNTAX.md table).
+(test "path-base ignores a trailing separator" (path-base "a/b/") "b")
+(test "path-base of the root is empty" (path-base "/") "")
+(test "path-dir takes everything before the last separator" (path-dir "a/b/c.txt") "a/b")
+; ...and follows Node/Ruby here, not Python, which answers "".
+(test "path-dir of a bare name is the current directory" (path-dir "x") ".")
+(test "path-dir of a top-level name is the root" (path-dir "/x") "/")
+(test "path-dir keeps a trailing dot as a component" (path-dir "a/.") "a")
+(test ".. is not resolved" (path-join "a" ".." "b") "a/../b")
+(test "a round trip through base and dir returns the path" (path-join (path-dir "a/b/c.txt") (path-base "a/b/c.txt")) "a/b/c.txt")

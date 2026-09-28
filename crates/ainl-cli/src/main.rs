@@ -13,6 +13,7 @@
 
 mod doctor;
 mod repl;
+mod test_runner;
 
 use ainl_core::parser::Node;
 use std::process::ExitCode;
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         Some("transpile") => cmd_transpile(&args[1..]),
         Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
+        Some("test") => cmd_test(&args[1..]),
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("version") | Some("--version") | Some("-v") => {
             println!("{}", version_line());
@@ -75,7 +77,8 @@ fn print_help() {
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                interactive REPL (multi-line input, --stdin for a script)\n  \
-         ainl doctor              self-test this install (exit 0 only if all pass)\n  \
+         ainl test [path]         run AINL test files; exit non-zero on failure\n  \
+         ainl doctor              self-test this install (exit 0 only if all pass)\n\
          ainl version             print version, build target, and source commit\n"
     );
 }
@@ -464,4 +467,26 @@ fn cmd_repl(rest: &[String]) -> ExitCode {
         }
     }
     repl::run(stdin_mode)
+}
+
+/// `ainl test [path] [--quiet]`.
+///
+/// The path defaults to `tests` — the directory a checkout has one of, and the
+/// one a CI step should be able to name without being told. Unknown flags are
+/// rejected rather than ignored, so a typo cannot silently run *more* than the
+/// author intended.
+fn cmd_test(rest: &[String]) -> ExitCode {
+    let mut quiet = false;
+    let mut path: Option<&str> = None;
+    for arg in rest {
+        match arg.as_str() {
+            "--quiet" | "-q" => quiet = true,
+            flag if flag.starts_with('-') => {
+                eprintln!("unknown flag '{flag}' (supported: --quiet, -q)");
+                return ExitCode::FAILURE;
+            }
+            other => path = Some(other),
+        }
+    }
+    test_runner::run(path.unwrap_or("tests"), quiet)
 }

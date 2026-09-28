@@ -15,6 +15,10 @@ Cargo.lock
 # only matters when a run is interrupted, leaving one behind.
 ainl-stdlib-example.tmp*
 
+# tests/file_io.ainl's scratch file. The AINL test suite creates, writes and
+# deletes files, so an interrupted run can leave this behind.
+ainl-test-fileio.tmp*
+
 # Secrets (keep tokens/keys out of the repo)
 *.env
 config.env

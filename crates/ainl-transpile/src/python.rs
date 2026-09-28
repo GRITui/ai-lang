@@ -63,12 +63,20 @@ impl Py {
     }
 
     fn finish(mut self) -> String {
+        // Tier 2 testing first: `_test` renders the actual value, so it is a
+        // member of the display cluster below — naming it there is what pulls
+        // in `_disp`, `_repr`, `_Hash` and `_Sym`.
+        if self.needed.contains("_test") {
+            self.needed.insert("_typename");
+        }
         // Resolve runtime dependencies: the display cluster references `_Sym`,
         // and `_sym` (from quoted symbols) needs the `_Sym` class.
-        let disp_used = self
-            .needed
-            .iter()
-            .any(|n| matches!(*n, "_print" | "_str" | "_error" | "_repr" | "_disp"));
+        let disp_used = self.needed.iter().any(|n| {
+            matches!(
+                *n,
+                "_print" | "_str" | "_error" | "_repr" | "_disp" | "_test"
+            )
+        });
         if disp_used {
             self.needed.insert("_disp");
             self.needed.insert("_repr");
@@ -376,6 +384,12 @@ impl Py {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Tier 2 testing ----
+                // A failure raises with the same message the interpreter and
+                // the AOT C runtime produce, so stderr stays byte-equal across
+                // all four backends. `_test` compares the *rendered* value,
+                // which is the same thing the assertion spells.
+                "test" => return self.call_builtin("_test", args, Some("_test")),
                 // ---- Stage 3.1 stdlib ----
                 // The multi-arg / statement-shaped ones get bespoke arms; the
                 // rest reuse call_builtin. Each maps to the host's own idiom
@@ -715,6 +729,14 @@ const RUNTIME: &[(&str, &str)] = &[
         "def _eq(a, b):\n    if isinstance(a, list) and isinstance(b, list):\n        return len(a) == len(b) and all(_eq(x, y) for x, y in zip(a, b))\n    if isinstance(a, _Sym) != isinstance(b, _Sym):\n        return False\n    if isinstance(a, bool) != isinstance(b, bool):\n        return False\n    return a == b",
     ),
     ("_print", "def _print(*xs):\n    print(' '.join(_disp(x) for x in xs))"),
+    (
+        "_typename",
+        "def _typename(x):\n    if x is None: return 'nil'\n    if x is True or x is False: return 'bool'\n    if isinstance(x, _Sym): return 'sym'\n    if isinstance(x, str): return 'str'\n    if isinstance(x, _Hash): return 'hash'\n    if isinstance(x, list): return 'list'\n    if isinstance(x, bool): return 'bool'\n    if isinstance(x, int): return 'int'\n    if isinstance(x, float): return 'float'\n    return '?'",
+    ),
+    (
+        "_test",
+        "def _test(name, actual, expected):\n    if not isinstance(name, str) or isinstance(name, _Sym): raise RuntimeError('test expects a str name, got %s' % _typename(name))\n    if not isinstance(expected, str) or isinstance(expected, _Sym): raise RuntimeError('test expects a str expected value, got %s' % _typename(expected))\n    got = _disp(actual)\n    if got == expected: return True\n    raise RuntimeError('test failed: %s: expected %s, got %s' % (name, expected, got))",
+    ),
     ("_str", "def _str(*xs):\n    return ''.join(_disp(x) for x in xs)"),
     ("_first", "def _first(x):\n    return x[0] if len(x) else None"),
     ("_rest", "def _rest(x):\n    return list(x[1:])"),

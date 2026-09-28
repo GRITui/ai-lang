@@ -163,12 +163,16 @@ AINL's other properties, all measured:
 - **AOT to a native binary.** `ainl compile` emits a single self-contained C
   file — the micro-runtime is inlined, so the output links against nothing but
   libc. Needs `cc` to build; **the output needs nothing.**
-- **56 builtins.** 54 are byte-identical on all four backends (the interpreter,
+- **57 builtins.** 55 are byte-identical on all four backends (the interpreter,
   the AOT binary, and the three transpiler targets). The other 2 — `http-get`
   and `http-post` — are **interpreter-only**: the AOT and transpiler backends
   refuse a program that uses them with an explicit `interpreter-only` error
   rather than emit something that behaves differently
   ([docs/SYNTAX.md](docs/SYNTAX.md#3c-http-http-get--http-post)).
+- **A test runner.** `(test name expr expected)` asserts, and `ainl test` runs
+  a directory of test files and exits non-zero on any failure — so AINL can
+  check its own output, and CI can consume the result with no parsing
+  ([docs/SYNTAX.md](docs/SYNTAX.md#3d-testing-test-and-ainl-test)).
 - **Zero external dependencies.** A small static Rust binary, no crates.io
   runtime deps.
 
