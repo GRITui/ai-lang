@@ -77,6 +77,16 @@ impl Js {
         if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
+        // Stage 3.1 stdlib dependencies: `_min`/`_max` share one fold helper and
+        // `_sleep`/`_abs`/`_floor`/`_sqrt` share the number check.
+        if self.needed.contains("_min") || self.needed.contains("_max") {
+            self.needed.insert("_minmax");
+        }
+        for dep in ["_sleep", "_abs", "_floor", "_sqrt"] {
+            if self.needed.contains(dep) {
+                self.needed.insert("_isnum");
+            }
+        }
         let mut out = String::new();
         out.push_str("// Transpiled from AINL by `ainl transpile --to js`.\n");
         out.push_str("// Generated code: edit the .ainl source, not this file.\n\n");
@@ -305,6 +315,35 @@ impl Js {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Stage 3.1 stdlib ----
+                // Each maps to the host's own idiom (fs.readFileSync,
+                // process.env, Date.now()/1000, Math.sqrt) so the emitted JS
+                // reads like JS. Where JS's own behavior would diverge from the
+                // interpreter's, the helper restores the interpreter's rule —
+                // most importantly, the synchronous fs calls and the integer
+                // checks, since Node's `"1" < 2` and `[] + 1` coercions would
+                // otherwise produce a value where AINL errors.
+                "read-file" => return self.call_builtin("_read_file", args, Some("_read_file")),
+                "write-file" => return self.call_builtin("_write_file", args, Some("_write_file")),
+                "append-file" => {
+                    return self.call_builtin("_append_file", args, Some("_append_file"))
+                }
+                "split" => return self.call_builtin("_split", args, Some("_split")),
+                "join" => return self.call_builtin("_join", args, Some("_join")),
+                "trim" => return self.call_builtin("_trim", args, Some("_trim")),
+                "replace" => return self.call_builtin("_replace", args, Some("_replace")),
+                "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
+                "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
+                "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
+                "exit" => return self.call_builtin("_exit", args, Some("_exit")),
+                "now" => return self.call_builtin("_now", args, Some("_now")),
+                "sleep" => return self.call_builtin("_sleep", args, Some("_sleep")),
+                "abs" => return self.call_builtin("_abs", args, Some("_abs")),
+                "min" => return self.call_builtin("_min", args, Some("_min")),
+                "max" => return self.call_builtin("_max", args, Some("_max")),
+                "floor" => return self.call_builtin("_floor", args, Some("_floor")),
+                "sqrt" => return self.call_builtin("_sqrt", args, Some("_sqrt")),
                 _ => {}
             }
         }
@@ -602,4 +641,92 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_keys", "function _keys(h) { return Array.from(h, p => p[0]); }"),
     ("_vals", "function _vals(h) { return Array.from(h, p => p[1]); }"),
     ("_error", "function _error(...xs) { throw new Error(xs.map(_disp).join(\" \")); }"),
+    // ---- Stage 3.1 stdlib ----
+    // JS's own behavior diverges from the interpreter's in ways that matter
+    // here, so each helper pins the interpreter's rule:
+    //   * Number checks: JS coerces ("1" + 2 === "12", [] + 1 === "1", and
+    //     "10" < 9 is true), so _isnum rejects non-numbers instead of letting a
+    //     coercion produce a value where AINL errors.
+    //   * split/replace with an empty target: JS returns per-character
+    //     results / the input unchanged, where AINL rejects.
+    //   * trim/case are ASCII-only (JS's are Unicode-aware).
+    //   * floor returns an int, and sqrt rejects negatives instead of NaN.
+    //   * join requires strings, so `join([1,2])` is an error, not "1,2".
+    // The `require` calls are lazy inside the helpers so a program that only
+    // uses, say, `trim` never loads fs.
+    ("_isnum", "function _isnum(x) { return typeof x === \"number\"; }"),
+    (
+        "_read_file",
+        "function _read_file(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"read-file expects a str path\");\n  return require(\"fs\").readFileSync(path, \"utf8\");\n}",
+    ),
+    (
+        "_write_file",
+        "function _write_file(path, content) {\n  if (typeof path !== \"string\") throw new TypeError(\"write-file expects a str path\");\n  if (typeof content !== \"string\") throw new TypeError(\"write-file expects str content\");\n  require(\"fs\").writeFileSync(path, content);\n}",
+    ),
+    (
+        "_append_file",
+        "function _append_file(path, content) {\n  if (typeof path !== \"string\") throw new TypeError(\"append-file expects a str path\");\n  if (typeof content !== \"string\") throw new TypeError(\"append-file expects str content\");\n  require(\"fs\").appendFileSync(path, content);\n}",
+    ),
+    (
+        "_split",
+        "function _split(s, sep) {\n  if (typeof s !== \"string\") throw new TypeError(\"split expects a str\");\n  if (typeof sep !== \"string\") throw new TypeError(\"split expects a str\");\n  if (sep === \"\") throw new Error(\"split expects a non-empty separator\");\n  return s.split(sep);\n}",
+    ),
+    (
+        "_join",
+        "function _join(xs, sep) {\n  if (!Array.isArray(xs)) throw new TypeError(\"join expects a list\");\n  if (typeof sep !== \"string\") throw new TypeError(\"join expects a str separator\");\n  for (const x of xs) if (typeof x !== \"string\") throw new TypeError(\"join expects a list of str\");\n  return xs.join(sep);\n}",
+    ),
+    (
+        "_trim",
+        "function _trim(s) {\n  if (typeof s !== \"string\") throw new TypeError(\"trim expects a str\");\n  return s.replace(/^[ \\t\\n\\r\\x0b\\x0c]+|[ \\t\\n\\r\\x0b\\x0c]+$/g, \"\");\n}",
+    ),
+    (
+        "_replace",
+        "function _replace(s, old, neu) {\n  if (typeof s !== \"string\") throw new TypeError(\"replace expects a str\");\n  if (typeof old !== \"string\") throw new TypeError(\"replace expects a str\");\n  if (typeof neu !== \"string\") throw new TypeError(\"replace expects a str\");\n  if (old === \"\") throw new Error(\"replace expects a non-empty target\");\n  return s.split(old).join(neu);\n}",
+    ),
+    (
+        "_upcase",
+        "function _upcase(s) {\n  if (typeof s !== \"string\") throw new TypeError(\"upcase expects a str\");\n  return s.replace(/[a-z]/g, c => String.fromCharCode(c.charCodeAt(0) - 32));\n}",
+    ),
+    (
+        "_downcase",
+        "function _downcase(s) {\n  if (typeof s !== \"string\") throw new TypeError(\"downcase expects a str\");\n  return s.replace(/[A-Z]/g, c => String.fromCharCode(c.charCodeAt(0) + 32));\n}",
+    ),
+    (
+        "_contains",
+        "function _contains(hay, needle) {\n  if (typeof hay !== \"string\") throw new TypeError(\"contains expects a str\");\n  if (typeof needle !== \"string\") throw new TypeError(\"contains expects a str\");\n  return hay.indexOf(needle) !== -1;\n}",
+    ),
+    (
+        "_env_get",
+        "function _env_get(name) {\n  if (typeof name !== \"string\") throw new TypeError(\"env-get expects a str\");\n  const v = process.env[name];\n  return v === undefined ? null : v;\n}",
+    ),
+    (
+        "_exit",
+        "function _exit(code) {\n  if (typeof code !== \"number\") throw new TypeError(\"exit expects an int\");\n  process.exit(code);\n}",
+    ),
+    (
+        "_now",
+        "function _now() {\n  return Math.floor(Date.now() / 1000);\n}",
+    ),
+    (
+        "_sleep",
+        "function _sleep(secs) {\n  if (!_isnum(secs)) throw new TypeError(\"sleep expects a number\");\n  if (Number.isNaN(secs) || secs < 0) throw new Error(\"sleep expects a non-negative number\");\n  const shared = new Int32Array(new SharedArrayBuffer(4));\n  Atomics.wait(shared, 0, 0, secs * 1000);\n}",
+    ),
+    (
+        "_abs",
+        "function _abs(n) {\n  if (!_isnum(n)) throw new TypeError(\"abs expects a number\");\n  return Math.abs(n);\n}",
+    ),
+    (
+        "_minmax",
+        "function _minmax(xs, wantMax) {\n  if (!xs.length) throw new TypeError(wantMax ? \"max expects at least 1 argument\" : \"min expects at least 1 argument\");\n  let best = xs[0];\n  for (const x of xs) {\n    if (!_isnum(x)) throw new TypeError(wantMax ? \"max expects a number\" : \"min expects a number\");\n    if (wantMax ? x > best : x < best) best = x;\n  }\n  return best;\n}",
+    ),
+    ("_min", "function _min(...xs) { return _minmax(xs, false); }"),
+    ("_max", "function _max(...xs) { return _minmax(xs, true); }"),
+    (
+        "_floor",
+        "function _floor(n) {\n  if (!_isnum(n)) throw new TypeError(\"floor expects a number\");\n  return Math.floor(n);\n}",
+    ),
+    (
+        "_sqrt",
+        "function _sqrt(n) {\n  if (!_isnum(n)) throw new TypeError(\"sqrt expects a number\");\n  if (n < 0) throw new Error(\"sqrt expects a non-negative number\");\n  return Math.sqrt(n);\n}",
+    ),
 ];

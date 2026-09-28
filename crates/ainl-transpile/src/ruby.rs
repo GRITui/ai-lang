@@ -69,6 +69,10 @@ impl Rb {
         if disp_used || self.needed.iter().any(|n| matches!(*n, "_hash" | "_assoc")) {
             self.needed.insert("AHash");
         }
+        // Stage 3.1 stdlib dependency: `_min`/`_max` share one fold helper.
+        if self.needed.contains("_min") || self.needed.contains("_max") {
+            self.needed.insert("_minmax");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to ruby`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -280,6 +284,35 @@ impl Rb {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Stage 3.1 stdlib ----
+                // Each maps to the host's own idiom (File.read, ENV[],
+                // Time.now.to_i, sleep, Math.sqrt) so the emitted Ruby reads like
+                // Ruby. Where Ruby's own behavior would diverge from the
+                // interpreter's, the helper restores the interpreter's rule —
+                // notably rejecting an empty split separator, keeping trim/case
+                // ASCII-only, and not letting `Comparable` sort a String against
+                // a Numeric (which Ruby permits for some pairs and AINL does not).
+                "read-file" => return self.call_builtin("_read_file", args, Some("_read_file")),
+                "write-file" => return self.call_builtin("_write_file", args, Some("_write_file")),
+                "append-file" => {
+                    return self.call_builtin("_append_file", args, Some("_append_file"))
+                }
+                "split" => return self.call_builtin("_split", args, Some("_split")),
+                "join" => return self.call_builtin("_join", args, Some("_join")),
+                "trim" => return self.call_builtin("_trim", args, Some("_trim")),
+                "replace" => return self.call_builtin("_replace", args, Some("_replace")),
+                "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
+                "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
+                "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
+                "exit" => return self.call_builtin("_exit", args, Some("_exit")),
+                "now" => return self.call_builtin("_now", args, Some("_now")),
+                "sleep" => return self.call_builtin("_sleep", args, Some("_sleep")),
+                "abs" => return self.call_builtin("_abs", args, Some("_abs")),
+                "min" => return self.call_builtin("_min", args, Some("_min")),
+                "max" => return self.call_builtin("_max", args, Some("_max")),
+                "floor" => return self.call_builtin("_floor", args, Some("_floor")),
+                "sqrt" => return self.call_builtin("_sqrt", args, Some("_sqrt")),
                 _ => {}
             }
         }
@@ -560,4 +593,92 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_keys", "def _keys(h)\n  h.map { |p| p[0] }\nend"),
     ("_vals", "def _vals(h)\n  h.map { |p| p[1] }\nend"),
     ("_error", "def _error(*xs)\n  raise(xs.map { |x| _disp(x) }.join(\" \"))\nend"),
+    // ---- Stage 3.1 stdlib ----
+    // Each helper pins the *interpreter's* rule where Ruby's own behavior would
+    // differ, so all four backends agree:
+    //   * split/replace reject an empty target instead of raising ArgumentError
+    //     / silently returning the input.
+    //   * trim and case are ASCII-only (Ruby's are Unicode-aware, and
+    //     String#strip also removes U+00A0 and friends).
+    //   * min/max fold pairwise over Numeric only: Ruby's Comparable would let
+    //     a String participate in `<` against an Integer, AINL will not.
+    //   * floor/sqrt keep AINL's rules — floor returns an Integer and passes an
+    //     Integer through untouched, sqrt rejects a negative rather than
+    //     raising Math::DomainError with a different message.
+    // `require` is lazy inside each helper so a program that only uses `trim`
+    // loads nothing.
+    (
+        "_read_file",
+        "def _read_file(path)\n  raise TypeError, 'read-file expects a str path' unless path.is_a?(String)\n  File.read(path)\nend",
+    ),
+    (
+        "_write_file",
+        "def _write_file(path, content)\n  raise TypeError, 'write-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'write-file expects str content' unless content.is_a?(String)\n  File.write(path, content)\nend",
+    ),
+    (
+        "_append_file",
+        "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  File.open(path, 'a') { |f| f.write(content) }\nend",
+    ),
+    (
+        "_split",
+        "def _split(s, sep)\n  raise TypeError, 'split expects a str' unless s.is_a?(String) && sep.is_a?(String)\n  raise ArgumentError, 'split expects a non-empty separator' if sep.empty?\n  # The -1 limit keeps trailing empty fields, which AINL's split does\n  # (\"a,b,\" -> [\"a\" \"b\" \"\"]); Ruby's default limit drops them, which would\n  # disagree with the interpreter and with the Python/JS targets.\n  s.split(sep, -1)\nend",
+    ),
+    (
+        "_join",
+        "def _join(xs, sep)\n  raise TypeError, 'join expects a list' unless xs.is_a?(Array)\n  raise TypeError, 'join expects a str separator' unless sep.is_a?(String)\n  xs.each { |x| raise TypeError, 'join expects a list of str' unless x.is_a?(String) }\n  xs.join(sep)\nend",
+    ),
+    (
+        "_trim",
+        "def _trim(s)\n  raise TypeError, 'trim expects a str' unless s.is_a?(String)\n  s.gsub(/\\A[ \\t\\n\\r\\x0b\\x0c]+|[ \\t\\n\\r\\x0b\\x0c]+\\z/, '')\nend",
+    ),
+    (
+        "_replace",
+        "def _replace(s, old, neu)\n  raise TypeError, 'replace expects a str' unless s.is_a?(String) && old.is_a?(String) && neu.is_a?(String)\n  raise ArgumentError, 'replace expects a non-empty target' if old.empty?\n  s.gsub(old, neu)\nend",
+    ),
+    (
+        "_upcase",
+        "def _upcase(s)\n  raise TypeError, 'upcase expects a str' unless s.is_a?(String)\n  s.gsub(/[a-z]/) { |c| (c.ord - 32).chr }\nend",
+    ),
+    (
+        "_downcase",
+        "def _downcase(s)\n  raise TypeError, 'downcase expects a str' unless s.is_a?(String)\n  s.gsub(/[A-Z]/) { |c| (c.ord + 32).chr }\nend",
+    ),
+    (
+        "_contains",
+        "def _contains(hay, needle)\n  raise TypeError, 'contains expects a str' unless hay.is_a?(String) && needle.is_a?(String)\n  hay.include?(needle)\nend",
+    ),
+    (
+        "_env_get",
+        "def _env_get(name)\n  raise TypeError, 'env-get expects a str' unless name.is_a?(String)\n  ENV[name]\nend",
+    ),
+    (
+        "_exit",
+        "def _exit(code)\n  raise TypeError, 'exit expects an int' unless code.is_a?(Integer)\n  $stdout.flush\n  exit(code)\nend",
+    ),
+    (
+        "_now",
+        "def _now\n  Time.now.to_i\nend",
+    ),
+    (
+        "_sleep",
+        "def _sleep(secs)\n  raise TypeError, 'sleep expects a number' unless secs.is_a?(Numeric)\n  raise ArgumentError, 'sleep expects a non-negative number' if secs.respond_to?(:nan?) && secs.nan? || secs < 0\n  sleep(secs) if secs > 0\n  nil\nend",
+    ),
+    (
+        "_abs",
+        "def _abs(n)\n  raise TypeError, 'abs expects a number' unless n.is_a?(Numeric)\n  n < 0 ? -n : n\nend",
+    ),
+    (
+        "_minmax",
+        "def _minmax(xs, want_max)\n  who = want_max ? 'max' : 'min'\n  raise TypeError, \"#{who} expects at least 1 argument\" if xs.empty?\n  best = xs[0]\n  xs.each do |x|\n    raise TypeError, \"#{who} expects a number\" unless x.is_a?(Numeric)\n    best = x if (want_max ? x > best : x < best)\n  end\n  best\nend",
+    ),
+    ("_min", "def _min(*xs)\n  _minmax(xs, false)\nend"),
+    ("_max", "def _max(*xs)\n  _minmax(xs, true)\nend"),
+    (
+        "_floor",
+        "def _floor(n)\n  raise TypeError, 'floor expects a number' unless n.is_a?(Numeric)\n  n.is_a?(Integer) ? n : n.floor\nend",
+    ),
+    (
+        "_sqrt",
+        "def _sqrt(n)\n  raise TypeError, 'sqrt expects a number' unless n.is_a?(Numeric)\n  raise ArgumentError, 'sqrt expects a non-negative number' if n < 0\n  Math.sqrt(n)\nend",
+    ),
 ];

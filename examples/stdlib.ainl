@@ -1,0 +1,116 @@
+; The AINL standard library (Stage 3.1), exercised end to end.
+;
+; Every builtin here must behave identically in all four backends: the
+; interpreter/VM, the AOT-compiled C binary, and the Python / JS / Ruby
+; transpiler targets. That equality is what
+; scripts/check-transpile.sh and scripts/check-aot.sh check, and this file is
+; what they check it on — so it deliberately avoids `now`, `sleep` and `exit`
+; (whose results depend on the clock or end the process) and instead covers
+; everything deterministic, including the edge cases the four backends had to
+; agree on by hand.
+;
+; `now`/`sleep`/`exit` are covered by the Rust suites instead
+; (crates/ainl-core/tests/stdlib_cli.rs, crates/ainl-cc/tests/aot_stdlib.rs).
+
+; ---- strings ---------------------------------------------------------------
+(def csv "alpha,beta,,gamma")
+(def fields (split csv ","))
+(print "split   =" fields)
+(print "len     =" (len fields))
+(print "join    =" (join fields "|"))
+(print "roundtrip =" (join (split csv ",") ","))
+
+; multi-char separator, and a separator that never occurs
+(print "multichar =" (split "a::b::c" "::"))
+(print "nomatch  =" (split "abc" ","))
+
+; whitespace and case, which are ASCII-only in all four backends
+(print "trim    =" (upcase (trim "  padded  ")))
+(print "tabs    =" (trim "\t tabbed \n"))
+(print "downcase=" (downcase "MiXeD Case"))
+(print "digits  =" (upcase "a-b_c 123"))
+
+; replace rewrites every occurrence and does not rescan its own output
+(print "replace =" (replace "a-b-c" "-" "+"))
+(print "greedy  =" (replace "aaaa" "aa" "b"))
+(print "nomatch =" (replace "abc" "z" "y"))
+(print "grows   =" (replace "x" "x" "xxx"))
+
+(print "contains=" (contains csv "beta") (contains csv "omega"))
+(print "empty-ne =" (contains "x" ""))
+
+; A real text-munging loop, the way a script would actually use these.
+; AINL has no `map` builtin (it is one line to write — that is the point of the
+; language), so define it here the way examples/lists.ainl does.
+(def map (fn (f lst)
+  (if (= (len lst) 0) (list)
+    (cons (f (first lst)) (map f (rest lst))))))
+(def shout (fn (line) (upcase (trim line))))
+(def lines (split "  one  \n two\nthree" "\n"))
+(print "shout   =" (map shout lines))
+
+; ---- file I/O --------------------------------------------------------------
+(def tmp "ainl-stdlib-example.tmp")
+(write-file tmp "alpha\nbeta\n")
+(append-file tmp "gamma\n")
+(def body (read-file tmp))
+(print "bytes   =" (len body))
+(print "lines   =" (len (split body "\n")))
+(print "head    =" (nth (split body "\n") 0))
+(print "tail    =" (nth (split body "\n") 2))
+
+; truncate, then read the empty result back
+(write-file tmp "")
+(print "emptied =" (len (read-file tmp)) (len tmp))
+
+; ---- maps: combine the stdlib with the core -------------------------------
+; Count word frequencies. Note the accumulator is *threaded* through `tally`
+; rather than mutated in a `def`: a `fn` body opens its own scope (SYNTAX.md
+; §2a), so `def` inside it can only shadow, never reach out. This is the same
+; shape examples/hello.ainl uses for its variadic `sum`.
+(def bump (fn (h k)
+  (assoc h k (+ 1 (if (= (get h k) nil) 0 (get h k))))))
+(def tally (fn (ws h)
+  (if (= (len ws) 0) h
+    (tally (rest ws) (bump h (first ws))))))
+(def freqs (tally (split "a b a c b a" " ") (hash)))
+(print "counts  =" freqs)
+(print "a-count =" (get freqs "a"))
+(print "b-count =" (get freqs "b"))
+(print "keys    =" (keys freqs))
+
+; fold over the words with the string builtins, producing a summary line
+(def parts (list (upcase (nth (split "x y z" " ") 0)) (upcase (nth (split "x y z" " ") 2))))
+(print "summary =" (join parts "-") (len parts))
+
+; ---- env -------------------------------------------------------------------
+; `(env-get "PATH")` is set in every CI environment, and unset names are nil —
+; both branches of the builtin, without depending on a specific value. There is
+; no `nil?` predicate, so nil-ness is tested against `nil` with `=`.
+(print "env set? =" (= nil (env-get "AINL_STDLIB_EXAMPLE_UNSET")))
+(print "env miss =" (env-get "AINL_STDLIB_EXAMPLE_UNSET"))
+(print "env path?=" (< 0 (len (str (env-get "PATH")))))
+
+; ---- math ------------------------------------------------------------------
+; NOTE: this example is checked byte-for-byte against *all three* transpiler
+; targets by scripts/check-transpile.sh, so every value printed here must be
+; one JS can represent. JS has a single `number` type, which costs two things
+; (docs/NUMERIC_MODEL.md): a whole-valued float prints as `4` rather than
+; `4.0`, and an integer above 2^53 loses precision. So the lines below print
+; only ints and *non*-whole floats, and the cases JS cannot express — `(sqrt
+; 16)` -> 4.0, `(floor 9007199254740993)` -> 9007199254740993 — are covered in
+; crates/ainl-cc/tests/aot_stdlib.rs and crates/ainl-core/src/eval.rs instead,
+; where each backend is compared against the interpreter directly.
+(print "abs     =" (abs -42) (abs 42) (abs -2.5))
+(print "minmax  =" (min 3 1 2) (max 3 1 2))
+(print "negatives=" (min 0 -3 -1) (max 0 -3 -1))
+(print "mixed   =" (min 2 1.5) (max 1.5 9.5))
+(print "single  =" (min 7) (max 7))
+(print "floor   =" (floor 2.7) (floor -2.1) (floor 4))
+(print "sqrt    =" (sqrt 2.25) (sqrt 0.04))
+
+; a small numeric pipeline: the classic 1.5 * n - 1 form, over an odd n range so
+; no result is a whole number (JS would print 2.0 as `2`)
+(def f (fn (n) (- (* 1.5 n) 1)))
+(def row (fn (i) (f (+ (* 2 i) 1))))
+(print "pipeline=" (list (row 0) (row 1) (row 2) (row 3)))

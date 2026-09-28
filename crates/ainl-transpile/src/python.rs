@@ -88,6 +88,14 @@ impl Py {
         if disp_used || self.needed.contains("_sym") || self.needed.contains("_eq") {
             self.needed.insert("_Sym");
         }
+        // Stage 3.1 stdlib dependencies: `_join` distinguishes a quoted symbol
+        // from an equal-content string, and `_min`/`_max` share one fold helper.
+        if self.needed.contains("_join") {
+            self.needed.insert("_Sym");
+        }
+        if self.needed.contains("_min") || self.needed.contains("_max") {
+            self.needed.insert("_minmax");
+        }
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to python`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -328,6 +336,35 @@ impl Py {
                 "keys" => return self.call_builtin("_keys", args, Some("_keys")),
                 "vals" => return self.call_builtin("_vals", args, Some("_vals")),
                 "error" => return self.call_builtin("_error", args, Some("_error")),
+                // ---- Stage 3.1 stdlib ----
+                // The multi-arg / statement-shaped ones get bespoke arms; the
+                // rest reuse call_builtin. Each maps to the host's own idiom
+                // (open().read(), time.time(), os.getenv, math.sqrt) so the
+                // generated code reads like Python, not like an AINL interpreter
+                // in Python syntax. Where the host's own behavior would differ
+                // from the interpreter's, the helper re-establishes the
+                // interpreter's rule — see the RUNTIME table.
+                "read-file" => return self.call_builtin("_read_file", args, Some("_read_file")),
+                "write-file" => return self.call_builtin("_write_file", args, Some("_write_file")),
+                "append-file" => {
+                    return self.call_builtin("_append_file", args, Some("_append_file"))
+                }
+                "split" => return self.call_builtin("_split", args, Some("_split")),
+                "join" => return self.call_builtin("_join", args, Some("_join")),
+                "trim" => return self.call_builtin("_trim", args, Some("_trim")),
+                "replace" => return self.call_builtin("_replace", args, Some("_replace")),
+                "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
+                "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
+                "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
+                "exit" => return self.call_builtin("_exit", args, Some("_exit")),
+                "now" => return self.call_builtin("_now", args, Some("_now")),
+                "sleep" => return self.call_builtin("_sleep", args, Some("_sleep")),
+                "abs" => return self.call_builtin("_abs", args, Some("_abs")),
+                "min" => return self.call_builtin("_min", args, Some("_min")),
+                "max" => return self.call_builtin("_max", args, Some("_max")),
+                "floor" => return self.call_builtin("_floor", args, Some("_floor")),
+                "sqrt" => return self.call_builtin("_sqrt", args, Some("_sqrt")),
                 _ => {}
             }
         }
@@ -642,4 +679,95 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_keys", "def _keys(h):\n    return [pair[0] for pair in h]"),
     ("_vals", "def _vals(h):\n    return [pair[1] for pair in h]"),
     ("_error", "def _error(*xs):\n    raise RuntimeError(' '.join(_disp(x) for x in xs))"),
+    // ---- Stage 3.1 stdlib ----
+    // Each helper re-establishes the *interpreter's* rule where Python's own
+    // behavior would differ, so all four backends agree:
+    //   * split/replace reject an empty target instead of Python's
+    //     ValueError / per-position insertion.
+    //   * trim strips the ASCII set only (str.strip() also removes U+00A0 and
+    //     friends, which the C runtime and the other two targets do not).
+    //   * upcase/downcase fold ASCII only (str.upper() is Unicode-aware).
+    //   * sqrt/sleep reject negatives instead of returning NaN / raising
+    //     ValueError from time.sleep.
+    //   * floor returns an int, and passes an int straight through so a large
+    //     i64 is not round-tripped through a float.
+    //   * join requires a list of str, so a non-string element is a defined
+    //     error rather than Python's silent str() coercion.
+    (
+        "_read_file",
+        "def _read_file(path):\n    with open(path, 'r') as f:\n        return f.read()",
+    ),
+    (
+        "_write_file",
+        "def _write_file(path, content):\n    with open(path, 'w') as f:\n        f.write(content)",
+    ),
+    (
+        "_append_file",
+        "def _append_file(path, content):\n    with open(path, 'a') as f:\n        f.write(content)",
+    ),
+    (
+        "_split",
+        "def _split(s, sep):\n    if not sep: raise ValueError('split expects a non-empty separator')\n    return s.split(sep)",
+    ),
+    (
+        "_join",
+        "def _join(xs, sep):\n    for x in xs:\n        if not isinstance(x, str) or isinstance(x, _Sym): raise TypeError('join expects a list of str')\n    return sep.join(xs)",
+    ),
+    (
+        "_trim",
+        "def _trim(s):\n    return s.strip(' \\t\\n\\r\\x0b\\x0c')",
+    ),
+    (
+        "_replace",
+        "def _replace(s, old, new):\n    if not old: raise ValueError('replace expects a non-empty target')\n    return s.replace(old, new)",
+    ),
+    (
+        "_upcase",
+        "def _upcase(s):\n    return ''.join(chr(ord(c) - 32) if 'a' <= c <= 'z' else c for c in s)",
+    ),
+    (
+        "_downcase",
+        "def _downcase(s):\n    return ''.join(chr(ord(c) + 32) if 'A' <= c <= 'Z' else c for c in s)",
+    ),
+    (
+        "_contains",
+        "def _contains(hay, needle):\n    return needle in hay",
+    ),
+    ("_env_get", "def _env_get(name):\n    import os\n    return os.environ.get(name)"),
+    (
+        "_exit",
+        "def _exit(code):\n    import sys\n    sys.stdout.flush()\n    raise SystemExit(code)",
+    ),
+    (
+        "_now",
+        "def _now():\n    import time\n    return int(time.time())",
+    ),
+    (
+        "_sleep",
+        "def _sleep(secs):\n    import time\n    if secs != secs or secs < 0: raise ValueError('sleep expects a non-negative number')\n    if secs > 0: time.sleep(secs)",
+    ),
+    (
+        "_abs",
+        "def _abs(n):\n    if not isinstance(n, (int, float)) or isinstance(n, bool): raise TypeError('abs expects a number')\n    return n if n >= 0 else -n",
+    ),
+    (
+        "_min",
+        "def _min(*xs):\n    if not xs: raise TypeError('min expects at least 1 argument')\n    return _minmax(xs, False)",
+    ),
+    (
+        "_max",
+        "def _max(*xs):\n    if not xs: raise TypeError('max expects at least 1 argument')\n    return _minmax(xs, True)",
+    ),
+    (
+        "_minmax",
+        "def _minmax(xs, want_max):\n    best = xs[0]\n    for x in xs[1:]:\n        if not isinstance(x, (int, float)) or isinstance(x, bool): raise TypeError('min/max expects a number')\n        if (x > best) if want_max else (x < best): best = x\n    return best",
+    ),
+    (
+        "_floor",
+        "def _floor(n):\n    import math\n    if isinstance(n, bool) or not isinstance(n, (int, float)): raise TypeError('floor expects a number')\n    return n if isinstance(n, int) else math.floor(n)",
+    ),
+    (
+        "_sqrt",
+        "def _sqrt(n):\n    import math\n    if isinstance(n, bool) or not isinstance(n, (int, float)): raise TypeError('sqrt expects a number')\n    if n < 0: raise ValueError('sqrt expects a non-negative number')\n    return math.sqrt(n)",
+    ),
 ];
