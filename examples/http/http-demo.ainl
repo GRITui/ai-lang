@@ -1,0 +1,69 @@
+; examples/http/http-demo.ainl — an AINL HTTP client, end to end.
+;
+; Run it against the tiny server next to this file:
+;
+;     python3 examples/http/server.py 8080 &     # or: nc -l 8080
+;     ainl run examples/http/http-demo.ainl
+;
+; The port can be overridden, so this works on a machine where 8080 is taken:
+;
+;     AINL_DEMO_PORT=9000 ainl run examples/http/http-demo.ainl
+;
+; SCOPE: the interpreter only (ainl run / ainl repl). The AOT C backend and
+; the three transpilers refuse a program using http-get/http-post with an
+; `interpreter-only` error, and https:// is refused by name — see
+; docs/SYNTAX.md 3c and docs/HTTP_TLS.md.
+
+; The demo port. `env-get` returns nil when unset, so fall back with `or`.
+(def port (or (env-get "AINL_DEMO_PORT") "8080"))
+(def base (str "http://127.0.0.1:" port))
+
+; --- a response is an ordinary map -----------------------------------------
+; No new value type and no new access syntax: `get` reaches every field, and
+; `headers` is itself a map, so a nested `get` gets a header. A helper written
+; once works for any response.
+(def brief
+  (fn (label r)
+    (print label (get r "status")
+           (if (get r "ok") "ok" "not-ok")
+           (get r "body"))))
+
+; --- GET --------------------------------------------------------------------
+(def health (http-get (str base "/health")))
+(brief "GET  /health" health)
+
+; A header is a `get` on the nested `headers` map. Header names are
+; lowercased by the client, so look them up in lowercase.
+(print "     content-type:" (get (get health "headers") "content-type"))
+
+; --- a request header -------------------------------------------------------
+; The second argument is a map of request headers, which is how a real API
+; gets an `Accept` or an `Authorization`.
+(def accepted
+  (http-get (str base "/items")
+            (hash "Accept" "application/json"
+                  "X-Client" "ainl-demo")))
+(brief "GET  /items" accepted)
+
+; --- POST with a body -------------------------------------------------------
+; The body is a plain string. AINL computes the Content-Length itself and
+; refuses to let a caller override it.
+(def created
+  (http-post (str base "/items")
+             "{\"name\": \"widget\"}"
+             (hash "Content-Type" "application/json")))
+(brief "POST /items" created)
+
+; --- a status is data, not an error ----------------------------------------
+; A 404 is a fact about the server, not a failure of the fetch: the builtin
+; returns it and the caller decides. That is why `(get r "ok")` exists.
+(def missing (http-get (str base "/nope")))
+(print "GET  /nope    " (get missing "status")
+       (if (get missing "ok") "ok" "not-ok"))
+(print "     -> a non-2xx status is a value, not a runtime error")
+
+; --- a helper over both verbs ----------------------------------------------
+; One function, any endpoint: this is the shape a real AINL caller has.
+(def show-status (fn (u) (get (http-get u) "status")))
+(print "     helper  " (str base "/health") "->"
+       (show-status (str base "/health")))

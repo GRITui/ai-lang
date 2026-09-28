@@ -117,6 +117,40 @@ jobs:
       - name: Documented import behavior matches the interpreter
         run: ./scripts/check-docs-import.sh
 
+  http:
+    name: http (client works locally; TLS + backends refuse)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # python3 is preinstalled on ubuntu-latest runners. The server is stdlib
+      # only and binds to loopback on a port the OS picks, so this job needs no
+      # outbound network and no fixture host — the same "no external network"
+      # rule the Rust suite in crates/ainl-core/tests/http.rs follows.
+      - name: Documented HTTP behavior matches the interpreter
+        run: ./scripts/check-docs-http.sh
+
   aot:
     name: AOT (C -> cc) byte-identical + step cap
     runs-on: ubuntu-latest

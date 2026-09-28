@@ -651,6 +651,12 @@ fn install_stdlib(env: &Env) {
     // decisions (string keys only, insertion-order objects, one canonical
     // float spelling, non-finite floats are an error).
     crate::json_value::install(env);
+
+    // HTTP. Plain HTTP over TCP, interpreter-only by design: the zero-dep
+    // rule is what keeps the AOT binary standalone, and every TLS stack is a
+    // C-transitive dependency tree. `https://` is refused with an error that
+    // names the fix rather than attempted. See http.rs and docs/HTTP_TLS.md.
+    crate::http::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------

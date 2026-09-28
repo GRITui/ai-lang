@@ -88,24 +88,28 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).
 ///
-/// Returns `Err` if the program uses a form this backend cannot lower —
-/// currently only [`ainl_core::import`]. `import` is resolved by the
-/// interpreter's load-time module loader, which evaluates a module in a fresh
-/// environment and hands the resulting *values* to the interpreter. A C
-/// program has no such phase: the generated `main` would treat `(import "m")`
-/// as an ordinary call to a free variable, and the program would fail at
-/// runtime with a `scope_lookup` error naming `import` — a message that
-/// describes a generated-C bug rather than the real problem. Refusing at
-/// compile time is the honest answer, and it is the same contract the three
-/// transpilers give (see `ainl-transpile`), so all four backends agree on
-/// which programs they can build.
+/// Returns `Err` if the program uses a form this backend cannot lower — the
+/// interpreter-only set (see [`ainl_core::interpreter_only`]): `import` and
+/// `http-get`/`http-post`.
+///
+/// The generated `main` has no load phase, so it would treat `(import "m")` as
+/// an ordinary call to a free variable and the program would fail at runtime
+/// with a `scope_lookup` error naming `import` — a message that describes a
+/// generated-C bug rather than the real problem. `http-get` is the same shape
+/// of failure one level up: there is no socket, no timeout and no HTTP/1.1
+/// parser in the C runtime, and a C program that links a host curl would break
+/// the standalone-binary promise the `aot-standalone` CI job exists to prove.
+/// Refusing at compile time is the honest answer, and it is the same contract
+/// the three transpilers give (see `ainl-transpile`), so all four backends
+/// agree on which programs they can build.
 pub fn generate(forms: &[Node]) -> Result<String> {
-    if let Some(node) = find_import(forms) {
+    if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
         return Err(ainl_core::Error::runtime(format!(
-            "ainl compile: `import` is interpreter-only (found at byte {}) — \
+            "ainl compile: `{sym}` is interpreter-only (found at byte {}) — \
              this backend emits one standalone C program with no load phase, so it cannot \
-             resolve modules. Run the program with `ainl run` instead.",
-            node
+             resolve modules or carry an HTTP client without breaking the static-binary \
+             guarantee. Run the program with `ainl run` instead.",
+            at
         )));
     }
     let mut g = Gen::new();
@@ -144,40 +148,6 @@ pub fn generate(forms: &[Node]) -> Result<String> {
     // main.
     g.emit_main(&main_code, n_globals);
     Ok(g.out)
-}
-
-/// The byte offset of the first `import` anywhere in `forms`, or `None`.
-///
-/// The search is over the whole tree, not just the top level, so a nested
-/// import is refused here too — but it is really the interpreter's own check
-/// that reports *that*, and this backend only needs to know that some import is
-/// present. Sharing one predicate with `ainl-transpile` keeps the four backends
-/// refusing the same set of programs.
-fn find_import(forms: &[Node]) -> Option<usize> {
-    for form in forms {
-        let Node::List(items, _) = form else {
-            continue;
-        };
-        if let Some(ainl_core::Node::Sym(head, _)) = items.first() {
-            if head == ainl_core::import::IMPORT_SYM {
-                return Some(form.span().start);
-            }
-            // `quote` is data: nothing inside it is ever evaluated, so there is
-            // no import to refuse.
-            if head == "quote" {
-                continue;
-            }
-        }
-        // `()` is legal AINL — an empty `fn` parameter list, for one — so skip
-        // the head only when there IS a head. Slicing from 1 on an empty list
-        // panics, and the crash would be reachable from ordinary source.
-        if !items.is_empty() {
-            if let Some(at) = find_import(&items[1..]) {
-                return Some(at);
-            }
-        }
-    }
-    None
 }
 
 struct Gen {

@@ -41,8 +41,38 @@ later, **Blockers** = needs an external resource or decision.
   means either an arbitrary-precision integer type in the (zero-dependency)
   interpreter, or `BigInt`-based codegen for the JS target; currently the
   divergence is documented and pinned by tests rather than fixed.
+- **HTTPS for `http-get` / `http-post`**: AINL speaks plain HTTP only, and
+  `https://` is refused by name. This was a decision, not an omission — the
+  zero-dependency rule is what keeps the AOT binary statically linked, and
+  every TLS stack is a C-transitive dependency tree. The two priced paths (a
+  local TLS-terminating proxy, or an opt-in `--features tls` build) and the
+  reasoning are in [HTTP_TLS.md](HTTP_TLS.md). Revisit only if the
+  standalone-binary property stops being a claim.
+- **An HTTP client in the AOT C backend and the three transpilers**: both
+  builtins are interpreter-only today and the other backends refuse them with
+  an `interpreter-only` error. A port means an HTTP/1.1 client in the C runtime
+  (a socket plus a parser, and the static-link guarantee has to survive it) and
+  three host-library mappings that must agree with
+  `crates/ainl-core/src/http.rs` byte for byte — the same contract
+  `json_value.rs` has to its three ports. Named in SYNTAX.md §3c.
+- **An HTTP server / listening socket**: AINL can fetch, not serve. There is no
+  `http-listen`, so two AINL programs cannot talk to each other.
 
 ## Recently completed
+
+**HTTP client (`http-get` / `http-post`)** — a hand-written zero-dependency
+HTTP/1.1 client in `ainl-core` (`http.rs`, the normative implementation):
+GET/POST against any `http://` URL, request headers, `Content-Length` and
+chunked response bodies, and a response that is an ordinary AINL map
+(`status`/`ok`/`body`/`headers`/`reason`/`truncated`) so it needs no new access
+syntax. A non-2xx status is a *value*, not an error. Fixed limits (10s connect,
+30s read, 8 MiB body, 64 KiB headers) rather than an unbounded read, and
+`Host`/`Content-Length`/CRLF/userinfo are refused as the request-smuggling
+primitives they are. **No TLS** — `https://` is refused with the fix in the
+message, before a socket is opened. Interpreter-only, with the AOT backend and
+all three transpilers refusing explicitly. 27 end-to-end tests against a real
+loopback server, 12 backend-refusal tests, and a doc gate that executes every
+claim in SYNTAX.md §3c. ([HTTP_TLS.md](HTTP_TLS.md))
 
 **JSON → AST round-trip (deserialization)** — hand-written zero-dependency JSON
 parser in `ainl-core` (`deserialize::json_to_forms`, CLI `ainl ast <file>

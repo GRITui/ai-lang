@@ -754,6 +754,13 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let env = ainl_core::Env::with_prelude();
     // The names the codegen table is expected to cover, read back out of the
     // generated prelude so the test follows the interpreter, not a copy.
+    //
+    // The two HTTP builtins are deliberately NOT here. They are
+    // interpreter-only (see `http_refusal.rs`), so there is no runtime.c
+    // builtin for them and no id to give: a program using one is refused
+    // before codegen, and the table must not pretend otherwise. They are
+    // asserted as absent just below, so adding one to the prelude without
+    // deciding its backend status fails here instead of silently passing.
     let names: Vec<String> = [
         "+",
         "*",
@@ -832,4 +839,36 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         );
     }
     assert_eq!(names.len(), 54, "update this list when the prelude changes");
+
+    // The other direction, which is the one that actually catches drift: every
+    // name the prelude binds must be either in the table above (reachable by
+    // codegen) or listed here as interpreter-only. A builtin that is in
+    // neither is the silent failure this whole test exists to prevent — it
+    // compiles to a `scope_lookup` and only fails when a program runs it.
+    const INTERPRETER_ONLY: &[&str] = &["http-get", "http-post"];
+    let listed: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    for name in INTERPRETER_ONLY {
+        assert!(
+            !listed.contains(name),
+            "`{name}` is interpreter-only, so it must not be in the codegen table"
+        );
+        // It must nonetheless be bound in the prelude, or the interpreter-only
+        // refusal is refusing a program that could never have called it.
+        let v = env
+            .get(name)
+            .unwrap_or_else(|| panic!("the prelude does not define `{name}`"));
+        assert!(
+            matches!(v, ainl_core::Value::Builtin { .. }),
+            "`{name}` must be a builtin in the prelude"
+        );
+    }
+    let total = listed.len() + INTERPRETER_ONLY.len();
+    assert_eq!(
+        total,
+        56,
+        "the prelude has {total} builtins ({} portable + {} interpreter-only); \
+         update the table and this count when the prelude changes",
+        listed.len(),
+        INTERPRETER_ONLY.len()
+    );
 }

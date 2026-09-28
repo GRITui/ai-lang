@@ -374,6 +374,102 @@ thing. A program with no `import` is unaffected on every backend.
 (Scope note: the REPL and `import` are independent. The REPL adds no syntax of
 its own — see §3a.)
 
+## 3c. HTTP: `http-get` / `http-post`
+
+| Call | Returns |
+|------|---------|
+| `(http-get url)` | a response map |
+| `(http-get url headers)` | the same, with request headers |
+| `(http-post url body)` | a response map |
+| `(http-post url body headers)` | the same, with request headers |
+
+`url` must start with `http://`. `body` is a string. `headers` is a map of
+`str`→`str`.
+
+```lisp
+(def r (http-get "http://127.0.0.1:8080/health"))
+(get r "status")                 ; => 200   (an int)
+(get r "ok")                    ; => true
+(get r "body")                  ; => "…"
+(get (get r "headers") "content-type")   ; => "text/plain"
+
+(http-post "http://127.0.0.1:8080/items"
+           "{\"name\": \"widget\"}"
+           (hash "Content-Type" "application/json"))
+```
+
+### The response is an ordinary map
+
+Four keys plus a nested `headers` map. No new value type and no new access
+syntax, so `get`, `has`, `keys` and `vals` all work on it and a helper written
+once handles every response:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `status` | `int` | the HTTP status code |
+| `ok` | `bool` | `true` when `status` is 200–299 |
+| `body` | `str` | the response body |
+| `headers` | map | `str`→`str`, **names lowercased** |
+| `reason` | `str` | the status text (`"Not Found"`) |
+| `truncated` | `bool` | present **only** when the body hit the size cap |
+
+### A non-2xx status is a value, not an error
+
+`(get (http-get u) "ok")` is `false` for a 404. The call **succeeds**. This is
+deliberate: a 404 is a fact about the server, and a caller that has to
+string-match an error message to tell a 404 from a 500 cannot branch on it
+properly. Only a *transport* failure (cannot connect, timed out, malformed
+response) is a runtime error.
+
+```lisp
+(def r (http-get "http://127.0.0.1:8080/nope"))
+(if (get r "ok") "found" "missing")           ; => "missing"
+```
+
+### Rules a caller has to know
+
+- **Plain HTTP only. `https://` is refused**, with an error naming the fix.
+  This is a decision, not a gap — AINL's zero-dependency rule is what keeps its
+  AOT binaries standalone, and every TLS stack is a C-transitive dependency
+  tree. Use a local TLS-terminating proxy and point AINL at its `http://` side.
+  The full reasoning and the two priced ways forward are in
+  [HTTP_TLS.md](HTTP_TLS.md).
+- **The body must be valid UTF-8.** Otherwise it cannot be an AINL string, and
+  it is an error rather than a lossy replacement character — the same position
+  `read-file` takes.
+- **The body must be framed**: `Content-Length` or chunked
+  `Transfer-Encoding`. A close-delimited body is refused, because reading to
+  EOF on a connection that does not close never returns.
+- **Repeated response headers keep the first value.** `Set-Cookie` arrives
+  several times on a real response, and joining with `,` is wrong for every
+  header that uses commas as a list separator, so there is no join. Look the
+  header up by name; AINL has no way to ask for the second one.
+- **No redirects, no cookies, no keep-alive.** A 3xx comes back as a response
+  like any other. A client that follows redirects can be walked somewhere the
+  caller never named.
+- **`Host` and `Content-Length` cannot be set** — AINL computes both from the
+  URL and the body, and a caller-supplied value is the request-smuggling
+  primitive. Credentials in a URL (`http://u:p@host/`) are refused for the same
+  reason: they end up in a request line and get logged.
+- **A header name or value containing CR or LF is refused.** It would split one
+  request into two.
+- **Limits are fixed, not tunable**: 10 s to connect, 30 s to read, 8 MiB body,
+  64 KiB headers. A body over the cap is **truncated and flagged** with
+  `truncated`, not refused. A builtin that can hang forever or exhaust memory
+  makes every networked program untestable.
+
+### Backend scope: the interpreter only
+
+`http-get` / `http-post` work with `ainl run` and `ainl repl` — the
+interpreter/VM and the tree-walking evaluator, which are held to agreeing on
+them. The **AOT C backend and the three transpilers refuse** a program that
+uses either, with the same `interpreter-only` error `import` gives (§3b). A
+socket plus an HTTP/1.1 client in the C runtime would break the static-binary
+guarantee, and each host language's HTTP library disagrees with the others
+about redirects, header casing, timeouts and verification defaults — which is
+the "builds cleanly, does something subtly different" failure the four-backend
+rule exists to prevent.
+
 ## 4. Canonical examples
 
 ```lisp

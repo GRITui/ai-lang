@@ -164,8 +164,11 @@ reason not to run this on everything.
 ```
 
 The micro-runtime (value model, refcounting, cons cells, interning, scopes,
-closures, 54 builtins, step counter) is inlined into a **single self-contained
-C file** that links against nothing but libc. Keep the C with `--keep-c`.
+closures, step counter) is inlined into a **single self-contained C file** that
+links against nothing but libc, together with the 54 builtins the AOT backend
+implements. (`http-get`/`http-post` are the other two of the prelude's 56, and
+are interpreter-only — see [SYNTAX.md §3c](SYNTAX.md#3c-http-http-get--http-post),
+so they are not in this runtime.) Keep the C with `--keep-c`.
 
 ```
 compiled /tmp/pipeline_demo.ainl -> /tmp/pipeline_demo

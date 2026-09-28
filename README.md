@@ -163,8 +163,12 @@ AINL's other properties, all measured:
 - **AOT to a native binary.** `ainl compile` emits a single self-contained C
   file — the micro-runtime is inlined, so the output links against nothing but
   libc. Needs `cc` to build; **the output needs nothing.**
-- **54 builtins** across the interpreter, the AOT binary, and all three
-  transpiler targets, with byte-identical output on all four.
+- **56 builtins.** 54 are byte-identical on all four backends (the interpreter,
+  the AOT binary, and the three transpiler targets). The other 2 — `http-get`
+  and `http-post` — are **interpreter-only**: the AOT and transpiler backends
+  refuse a program that uses them with an explicit `interpreter-only` error
+  rather than emit something that behaves differently
+  ([docs/SYNTAX.md](docs/SYNTAX.md#3c-http-http-get--http-post)).
 - **Zero external dependencies.** A small static Rust binary, no crates.io
   runtime deps.
 
@@ -184,7 +188,7 @@ The AOT binary lands within **1.27× of hand-written Rust** for the same loop.
 Of the AOT binary's 2.25 ms, 1.56 ms is process startup — subtracting the
 measured floor, AOT compute is 0.69 ms, about **51× the interpreter**.
 
-### Two things that did not work
+### Things that did not work
 
 Kept here because a pitch that only lists wins is not a pitch you can trust.
 
@@ -207,6 +211,16 @@ Kept here because a pitch that only lists wins is not a pitch you can trust.
   thing. Inlining modules would change their evaluation semantics, so the
   backends decline rather than guess. A program with no import is unaffected on
   every backend. ([docs/SYNTAX.md §3b](docs/SYNTAX.md#3b-modules-import))
+- **`http-get` / `http-post` are interpreter-only, and there is no TLS.** The
+  HTTP client works on the interpreter and the tree-walking evaluator; the AOT
+  and transpiler backends **refuse** a program using it, because a socket in the
+  C runtime would break the static-binary guarantee and the three host HTTP
+  libraries disagree about redirects, header casing and timeouts. `https://` is
+  **refused outright**: every TLS stack is a C-transitive dependency tree, and
+  the zero-dependency rule is what makes the AOT binary standalone. Use a local
+  TLS-terminating proxy. This is a decision with two priced ways forward, not an
+  oversight — [docs/HTTP_TLS.md](docs/HTTP_TLS.md) records the reasoning.
+  ([docs/SYNTAX.md §3c](docs/SYNTAX.md#3c-http-http-get--http-post))
 
 ## Install
 
@@ -246,6 +260,7 @@ cargo build --release
 
 ainl run examples/hello.ainl                  # interpret
 ainl run examples/wordcount/main.ainl          # multi-file: (import "lib/...")
+ainl run examples/http/http-demo.ainl           # HTTP client (interpreter-only; see below)
 ainl repl                                      # interactive REPL
 ainl repl --stdin < session.ainl > out.txt     # scriptable REPL session
 ainl compile examples/fib.ainl -o fib && ./fib # AOT → native binary

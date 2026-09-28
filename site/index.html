@@ -271,8 +271,10 @@ $ ./fib10
     and read back losslessly.</li>
     <li><strong>Lossless interop.</strong> The same AST projects to idiomatic Python,
     JavaScript, and Ruby — byte-equivalent across all four backends.</li>
-    <li><strong>54 builtins</strong> across the interpreter, the AOT binary, and all three
-    transpiler targets, with byte-identical output on every one.</li>
+    <li><strong>56 builtins</strong> — 54 byte-identical across the interpreter,
+    the AOT binary, and all three transpiler targets; <code>http-get</code> and
+    <code>http-post</code> are interpreter-only and the other backends refuse
+    them out loud.</li>
     <li><strong>Zero external dependencies.</strong> A small static Rust binary.</li>
   </ul>
   <pre><code>(def sq (fn (x) (* x x)))
