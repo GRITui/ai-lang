@@ -17,6 +17,9 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
+/* Stage 3.1 stdlib: time(), getenv() and file I/O. time()/clock() are in libc
+ * on POSIX; the C23 additions (timespec_get) are avoided for portability. */
+#include <time.h>
 
 /* ---- error handling ---------------------------------------------------- */
 static int g_err = 0;
@@ -113,7 +116,15 @@ struct Scope {
 enum {
   B_ADD, B_MUL, B_SUB, B_DIV, B_EQ, B_LT, B_GT, B_LE, B_GE, B_NOT, B_MOD,
   B_PRINT, B_STR, B_LIST, B_LEN, B_FIRST, B_REST, B_NTH, B_CONS, B_PUSH,
-  B_HASH, B_GET, B_ASSOC, B_HAS, B_KEYS, B_VALS, B_ERROR, B_COUNT
+  B_HASH, B_GET, B_ASSOC, B_HAS, B_KEYS, B_VALS, B_ERROR,
+  /* Stage 3.1 stdlib — the ids here must match BUILTIN_IDS in ainl-cc's
+   * lib.rs exactly; the AOT correctness suite fails loudly if they drift. */
+  B_READ_FILE, B_WRITE_FILE, B_APPEND_FILE,
+  B_SPLIT, B_JOIN, B_TRIM, B_REPLACE, B_UPCASE, B_DOWNCASE, B_CONTAINS,
+  B_ENV_GET, B_EXIT,
+  B_NOW, B_SLEEP,
+  B_ABS, B_MIN, B_MAX, B_FLOOR, B_SQRT,
+  B_COUNT
 };
 
 struct Closure {
@@ -492,6 +503,20 @@ static double as_f64(Value *v) {
 }
 
 /* ---- checked integer arithmetic (i64 -> f64 promotion on overflow) ----- */
+
+/* Number of UTF-8 characters (code points) in the first `len` bytes.
+ * A byte with its high bit clear is a 1-byte character; a byte matching
+ * 0b10xxxxxx continues the character started by the preceding lead byte and is
+ * skipped. This is what makes `(len str)` count characters the way the
+ * interpreter's `chars().count()` does instead of counting UTF-8 bytes. */
+static size_t utf8_len(const char *s, size_t len) {
+  size_t n = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (((unsigned char)s[i] & 0xC0) != 0x80)
+      n++;
+  }
+  return n;
+}
 static int checked_add(int64_t a, int64_t b, int64_t *out) {
   if (b > 0 && a > INT64_MAX - b)
     return 0;
@@ -997,7 +1022,12 @@ static Value builtin_len(Value *args, int nargs) {
   if (a->tag == V_LIST)
     return v_int((int64_t)a->u.l->len);
   if (a->tag == V_STR)
-    return v_int((int64_t)a->u.s->len);
+    /* UTF-8 *characters*, not bytes — `s->len` is the byte count, so "héllo"
+     * would be 6 here against the interpreter's 5. Counts code points by
+     * skipping continuation bytes (0b10xxxxxx), which is exact for valid UTF-8
+     * and matches Rust's `chars().count()`. An invalid byte counts as one
+     * character, which is also what Rust's lossy decode does. */
+    return v_int((int64_t)utf8_len(a->u.s->data, a->u.s->len));
   if (a->tag == V_MAP)
     return v_int((int64_t)a->u.m->n);
   set_err("len expects list, str, or hash, got %s", type_name(a));
@@ -1279,6 +1309,519 @@ static Value builtin_error(Value *args, int nargs) {
   return v_nil();
 }
 
+/* ---- Stage 3.1 stdlib ---------------------------------------------------- */
+/* Each of these is a byte-for-byte twin of the corresponding builtin in
+ * crates/ainl-core/src/eval.rs, including the exact error strings. The two
+ * rules that make the four backends agree rather than merely resemble each
+ * other are applied here too:
+ *   * ASCII-only case folding and whitespace trimming. <ctype.h>'s tolower/
+ *     toupper are locale-dependent (and undefined for negative char values),
+ *     and the three transpiler hosts each strip a different Unicode whitespace
+ *     set, so both sides spell the character class out.
+ *   * Where the hosts disagree (empty split separator, empty replace target,
+ *     negative sqrt/sleep) this runtime raises the same message the
+ *     interpreter does, instead of picking its own answer. */
+
+/* The characters `trim` strips: space, tab, LF, CR, FF, VT (see is_ascii_ws in
+ * eval.rs). Locale-independent by construction. */
+static int a_is_ascii_ws(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0C' ||
+         c == '\x0B';
+}
+
+/* A str argument, or the shared "who expects a str, got t" error. Returns NULL
+ * after setting g_err. */
+static const char *as_str_arg(Value *v, const char *who) {
+  if (v->tag == V_STR)
+    return v->u.s->data;
+  set_err("%s expects a str, got %s", who, type_name(v));
+  return NULL;
+}
+
+/* A str *path* argument — the file builtins' wording. */
+static const char *as_path_arg(Value *v, const char *who) {
+  if (v->tag == V_STR)
+    return v->u.s->data;
+  set_err("%s expects a str path, got %s", who, type_name(v));
+  return NULL;
+}
+
+/* The content operand of the two writing file builtins. */
+static const char *as_content_arg(Value *v, const char *who) {
+  if (v->tag == V_STR)
+    return v->u.s->data;
+  set_err("%s expects str content, got %s", who, type_name(v));
+  return NULL;
+}
+
+/* A numeric argument reported under the builtin's own name. Returns 0 on
+ * failure (g_err set); the caller must check. */
+static int as_num_arg(Value *v, const char *who, double *out) {
+  if (v->tag == V_INT) {
+    *out = (double)v->u.i;
+    return 1;
+  }
+  if (v->tag == V_FLOAT) {
+    *out = v->u.f;
+    return 1;
+  }
+  set_err("%s expects a number, got %s", who, type_name(v));
+  return 0;
+}
+
+/* Read a whole file as a new Str. fopen in "rb" so no CRLF translation can
+ * change the bytes on a Windows host (matching the interpreter's read). */
+static Value builtin_read_file(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("read-file expects (read-file path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "read-file");
+  if (!path)
+    return v_nil();
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    set_err("read-file: cannot read '%s'", path);
+    return v_nil();
+  }
+  size_t cap = 4096, len = 0;
+  char *buf = malloc(cap);
+  for (;;) {
+    if (len + 4096 > cap) {
+      cap *= 2;
+      buf = realloc(buf, cap);
+    }
+    size_t got = fread(buf + len, 1, 4096, f);
+    len += got;
+    if (got < 4096)
+      break;
+  }
+  int bad = ferror(f);
+  fclose(f);
+  if (bad) {
+    free(buf);
+    set_err("read-file: cannot read '%s'", path);
+    return v_nil();
+  }
+  buf = realloc(buf, len + 1);
+  buf[len] = 0;
+  return v_str_take(buf);
+}
+
+/* write-file / append-file share one body: the mode string and the verb are the
+ * only differences. */
+static Value write_file_inner(Value *args, int nargs, const char *who,
+                              const char *verb, const char *mode) {
+  if (nargs != 2) {
+    set_err("%s expects (%s path content)", who, who);
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], who);
+  if (!path)
+    return v_nil();
+  const char *content = as_content_arg(&args[1], who);
+  if (!content)
+    return v_nil();
+  FILE *f = fopen(path, mode);
+  if (!f) {
+    set_err("%s: cannot %s '%s'", who, verb, path);
+    return v_nil();
+  }
+  size_t n = strlen(content);
+  size_t wrote = n ? fwrite(content, 1, n, f) : 0;
+  int bad = (wrote != n) || fflush(f) != 0;
+  if (fclose(f) != 0)
+    bad = 1;
+  if (bad) {
+    set_err("%s: cannot %s '%s'", who, verb, path);
+    return v_nil();
+  }
+  return v_nil();
+}
+
+static Value builtin_write_file(Value *args, int nargs) {
+  /* "wb" truncates an existing file, matching write-file. */
+  return write_file_inner(args, nargs, "write-file", "write", "wb");
+}
+
+static Value builtin_append_file(Value *args, int nargs) {
+  /* "ab" appends, and creates the file when absent, matching append-file. */
+  return write_file_inner(args, nargs, "append-file", "append to", "ab");
+}
+
+/* (split str sep) -> list of str. An empty separator is rejected, as in the
+ * interpreter. */
+static Value builtin_split(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("split expects (split str separator)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "split");
+  if (!s)
+    return v_nil();
+  const char *sep = as_str_arg(&args[1], "split");
+  if (!sep)
+    return v_nil();
+  size_t seplen = strlen(sep);
+  if (seplen == 0) {
+    set_err("split expects a non-empty separator");
+    return v_nil();
+  }
+  size_t slen = strlen(s);
+  /* Upper bound on fields: (len / seplen) + 1, plus the empty-string case. */
+  size_t maxf = slen / seplen + 2;
+  Value *items = malloc(maxf * sizeof(Value));
+  size_t n = 0, start = 0;
+  for (size_t i = 0; i + seplen <= slen;) {
+    if (memcmp(s + i, sep, seplen) == 0) {
+      char *field = malloc(i - start + 1);
+      memcpy(field, s + start, i - start);
+      field[i - start] = 0;
+      items[n].tag = V_STR;
+      items[n].u.s = NULL;
+      /* Build a Str around the malloc'd field so v_list_from_array can take
+       * ownership uniformly. */
+      Str *st = malloc(sizeof(Str));
+      st->ref = 1;
+      st->len = i - start;
+      st->data = field;
+      items[n].u.s = st;
+      n++;
+      i += seplen;
+      start = i;
+    } else {
+      i++;
+    }
+  }
+  /* The trailing field (possibly empty). */
+  char *tail = malloc(slen - start + 1);
+  memcpy(tail, s + start, slen - start);
+  tail[slen - start] = 0;
+  Str *st = malloc(sizeof(Str));
+  st->ref = 1;
+  st->len = slen - start;
+  st->data = tail;
+  items[n].tag = V_STR;
+  items[n].u.s = st;
+  n++;
+  Value r = v_list_from_array(items, (int)n);
+  free(items);
+  return r;
+}
+
+/* (join list sep) -> str. Every element must be a str (matching the
+ * interpreter, which errors rather than coercing like JS). */
+static Value builtin_join(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("join expects (join list separator)");
+    return v_nil();
+  }
+  if (args[0].tag != V_LIST) {
+    set_err("join expects a list, got %s", type_name(&args[0]));
+    return v_nil();
+  }
+  if (args[1].tag != V_STR) {
+    set_err("join expects a str separator, got %s", type_name(&args[1]));
+    return v_nil();
+  }
+  const char *sep = args[1].u.s->data;
+  size_t seplen = args[1].u.s->len;
+  /* First pass: total length, validating every element is a str. */
+  size_t total = 0;
+  int count = 0;
+  ConsCell *c = args[0].u.l;
+  while (c && c->len > 0) {
+    if (c->head.tag != V_STR) {
+      set_err("join expects a list of str");
+      return v_nil();
+    }
+    total += c->head.u.s->len;
+    count++;
+    c = c->tail;
+  }
+  if (count > 1)
+    total += seplen * (size_t)(count - 1);
+  char *out = malloc(total + 1);
+  size_t off = 0;
+  int first = 1;
+  c = args[0].u.l;
+  while (c && c->len > 0) {
+    if (!first) {
+      memcpy(out + off, sep, seplen);
+      off += seplen;
+    }
+    first = 0;
+    memcpy(out + off, c->head.u.s->data, c->head.u.s->len);
+    off += c->head.u.s->len;
+    c = c->tail;
+  }
+  out[off] = 0;
+  return v_str_take(out);
+}
+
+/* (trim str) — strip leading/trailing ASCII whitespace (a_is_ascii_ws). */
+static Value builtin_trim(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("trim expects (trim str)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "trim");
+  if (!s)
+    return v_nil();
+  const char *start = s;
+  while (*start && a_is_ascii_ws((unsigned char)*start))
+    start++;
+  const char *end = s + strlen(s);
+  while (end > start && a_is_ascii_ws((unsigned char)end[-1]))
+    end--;
+  size_t len = (size_t)(end - start);
+  char *out = malloc(len + 1);
+  memcpy(out, start, len);
+  out[len] = 0;
+  return v_str_take(out);
+}
+
+/* (replace str old new) — every non-overlapping occurrence, left to right.
+ * The replacement is not rescanned, matching Rust's str::replace. An empty
+ * target is rejected, as in the interpreter. */
+static Value builtin_replace(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("replace expects (replace str old new)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "replace");
+  if (!s)
+    return v_nil();
+  const char *old = as_str_arg(&args[1], "replace");
+  if (!old)
+    return v_nil();
+  const char *neu = as_str_arg(&args[2], "replace");
+  if (!neu)
+    return v_nil();
+  size_t oldlen = strlen(old), newlen = strlen(neu), slen = strlen(s);
+  if (oldlen == 0) {
+    set_err("replace expects a non-empty target");
+    return v_nil();
+  }
+  /* Worst case: every byte is a match and each grows to newlen. */
+  size_t cap = slen * (newlen + 1) + 1;
+  char *out = malloc(cap);
+  size_t off = 0;
+  for (size_t i = 0; i < slen;) {
+    if (i + oldlen <= slen && memcmp(s + i, old, oldlen) == 0) {
+      memcpy(out + off, neu, newlen);
+      off += newlen;
+      i += oldlen;
+    } else {
+      out[off++] = s[i++];
+    }
+  }
+  out[off] = 0;
+  return v_str_take(out);
+}
+
+/* (upcase str) / (downcase str) — ASCII only (see a_is_ascii_ws). The explicit
+ * ranges avoid <ctype.h>'s locale dependency and its negative-char UB. */
+static Value builtin_case(Value *args, int nargs, int up) {
+  const char *who = up ? "upcase" : "downcase";
+  if (nargs != 1) {
+    set_err("%s expects (%s str)", who, who);
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], who);
+  if (!s)
+    return v_nil();
+  size_t len = strlen(s);
+  char *out = malloc(len + 1);
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (up)
+      out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+    else
+      out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+  }
+  out[len] = 0;
+  return v_str_take(out);
+}
+
+static Value builtin_upcase(Value *args, int nargs) {
+  return builtin_case(args, nargs, 1);
+}
+static Value builtin_downcase(Value *args, int nargs) {
+  return builtin_case(args, nargs, 0);
+}
+
+/* (contains hay needle) -> bool. An empty needle is true, matching strstr. */
+static Value builtin_contains(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("contains expects (contains str sub)");
+    return v_nil();
+  }
+  const char *hay = as_str_arg(&args[0], "contains");
+  if (!hay)
+    return v_nil();
+  const char *needle = as_str_arg(&args[1], "contains");
+  if (!needle)
+    return v_nil();
+  return v_bool(strstr(hay, needle) != NULL);
+}
+
+/* (env-get name) -> str or nil. */
+static Value builtin_env_get(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("env-get expects (env-get name)");
+    return v_nil();
+  }
+  const char *name = as_str_arg(&args[0], "env-get");
+  if (!name)
+    return v_nil();
+  const char *v = getenv(name);
+  return v ? v_str(v) : v_nil();
+}
+
+/* (exit code) — does not return. stdout is flushed first: exit() does not
+ * flush stdio the way a normal return does on every platform. */
+static Value builtin_exit(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("exit expects (exit code)");
+    return v_nil();
+  }
+  if (args[0].tag != V_INT) {
+    set_err("exit expects an int, got %s", type_name(&args[0]));
+    return v_nil();
+  }
+  fflush(stdout);
+  fflush(stderr);
+  exit((int)args[0].u.i);
+}
+
+/* (now) -> whole seconds since the Unix epoch. */
+static Value builtin_now(Value *args, int nargs) {
+  if (nargs != 0) {
+    set_err("now expects (now)");
+    return v_nil();
+  }
+  return v_int((int64_t)time(NULL));
+}
+
+/* (sleep seconds) -> nil. Negative and NaN are rejected so all four backends
+ * agree. Long requests are split into <= 1-year naps: nanosleep/select take a
+ * time_t, and an absurd value like 1e300 would otherwise wrap. */
+static Value builtin_sleep(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("sleep expects (sleep seconds)");
+    return v_nil();
+  }
+  double secs;
+  if (!as_num_arg(&args[0], "sleep", &secs))
+    return v_nil();
+  if (isnan(secs) || secs < 0.0) {
+    set_err("sleep expects a non-negative number");
+    return v_nil();
+  }
+  while (secs > 0.0) {
+    double chunk = secs > 31536000.0 ? 31536000.0 : secs;
+    struct timespec ts;
+    ts.tv_sec = (time_t)chunk;
+    ts.tv_nsec = (long)((chunk - (double)ts.tv_sec) * 1e9);
+    if (ts.tv_nsec < 0)
+      ts.tv_nsec = 0;
+    if (ts.tv_nsec > 999999999L)
+      ts.tv_nsec = 999999999L;
+    if (nanosleep(&ts, NULL) != 0)
+      break; /* interrupted by a signal: stop rather than spin */
+    secs -= chunk;
+  }
+  return v_nil();
+}
+
+/* (abs n) — integer-preserving; abs(INT64_MIN) has no i64 answer, so it
+ * promotes to float exactly as the interpreter's checked_abs does. */
+static Value builtin_abs(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("abs expects (abs n)");
+    return v_nil();
+  }
+  Value *a = &args[0];
+  if (a->tag == V_INT) {
+    if (a->u.i == INT64_MIN)
+      return v_float(-(double)a->u.i);
+    return v_int(a->u.i < 0 ? -a->u.i : a->u.i);
+  }
+  if (a->tag == V_FLOAT)
+    return v_float(fabs(a->u.f));
+  set_err("abs expects a number, got %s", type_name(a));
+  return v_nil();
+}
+
+/* (min a b ...) / (max a b ...) — numeric only, at least one argument, folding
+ * pairwise. Ties keep the first of the equal values (strict < / >), matching
+ * the interpreter. Returns an *owned* Value, so the winner is ref'd. */
+static Value builtin_minmax(Value *args, int nargs, int max) {
+  const char *who = max ? "max" : "min";
+  if (nargs < 1) {
+    set_err("%s expects at least 1 argument", who);
+    return v_nil();
+  }
+  double best;
+  if (!as_num_arg(&args[0], who, &best))
+    return v_nil();
+  int bi = 0;
+  for (int k = 1; k < nargs; k++) {
+    double x;
+    if (!as_num_arg(&args[k], who, &x))
+      return v_nil();
+    if (max ? (x > best) : (x < best)) {
+      best = x;
+      bi = k;
+    }
+  }
+  Value r = args[bi];
+  v_ref(&r);
+  return r;
+}
+
+static Value builtin_min(Value *args, int nargs) {
+  return builtin_minmax(args, nargs, 0);
+}
+static Value builtin_max(Value *args, int nargs) {
+  return builtin_minmax(args, nargs, 1);
+}
+
+/* (floor n) -> int. An int passes through unchanged (no double round-trip, so
+ * a large i64 keeps every bit). */
+static Value builtin_floor(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("floor expects (floor n)");
+    return v_nil();
+  }
+  if (args[0].tag == V_INT)
+    return v_int(args[0].u.i);
+  double x;
+  if (!as_num_arg(&args[0], "floor", &x))
+    return v_nil();
+  double f = floor(x);
+  if (f >= -9223372036854775808.0 && f < 9223372036854775808.0)
+    return v_int((int64_t)f);
+  return v_float(f);
+}
+
+/* (sqrt n) -> float. Negative is an error, not a silent NaN. */
+static Value builtin_sqrt(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("sqrt expects (sqrt n)");
+    return v_nil();
+  }
+  double x;
+  if (!as_num_arg(&args[0], "sqrt", &x))
+    return v_nil();
+  if (x < 0.0) {
+    set_err("sqrt expects a non-negative number");
+    return v_nil();
+  }
+  return v_float(sqrt(x));
+}
+
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
   tick(); /* bounds recursion / runaway calls */
@@ -1340,6 +1883,45 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_vals(args, nargs);
     case B_ERROR:
       return builtin_error(args, nargs);
+    /* Stage 3.1 stdlib */
+    case B_READ_FILE:
+      return builtin_read_file(args, nargs);
+    case B_WRITE_FILE:
+      return builtin_write_file(args, nargs);
+    case B_APPEND_FILE:
+      return builtin_append_file(args, nargs);
+    case B_SPLIT:
+      return builtin_split(args, nargs);
+    case B_JOIN:
+      return builtin_join(args, nargs);
+    case B_TRIM:
+      return builtin_trim(args, nargs);
+    case B_REPLACE:
+      return builtin_replace(args, nargs);
+    case B_UPCASE:
+      return builtin_upcase(args, nargs);
+    case B_DOWNCASE:
+      return builtin_downcase(args, nargs);
+    case B_CONTAINS:
+      return builtin_contains(args, nargs);
+    case B_ENV_GET:
+      return builtin_env_get(args, nargs);
+    case B_EXIT:
+      return builtin_exit(args, nargs);
+    case B_NOW:
+      return builtin_now(args, nargs);
+    case B_SLEEP:
+      return builtin_sleep(args, nargs);
+    case B_ABS:
+      return builtin_abs(args, nargs);
+    case B_MIN:
+      return builtin_min(args, nargs);
+    case B_MAX:
+      return builtin_max(args, nargs);
+    case B_FLOOR:
+      return builtin_floor(args, nargs);
+    case B_SQRT:
+      return builtin_sqrt(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -1550,6 +2132,14 @@ static void scope_install_prelude(Scope *env) {
       {"rest", B_REST}, {"nth", B_NTH}, {"cons", B_CONS}, {"push", B_PUSH},
       {"hash", B_HASH}, {"get", B_GET}, {"assoc", B_ASSOC}, {"has", B_HAS},
       {"keys", B_KEYS}, {"vals", B_VALS}, {"error", B_ERROR},
+      /* Stage 3.1 stdlib */
+      {"read-file", B_READ_FILE}, {"write-file", B_WRITE_FILE},
+      {"append-file", B_APPEND_FILE}, {"split", B_SPLIT}, {"join", B_JOIN},
+      {"trim", B_TRIM}, {"replace", B_REPLACE}, {"upcase", B_UPCASE},
+      {"downcase", B_DOWNCASE}, {"contains", B_CONTAINS},
+      {"env-get", B_ENV_GET}, {"exit", B_EXIT}, {"now", B_NOW},
+      {"sleep", B_SLEEP}, {"abs", B_ABS}, {"min", B_MIN}, {"max", B_MAX},
+      {"floor", B_FLOOR}, {"sqrt", B_SQRT},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

@@ -18,7 +18,10 @@
 use ainl_core::Node;
 use std::collections::{HashMap, HashSet};
 
-/// (name, builtin id) for the 27 prelude builtins (must match runtime.c).
+/// (name, builtin id) for every prelude builtin (must match the `enum` in
+/// runtime.c). A name that is bound in ainl-core's prelude but missing here
+/// would compile to a `scope_lookup` that fails at runtime, so the two tables
+/// are pinned against each other by `tests/aot_stdlib.rs`.
 const BUILTIN_IDS: &[(&str, i32)] = &[
     ("+", 0),
     ("*", 1),
@@ -47,6 +50,26 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("keys", 24),
     ("vals", 25),
     ("error", 26),
+    // Stage 3.1 stdlib
+    ("read-file", 27),
+    ("write-file", 28),
+    ("append-file", 29),
+    ("split", 30),
+    ("join", 31),
+    ("trim", 32),
+    ("replace", 33),
+    ("upcase", 34),
+    ("downcase", 35),
+    ("contains", 36),
+    ("env-get", 37),
+    ("exit", 38),
+    ("now", 39),
+    ("sleep", 40),
+    ("abs", 41),
+    ("min", 42),
+    ("max", 43),
+    ("floor", 44),
+    ("sqrt", 45),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).
