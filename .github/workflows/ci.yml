@@ -133,10 +133,16 @@ jobs:
           # -lm: fmod() (float formatting) lives in libm, not libc.
           x86_64-linux-musl-gcc -O2 -static -o hello.musl hello.c -lm
           file hello.musl
-          LDD_OUT=$(ldd hello.musl 2>&1)
+          file hello.musl | grep -q "statically linked"
+          # `ldd` on a fully static binary prints "not a dynamic executable" and
+          # exits 1, so it must be guarded with `|| true` — under `set -e` the
+          # bare command aborts the step before the check can run (which is what
+          # the first version of this step did).
           echo "== ldd =="
-          echo "$LDD_OUT"
-          echo "$LDD_OUT" | grep -Eq "not a dynamic executable|statically linked"
+          ldd_out=$(ldd hello.musl 2>&1 || true)
+          echo "$ldd_out"
+          echo "$ldd_out" | grep -Eq "not a dynamic executable|statically linked"
+          echo "ok   statically linked: no dynamic dependencies"
 
       - name: Run it (uploads the standalone binary as an artifact)
         run: |
