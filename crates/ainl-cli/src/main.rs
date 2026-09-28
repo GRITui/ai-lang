@@ -12,6 +12,9 @@
 //!   version        print version, build target, and source commit
 
 mod doctor;
+mod gbnf;
+mod gen;
+mod gen_api;
 mod repl;
 mod test_runner;
 
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         Some("test") => cmd_test(&args[1..]),
+        Some("gen") => gen::run(&args[1..]),
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("version") | Some("--version") | Some("-v") => {
             println!("{}", version_line());
@@ -78,6 +82,8 @@ fn print_help() {
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                interactive REPL (multi-line input, --stdin for a script)\n  \
          ainl test [path]         run AINL test files; exit non-zero on failure\n  \
+         ainl gen <spec>          generate AINL from a spec, then validate/compile/run\n  \
+         ainl gen --help          the full gen contract: flags, env vars, exit codes\n  \
          ainl doctor              self-test this install (exit 0 only if all pass)\n\
          ainl version             print version, build target, and source commit\n"
     );

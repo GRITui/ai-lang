@@ -14,6 +14,9 @@ only syntactically valid AINL. This page records the experiments, in order:
 - **[27B remote](#stage-34-the-larger-model-run--qwen38-27b-fp8-gateway)** — the
   current result. A larger model **does** produce correct programs:
   **9/10**. Verdict: **(a) correct**.
+- **[`ainl gen`](#ainl-gen--the-product-command)** — the same pipeline as a
+  shipped command: constrained generation, GBNF membership, a bounded repair
+  loop, and an interpreter or AOT target.
 
 ## Verdict summary
 
@@ -70,6 +73,64 @@ project to produce semantically correct AINL.
    `finish_reason: length` if the budget is too small — which looks like a
    broken key. Thinking is disabled explicitly via
    `chat_template_kwargs.enable_thinking`.
+4. **It enters 524 storms.** Cloudflare's read-timeout at ~125s, independent of
+   `max_tokens`, so a heavier spec can fail on any attempt. `ainl gen` reports
+   the HTTP status rather than retrying blindly; give it `--timeout` above the
+   gateway's own, and expect occasional hard failures under load.
+
+---
+
+## `ainl gen` — the product command
+
+The experiments above needed a harness (`scripts/gen-harness/run_gateway.py`).
+`ainl gen` is the same pipeline as a command anyone can run:
+
+```
+spec → constrained generation → GBNF membership → parse → compile → run → output
+```
+
+A failure at validate, compile, or run is turned into model-readable feedback —
+source position and the likely fix, never a Rust panic — and fed back for a
+bounded repair loop (`--attempts`, default 3).
+
+```sh
+export AINL_GEN_API_KEY_ENV=MY_API_KEY_VAR
+export AINL_GEN_ENDPOINT=https://your-gateway.example
+export AINL_GEN_MODEL=your-model
+
+ainl gen "print the sum of 2 and 3" --run
+ainl gen -f spec.ainl --aot -o myprog          # a standalone binary
+echo "print 2 and 3" | ainl gen --run           # spec on stdin
+```
+
+`--extra-json '{"chat_template_kwargs":{"enable_thinking":false}}'` passes
+vendor-specific request members. The key is read from the environment and
+handed to `curl` on **stdin**, so it appears in neither `ps` output nor shell
+history; the command takes no TLS stack of its own (see
+[HTTP_TLS.md](HTTP_TLS.md)).
+
+### Two independent checks, because a backend can lie
+
+Neither check is trusted to the other:
+
+1. **The probe.** Before the real call, an impossible grammar (`root ::= "Z"`)
+   is sent. A backend honouring constraints returns exactly `Z`; one ignoring
+   them returns prose. This is the only way to catch the `guided_grammar`
+   failure above, and it runs by default because that failure is silent.
+2. **Local membership.** `crates/ainl-cli/src/gbnf.rs` decides membership with
+   the Rust GBNF matcher and cross-checks it against the shipped Python
+   detector over 813 cases — every committed generation, hand-picked edges, and
+   800 fuzz inputs — with zero disagreements:
+
+   ```sh
+   python3 scripts/check-gbnf-rust.py
+   ```
+
+The end-of-run report never claims a check that did not run. `--no-probe`
+says the enforcement is *unverified*; `--grammar-field none` says the run was
+*not grammar-constrained*; a non-member program under a sent grammar is called
+out as a constraint the backend ignored. `scripts/check-gen-repair.py` pins all
+three against a local stub, with no network and no API key.
 
 ### Grounding: the model does not know AINL
 
