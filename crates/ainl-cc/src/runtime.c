@@ -513,14 +513,30 @@ static int checked_mul(int64_t a, int64_t b, int64_t *out) {
     *out = 0;
     return 1;
   }
+  /* Unsigned magnitude arithmetic, with the sign applied in unsigned space.
+   *
+   * Two traps, both reachable via INT64_MIN (whose magnitude is 2^63):
+   *
+   * 1. The magnitude product must not be computed before the overflow check.
+   *    `(* 2 -9223372036854775808)` has magnitudes 2 and 2^63, whose product
+   *    is 2^64 — which wraps uint64 to 0. Comparing that 0 against the limit
+   *    passes, and the result became 0. Divide instead: ua*ub <= limit is
+   *    exactly ub <= limit/ua for ua >= 1, so the product is only formed once
+   *    it is known to fit (and since it is <= 2^63, it fits uint64 too).
+   *
+   * 2. The negation must not be `-(int64_t)ur`. When ur == 2^63 that value is
+   *    not representable as int64_t, so the cast is implementation-defined and
+   *    the negation is undefined — on clang it folded to 0. `(int64_t)(0 - ur)`
+   *    computes the same bit pattern without UB, and is exactly INT64_MIN when
+   *    ur == 2^63, which is the correct answer. */
   int neg = (a < 0) ^ (b < 0);
   uint64_t ua = a < 0 ? (uint64_t)(-(a + 1)) + 1 : (uint64_t)a;
   uint64_t ub = b < 0 ? (uint64_t)(-(b + 1)) + 1 : (uint64_t)b;
-  uint64_t ur = ua * ub;
   uint64_t limit = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
-  if (ur > limit)
-    return 0;
-  *out = neg ? -(int64_t)ur : (int64_t)ur;
+  if (ub > limit / ua)
+    return 0; /* true product exceeds the i64 range -> caller promotes to f64 */
+  uint64_t ur = ua * ub;
+  *out = neg ? (int64_t)(0 - ur) : (int64_t)ur;
   return 1;
 }
 
@@ -1371,13 +1387,40 @@ static Value v_call(Value callee, Value *args, int nargs) {
 /* ---- tight 2-arg arithmetic/comparison (hot-path inlines) -------------- */
 /* These mirror the interpreter's 2-arg builtin semantics exactly (checked
  * i64 with promotion to f64 on overflow) but avoid the generic v_call switch
- * dispatch so the AOT hot loop stays tight. */
+ * dispatch so the AOT hot loop stays tight.
+ *
+ * Every one of them type-checks its operands first. The arithmetic inlines
+ * used to skip that and read `u.f` unconditionally on the non-int path, which
+ * reinterprets a V_STR/V_LIST/... union member (a pointer) as a double: a
+ * silent UB read that made `(+ 1 "a")` return 1.0 instead of raising
+ * "expected a number, got str". `a_cmp_ok` has always checked; these now
+ * share its type test. */
+
+static inline int a_is_num(Value v) {
+  return v.tag == V_INT || v.tag == V_FLOAT;
+}
+
+/* Set the type error the interpreter would raise, naming the first
+ * non-numeric operand (left-to-right, as the interpreter does). */
+static inline int a_num_fail(Value a, Value b) {
+  if (!a_is_num(a)) {
+    set_err("expected a number, got %s", type_name(&a));
+  } else {
+    set_err("expected a number, got %s", type_name(&b));
+  }
+  return 0;
+}
+
 static inline Value a_add(Value a, Value b) {
   if (a.tag == V_INT && b.tag == V_INT) {
     int64_t r;
     if (checked_add(a.u.i, b.u.i, &r))
       return v_int(r);
     return v_float((double)a.u.i + (double)b.u.i);
+  }
+  if (!a_is_num(a) || !a_is_num(b)) {
+    a_num_fail(a, b);
+    return v_nil();
   }
   double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
   double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
@@ -1390,6 +1433,10 @@ static inline Value a_sub2(Value a, Value b) {
       return v_int(r);
     return v_float((double)a.u.i - (double)b.u.i);
   }
+  if (!a_is_num(a) || !a_is_num(b)) {
+    a_num_fail(a, b);
+    return v_nil();
+  }
   double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
   double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
   return v_float(x - y);
@@ -1401,11 +1448,19 @@ static inline Value a_mul(Value a, Value b) {
       return v_int(r);
     return v_float((double)a.u.i * (double)b.u.i);
   }
+  if (!a_is_num(a) || !a_is_num(b)) {
+    a_num_fail(a, b);
+    return v_nil();
+  }
   double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
   double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
   return v_float(x * y);
 }
 static inline Value a_div(Value a, Value b) {
+  if (!a_is_num(a) || !a_is_num(b)) {
+    a_num_fail(a, b);
+    return v_nil();
+  }
   double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
   double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
   if (y == 0.0) {
@@ -1415,13 +1470,12 @@ static inline Value a_div(Value a, Value b) {
   return v_float(x / y);
 }
 static inline int a_cmp_ok(Value a, Value b, double *px, double *py) {
-  *px = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  *py = b.tag == V_INT ? (double)b.u.i : b.u.f;
-  if (a.tag != V_INT && a.tag != V_FLOAT || b.tag != V_INT && b.tag != V_FLOAT) {
-    set_err("expected a number, got %s",
-            a.tag == V_INT || a.tag == V_FLOAT ? type_name(&b) : type_name(&a));
+  if (!a_is_num(a) || !a_is_num(b)) {
+    a_num_fail(a, b);
     return 0;
   }
+  *px = a.tag == V_INT ? (double)a.u.i : a.u.f;
+  *py = b.tag == V_INT ? (double)b.u.i : b.u.f;
   if (isnan(*px) || isnan(*py)) {
     set_err("cannot compare NaN");
     return 0;

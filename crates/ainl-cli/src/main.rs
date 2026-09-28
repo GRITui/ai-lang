@@ -48,7 +48,8 @@ fn print_help() {
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
          ainl ast <file> --json-out <f>  read a JSON AST back (inverse of --json)\n  \
-         ainl compile <file.ainl> -o <out>   AOT-compile to a standalone C binary (via cc)\n  \
+         ainl compile <file.ainl> -o <out>   AOT-compile to a standalone C binary (via cc)\n\
+         ainl compile <file.ainl> -o <out> --keep-c <file.c>   keep the generated C\n\
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                start an interactive REPL\n  \
@@ -192,6 +193,7 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
     let mut path: Option<&String> = None;
     let mut out: Option<&String> = None;
     let mut c_only = false;
+    let mut keep_c: Option<&String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -207,8 +209,20 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
                 c_only = true;
                 i += 1;
             }
+            "--keep-c" => {
+                // Write the generated C to this path instead of a temp dir
+                // (useful for inspecting the standalone output by hand).
+                let Some(o) = rest.get(i + 1) else {
+                    eprintln!("--keep-c needs a .c path");
+                    return ExitCode::FAILURE;
+                };
+                keep_c = Some(o);
+                i += 2;
+            }
             flag if flag.starts_with("--") => {
-                eprintln!("unknown flag '{flag}' (supported: -o <file>, --c-only)");
+                eprintln!(
+                    "unknown flag '{flag}' (supported: -o <file>, --c-only, --keep-c <file>)"
+                );
                 return ExitCode::FAILURE;
             }
             _ => {
@@ -256,12 +270,31 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Write the generated .c next to the output binary, then invoke cc.
+    // Write the generated C to a temp dir next to the output binary, invoke
+    // `cc` on it, then remove it — a compile should not litter the user's
+    // working directory. `--keep-c` opts into keeping it for inspection.
+    let out_dir = std::path::Path::new(&out)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let stem = std::path::Path::new(&out)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "ainl_prog".to_string());
-    let c_path = format!("{stem}.c");
+    let c_path = match keep_c {
+        Some(p) => p.to_string(),
+        None => {
+            let tmp = out_dir.join(format!(".{stem}.ainl-codegen.c"));
+            match tmp.to_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("output path is not valid UTF-8");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
     if let Err(e) = std::fs::write(&c_path, &c) {
         eprintln!("cannot write {c_path}: {e}");
         return ExitCode::FAILURE;
@@ -269,6 +302,9 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
     let status = std::process::Command::new("cc")
         .args(["-O2", "-o", &out, &c_path])
         .status();
+    if keep_c.is_none() {
+        let _ = std::fs::remove_file(&c_path);
+    }
     match status {
         Ok(s) if s.success() => {
             println!("compiled {path} -> {out}");

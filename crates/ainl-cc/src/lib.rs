@@ -73,6 +73,11 @@ pub fn generate(forms: &[Node]) -> String {
         ));
     }
     g.emit("\n");
+    // Pre-interned def-name symbols (collected during codegen above, so they
+    // are emitted after the fact — but they must precede every use, which
+    // includes the generated function bodies, so the declarations go first
+    // and only the init statements are staged for the top of `main`).
+    g.emit_sym_static_decls();
     // Function bodies.
     let bodies = std::mem::take(&mut g.fn_bodies);
     for body in &bodies {
@@ -98,6 +103,12 @@ struct Gen {
     scoping: Vec<HashSet<String>>,
     /// Collected function bodies (emitted after forward declarations).
     fn_bodies: Vec<String>,
+    /// def-name symbol -> index into `sym_statics`.
+    sym_slots: HashMap<String, usize>,
+    /// File-scope `static Value` names holding pre-interned def-name symbols.
+    sym_statics: Vec<String>,
+    /// Statements that initialize those slots, staged for the top of `main`.
+    sym_inits: Vec<String>,
 }
 
 impl Gen {
@@ -112,6 +123,9 @@ impl Gen {
             global_names: Vec::new(),
             scoping: Vec::new(),
             fn_bodies: Vec::new(),
+            sym_slots: HashMap::new(),
+            sym_statics: Vec::new(),
+            sym_inits: Vec::new(),
         }
     }
 
@@ -171,6 +185,26 @@ impl Gen {
                 self.collect_globals(item, false);
             }
         }
+    }
+
+    /// A file-scope `static Value` holding the interned symbol `name`.
+    ///
+    /// `def` evaluates to its own name symbol, and in a hot loop that symbol is
+    /// built and immediately discarded. Calling `v_sym()` each time re-runs the
+    /// intern-table probe (FNV hash + strcmp) for a value that is constant, so
+    /// each distinct def name gets one file-scope slot, interned once at
+    /// startup, and the loop body is a plain struct copy.
+    fn intern_sym_static(&mut self, name: &str) -> String {
+        let idx = match self.sym_slots.get(name) {
+            Some(&i) => i,
+            None => {
+                let i = self.sym_statics.len();
+                self.sym_statics.push(name.to_string());
+                self.sym_slots.insert(name.to_string(), i);
+                i
+            }
+        };
+        format!("g_sym_s{idx}")
     }
 
     /// Add a name to the current (top) local scope.
@@ -278,17 +312,24 @@ impl Gen {
 
     fn gen_call(&mut self, items: &[Node], env: &str) -> String {
         let callee = &items[0];
-        // Fast path: (op a b) where op is a known 2-arg operator -> emit the
-        // tight inline directly (no v_call dispatch, no args array).
-        if let Node::Sym(op, _) = callee {
-            if let Some(fn_name) = two_arg_inline(op) {
-                let a = self.gen_expr(&items[1], env);
-                let b = self.gen_expr(&items[2], env);
-                let t = self.fresh();
-                self.emit_code(&format!("Value {t} = {fn_name}({a}, {b});\n"));
-                self.emit_code(&format!("v_unref(&{a});\n"));
-                self.emit_code(&format!("v_unref(&{b});\n"));
-                return t;
+        // Fast path: (op a b) — a *binary* call to a known 2-arg operator ->
+        // emit the tight inline directly (no v_call dispatch, no args array).
+        //
+        // The arity check is load-bearing: `+`, `-`, `*` and `=` are also
+        // variadic in AINL ((+ 1 2 3 4 5) == 15), so a 4+-operand form that
+        // took this path would inline the first two operands and silently drop
+        // the rest. Those go through v_call/numeric_fold instead.
+        if items.len() == 3 {
+            if let Node::Sym(op, _) = callee {
+                if let Some(fn_name) = two_arg_inline(op) {
+                    let a = self.gen_expr(&items[1], env);
+                    let b = self.gen_expr(&items[2], env);
+                    let t = self.fresh();
+                    self.emit_code(&format!("Value {t} = {fn_name}({a}, {b});\n"));
+                    self.emit_code(&format!("v_unref(&{a});\n"));
+                    self.emit_code(&format!("v_unref(&{b});\n"));
+                    return t;
+                }
             }
         }
         let callee_tmp = self.gen_expr(callee, env);
@@ -343,7 +384,8 @@ impl Gen {
             ));
         }
         let t = self.fresh();
-        self.emit_code(&format!("Value {t} = v_sym(\"{}\");\n", c_escape(&name)));
+        let sym = self.intern_sym_static(&name);
+        self.emit_code(&format!("Value {t} = {sym};\n"));
         t
     }
 
@@ -643,8 +685,37 @@ impl Gen {
         t
     }
 
+    /// Emit the file-scope `static Value` slots for pre-interned def-name
+    /// symbols, plus stage the statements that fill them for the top of `main`.
+    ///
+    /// Must be called after all codegen (which is what populates
+    /// `sym_statics`) and before the generated function bodies, since a `def`
+    /// inside an `fn` body references these slots.
+    fn emit_sym_static_decls(&mut self) {
+        if self.sym_statics.is_empty() {
+            return;
+        }
+        let names: Vec<String> = (0..self.sym_statics.len())
+            .map(|i| format!("g_sym_s{i}"))
+            .collect();
+        for n in &names {
+            self.emit(&format!("static Value {n};\n"));
+        }
+        self.emit("\n");
+        // The inits run at the top of main, before any top-level code.
+        let inits: Vec<String> = self
+            .sym_statics
+            .iter()
+            .zip(&names)
+            .map(|(sym, n)| format!("  {n} = v_sym({});\n", c_string(sym)))
+            .collect();
+        self.sym_inits = inits;
+    }
+
     fn emit_main(&mut self, main_code: &str, n_globals: usize) {
         self.emit("int main(void) {\n");
+        let inits = std::mem::take(&mut self.sym_inits);
+        self.emit(&inits.join(""));
         self.emit("  steps_init();\n");
         self.emit(&format!(
             "  for (int i = 0; i < {n_globals}; i++) {{ Value v; v.tag = V_NIL; g_top[i] = v; }}\n"
