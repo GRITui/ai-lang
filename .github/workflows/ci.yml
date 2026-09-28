@@ -261,6 +261,15 @@ jobs:
       - name: relative markdown links resolve
         run: ./scripts/check-links.sh
 
+      # The landing page (site/index.html) restates the README's headline
+      # numbers for people who never open the repo. If the README is corrected
+      # and the page is not, the pitch quietly starts overclaiming — which is
+      # the one failure mode this project cannot afford. Assert the numbers
+      # agree, and that the page stays self-contained (no local assets) so it
+      # keeps deploying to GitHub Pages as a single file.
+      - name: landing page in sync with the README (no number drift)
+        run: ./scripts/check-site.py
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest
