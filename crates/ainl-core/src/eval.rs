@@ -286,6 +286,10 @@ pub fn eval(node: &Node, env: &Env) -> Result<Value> {
 /// would drift the moment a builtin is added, and a drift here means a
 /// misspelling of the new builtin gets *no* suggestion while a misspelling of
 /// an old one does — a failure nobody would notice until it bit them.
+///
+/// Cached per thread: it is called once per unresolved variable reference
+/// (see `vm::Compiler::all_known_names`), and installing the prelude allocates
+/// a fresh environment each time.
 pub fn builtin_names() -> Vec<String> {
     thread_local! {
         static NAMES: std::cell::RefCell<Option<Vec<String>>> =
@@ -294,8 +298,11 @@ pub fn builtin_names() -> Vec<String> {
     NAMES.with(|c| {
         let mut slot = c.borrow_mut();
         if slot.is_none() {
+            // `Env::with_prelude` puts every builtin in the *root* scope, so
+            // `bindings()` — the root's own names, not the chain's — is
+            // exactly the builtin set.
             let env = Env::with_prelude();
-            let mut names: Vec<String> = env.0.vars.borrow().keys().cloned().collect();
+            let mut names: Vec<String> = env.bindings().into_iter().map(|(k, _)| k).collect();
             names.sort();
             *slot = Some(names);
         }
