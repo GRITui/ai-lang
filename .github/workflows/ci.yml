@@ -255,6 +255,12 @@ jobs:
       - name: --version field parsing
         run: ./scripts/check-version-field.sh
 
+      # The release job publishes RELEASE_NOTES.md verbatim to the release
+      # page, so a link in it that 404s ships to users. Cheap to check, and it
+      # already caught one bad reference written here.
+      - name: relative markdown links resolve
+        run: ./scripts/check-links.sh
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest
