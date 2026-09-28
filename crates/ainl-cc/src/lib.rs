@@ -15,6 +15,7 @@
 //! - `self.out`  -> file scope (runtime, global slots, fn bodies, main).
 //! - `self.code` -> expression code, spliced into `main` or a fn body.
 
+use ainl_core::eval::TryForm;
 use ainl_core::{Node, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -250,7 +251,12 @@ impl Gen {
                         }
                         return;
                     }
-                    "let" | "fn" => {
+                    // `try` is a scope boundary for the same reason `let` is:
+                    // its body and handler are sibling scopes, so a `def` in
+                    // either is a local, not a global slot. Without this a
+                    // `(try (def x 1) (catch (e) 0))` at top level would
+                    // reserve a global `x` that the handler cannot see.
+                    "let" | "fn" | "try" => {
                         for item in &items[1..] {
                             self.collect_globals(item, true);
                         }
@@ -364,6 +370,7 @@ impl Gen {
                         "quote" => return self.gen_quote(items),
                         "and" => return self.gen_and(items, env),
                         "or" => return self.gen_or(items, env),
+                        "try" => return self.gen_try(items, env),
                         _ => {}
                     }
                 }
@@ -639,6 +646,118 @@ impl Gen {
         } else {
             last_tmp
         }
+    }
+
+    /// `(try body... (catch (e) handler...))` — the AOT unwind.
+    ///
+    /// ## Why result-threading and not `setjmp`/`longjmp`
+    ///
+    /// This runtime has no unwind mechanism, and the two ways to add one differ
+    /// in a way that shows up under a loop. A `longjmp` out of a `try` body
+    /// would skip the `v_unref` of every `Value` temporary the body had built,
+    /// leaking each one — a slow leak on exactly the health-checker loop this
+    /// card exists to make expressible. Threading the error through the
+    /// existing `g_err` flag costs one `if` on the error path and frees
+    /// normally, because generated code keeps running its `v_unref` calls on
+    /// the way out (each `gen_expr` unrefs its operands as it goes).
+    ///
+    /// So: run the body, and if `g_err` is set when it finishes, consume the
+    /// error into the caught hash and run the handler instead. Generated code
+    /// already checks `g_err` at every fallible call (see `gen_call`), so
+    /// nothing else is needed to make the body stop early.
+    fn gen_try(&mut self, items: &[Node], env: &str) -> String {
+        let try_form = match ainl_core::eval::parse_try(&items[1..]) {
+            Ok(f) => f,
+            // The shape is wrong. Rather than generate C for a form the other
+            // three backends reject, fail here with the same message: a
+            // malformed `try` must read identically wherever it is compiled.
+            Err(e) => {
+                self.emit_code(&format!(
+                    "  set_err(\"{}\");\n",
+                    c_escape(&e.message().replace('"', "'"))
+                ));
+                return self.fresh_nil();
+            }
+        };
+        let TryForm {
+            body,
+            param,
+            handler,
+        } = try_form;
+
+        // The body gets its own scope, and so does the handler — SIBLING scopes
+        // of the enclosing one, matching the tree-walk and the VM. A `def` in a
+        // body that failed must not be visible to the handler that handles it.
+        let body_env = format!("try_body_env_{}", self.let_count);
+        let handler_env = format!("try_hand_env_{}", self.let_count);
+        self.let_count += 1;
+        self.emit_code(&format!("Scope *{body_env} = scope_new({env});\n"));
+        self.emit_code(&format!("Scope *{handler_env} = scope_new({env});\n"));
+
+        // The body's value has to survive the handler's generation, which emits
+        // its own temporaries. A dedicated slot keeps them from colliding.
+        let t = self.fresh();
+        self.emit_code(&format!("Value {t} = v_nil();\n"));
+
+        // --- body ---
+        self.scoping.push(HashSet::new());
+        let mut last_tmp: Option<String> = None;
+        for form in body {
+            let tmp = self.gen_expr(form, &body_env);
+            if let Some(prev) = &last_tmp {
+                self.emit_code(&format!("v_unref(&{prev});\n"));
+            }
+            last_tmp = Some(tmp);
+        }
+        match last_tmp {
+            Some(tmp) => {
+                self.emit_code(&format!("v_ref(&{tmp});\n{t} = {tmp};\nv_unref(&{tmp});\n"))
+            }
+            // An empty body is nil, the same as `(do)`.
+            None => self.emit_code(&format!("{t} = v_nil();\n")),
+        }
+        self.scoping.pop();
+
+        // --- dispatch ---
+        //
+        // `v_error_value()` both builds the caught hash and clears `g_err`, so
+        // the flag is consumed exactly once, by the innermost `catch` that
+        // sees it — which is what makes nested `try` pick the innermost handler.
+        self.emit_code(&format!("if (g_err) {{\n"));
+        let ev = self.fresh();
+        self.emit_code(&format!("Value {ev} = v_error_value();\n"));
+        // `scope_define` takes ownership of one ref of the value, so `ev` is
+        // NOT unref'd here — matching how `gen_let` binds its own values.
+        self.emit_code(&format!(
+            "scope_define({handler_env}, \"{}\", {ev});\n",
+            c_escape(param)
+        ));
+
+        // The handler runs in its own scope, and it is NOT itself protected: an
+        // error raised here propagates, exactly as a second `raise!` would.
+        self.scoping.push(HashSet::new());
+        let mut h_last: Option<String> = None;
+        for form in handler {
+            let tmp = self.gen_expr(form, &handler_env);
+            if let Some(prev) = &h_last {
+                self.emit_code(&format!("v_unref(&{prev});\n"));
+            }
+            h_last = Some(tmp);
+        }
+        match h_last {
+            Some(tmp) => self.emit_code(&format!(
+                "v_ref(&{tmp});\nv_unref(&{t});\n{t} = {tmp};\nv_unref(&{tmp});\n"
+            )),
+            None => {
+                self.emit_code(&format!("v_unref(&{t});\n{t} = v_nil();\n"));
+            }
+        }
+        self.scoping.pop();
+        self.emit_code("}\n");
+
+        self.emit_code(&format!("scope_unref({body_env});\n"));
+        self.emit_code(&format!("scope_unref({handler_env});\n"));
+        t
     }
 
     fn gen_while(&mut self, items: &[Node], env: &str) -> String {

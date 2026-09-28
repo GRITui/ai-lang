@@ -374,6 +374,7 @@ fn eval_list(items: &[Node], env: &Env, call_span: usize) -> Result<Value> {
             "let" => return sf_let(&items[1..], env).map_err(|e| e.or_at(call_span)),
             "while" => return sf_while(&items[1..], env).map_err(|e| e.or_at(call_span)),
             "quote" => return sf_quote(&items[1..]).map_err(|e| e.or_at(call_span)),
+            "try" => return sf_try(&items[1..], env).map_err(|e| e.or_at(call_span)),
             "and" => return sf_and(&items[1..], env).map_err(|e| e.or_at(call_span)),
             "or" => return sf_or(&items[1..], env).map_err(|e| e.or_at(call_span)),
             _ => {}
@@ -593,6 +594,130 @@ fn sf_quote(args: &[Node]) -> Result<Value> {
         return Err(Error::runtime("quote expects one form"));
     };
     Ok(quote_node(node))
+}
+
+/// The parsed pieces of `(try body... (catch (e) handler...))`.
+///
+/// The tree-walk and the bytecode VM each have their own `sf_try`, but they must
+/// agree on *which* body is protected, *which* handler runs, and *what* `e` is
+/// bound to — otherwise the two evaluators accept different programs or bind
+/// different names, and the 4-backend rule is broken at the first nested `try`.
+/// So the shape is parsed once, here, and both consume this.
+pub struct TryForm<'a> {
+    /// The protected forms: everything before the `catch` clause.
+    pub body: &'a [Node],
+    /// The name `e` is bound to in the handler.
+    pub param: &'a str,
+    /// The handler's forms, evaluated when the body raises.
+    pub handler: &'a [Node],
+}
+
+/// Parse the arguments of a `try` special form.
+///
+/// The `catch` clause is the first top-level `(catch …)` list; anything after it
+/// is ignored rather than treated as body, so a `(catch …)` nested deeper — in a
+/// `fn`, say — is not mistaken for this `try`'s handler.
+pub fn parse_try(args: &[Node]) -> Result<TryForm<'_>> {
+    let Some(catch_idx) = args.iter().position(|n| {
+        matches!(n, Node::List(i, _) if matches!(i.first(), Some(Node::Sym(s, _)) if s == "catch"))
+    }) else {
+        return Err(Error::runtime(
+            "try expects a (catch (e) handler...) clause — without one a failure has nowhere to go",
+        ));
+    };
+    let body = &args[..catch_idx];
+    let Node::List(clause, _) = &args[catch_idx] else {
+        return Err(Error::runtime("try: catch must be a list"));
+    };
+    // The clause is `(catch (e) handler...)`: `items[0]` is the `catch` marker
+    // and `items[1]` is the one-symbol binding list `(e)`, not a bare symbol.
+    // Unwrapping that list *is* the binding.
+    let (param, handler): (&str, &[Node]) = match clause.as_slice() {
+        [Node::Sym(head, _), Node::List(param_nodes, _), rest @ ..] if head == "catch" => {
+            match &param_nodes[..] {
+                [Node::Sym(param, _)] => (param.as_str(), rest),
+                _ => {
+                    return Err(Error::runtime(
+                        "catch takes exactly one binding: (catch (e) handler...)",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(Error::runtime(
+                "catch expects (catch (e) handler...) — `e` is bound to the caught error",
+            ));
+        }
+    };
+    Ok(TryForm {
+        body,
+        param,
+        handler,
+    })
+}
+
+/// `(try body... (catch (e) handler...))` — evaluate `body`; if it raises,
+/// bind the error to `e` and evaluate `handler` instead. The value is `body`'s
+/// on success and `handler`'s on failure.
+///
+/// ## Scoping
+///
+/// The body and the handler each run in a **fresh child of the enclosing
+/// scope** — siblings, not nested. That is deliberate: a `def` in a body that
+/// went on to fail must not be visible to the handler, or a handler could read
+/// a half-initialized value that was the thing that failed. It is also what
+/// makes the AOT `collect_globals` and the VM's `collect_defs` treat `try` as a
+/// scope boundary (a `def` in a body is a local, not a global slot), so all
+/// four backends agree on where those bindings live.
+///
+/// ## The step budget
+///
+/// The body gets a **fresh** step budget, like a top-level run and like a REPL
+/// submission (`vm::run_form`). A `try` is a containment boundary, so an
+/// infinite loop inside one must be bounded on its own rather than consuming an
+/// outer run's budget. The guard stays sound: the body's `while` is bounded by
+/// this budget, and an enclosing `while` still charges a tick per iteration.
+fn sf_try(args: &[Node], env: &Env) -> Result<Value> {
+    let TryForm {
+        body,
+        param,
+        handler,
+    } = parse_try(args)?;
+    // A fresh budget for the body, saved and restored, so a caught runaway
+    // loop neither runs unboundedly nor leaves the enclosing run with no
+    // headroom. Same rule as a top-level run and a REPL submission.
+    let saved = STEPS.with(|s| s.replace(0));
+    let body_env = env.child();
+    let outcome = sf_do(body, &body_env);
+    STEPS.with(|s| s.set(saved));
+    let result = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            // A failed body always clears its scope: nothing in the caught
+            // value refers to it, and leaving a self-referential `def` cycle
+            // rooted there would leak the whole scope.
+            body_env.clear();
+            // The handler gets a sibling scope (see the note above) and its
+            // own budget: a retry loop of its own must not starve the caller.
+            let handler_env = env.child();
+            handler_env.define(param.to_string(), e.to_value());
+            let saved = STEPS.with(|s| s.replace(0));
+            let handled = sf_do(handler, &handler_env);
+            STEPS.with(|s| s.set(saved));
+            match &handled {
+                // Clear the handler's cycle too, unless an escaped closure
+                // still needs that scope — the same rule as the body.
+                Ok(v) if !value_keeps_env_alive(v, &handler_env) => handler_env.clear(),
+                Err(_) => handler_env.clear(),
+                _ => {}
+            }
+            return handled;
+        }
+    };
+    if !value_keeps_env_alive(&result, &body_env) {
+        body_env.clear();
+    }
+    Ok(result)
 }
 
 fn quote_node(node: &Node) -> Value {

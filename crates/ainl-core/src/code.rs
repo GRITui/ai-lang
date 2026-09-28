@@ -97,6 +97,23 @@ pub enum Instr {
     JumpIfFalse(usize),
     /// Pop a value; if it is truthy, jump to `target`.
     JumpIfTrue(usize),
+    /// Enter a protected region: push a [`crate::vm::TryHandler`] recording
+    /// the enclosing frame, the operand-stack depth, the step count, and where
+    /// to resume — `handler_pc` (the bytecode offset of this `try`'s `catch`
+    /// code) plus `handler_fn` (the index of that handler's `FnCode`).
+    ///
+    /// The handler function is recorded rather than re-`MakeFn`'d on the way in
+    /// because the unwind path has to push the callee *and* its argument onto
+    /// the operand stack itself, in the order `Call` expects them.
+    PushTryHandler {
+        /// Bytecode offset to jump to when a frame inside the region raises.
+        handler_pc: usize,
+        /// Index into the enclosing frame's `fns` of the `catch` closure.
+        handler_fn: usize,
+    },
+    /// Leave a protected region that completed without raising: pop its
+    /// handler and restore the step budget to what it was on entry.
+    PopTryHandler,
 
     // --- functions ---
     /// Push a closure for `fns[idx]`, capturing the current frame's env.
