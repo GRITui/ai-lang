@@ -41,16 +41,111 @@ ainl run hello.ainl
 
 ## 3. The REPL
 
+The REPL keeps a program *running*, so a tweak costs one line instead of
+write-file / compile / run — and a `def` is still there when the next line
+arrives.
+
 ```sh
 ainl repl
-λ (+ 1 2 3)
-6
-λ (def double (fn (x) (* x 2)))
-double
-λ (double 21)
-42
-λ (exit)
 ```
+
+A real session (the `λ` is the prompt; `…` means "your form is still open"):
+
+```lisp
+λ (def x 41)
+λ (def double (fn (n) (* n 2)))
+λ (double x)
+82
+λ (def x (+ x 1))
+λ (double x)
+84
+```
+
+That is the loop: change one line, see the new answer, with everything else
+still bound.
+
+`def` prints nothing — it returns the symbol, and a REPL that echoed that
+would make every transcript unreadable. `nil` and `()` are silent for the same
+reason; `print` is how you ask for output.
+
+**Scoping, the thing a REPL teaches fastest.** A `fn` body is a *new* scope, so
+`def` inside a function cannot reach an outer variable. A REPL is where that is
+easiest to get bitten, because you can see both halves of the mistake side by
+side — and the second `counter` comes back `1`, not `2`:
+
+```lisp
+λ (def counter 0)
+λ (def bump (fn () (def counter (+ counter 1)) counter))
+λ (bump)
+1
+λ (bump)
+1
+λ counter
+0
+```
+
+Each call to `bump` gets a fresh scope, so `def counter` bound a *new* local
+that was thrown away with the call, and the outer `counter` never moved. This
+is [SYNTAX.md §2a](SYNTAX.md)'s rule, and it is the same reason `let` (whose
+`def`s *do* persist, because `while`/`if`/`do` don't open a scope) is the tool
+for a loop that accumulates:
+
+```lisp
+λ (def sum-to (fn (n)
+…   (let ((i 0) (acc 0))
+…     (while (< i n) (def i (+ i 1)) (def acc (+ acc i)))
+…     acc)))
+λ (sum-to 5)
+15
+```
+
+**Multi-line input.** An unclosed `(` continues onto the next line, and a
+string may span lines too. Write a function the way you would in any editor:
+
+```lisp
+λ (def fib (fn (n)
+…   (if (< n 2) n
+…     (+ (fib (- n 1))
+…        (fib (- n 2))))))
+λ (fib 20)
+6765
+```
+
+**Errors do not end the session.** They print as `line N: …` on stderr, where
+`N` is the line in your input, and the next line runs normally:
+
+```lisp
+λ (+ 1 2)
+3
+λ (nosuch)
+line 2: runtime error: unbound symbol 'nosuch'
+λ (+ 1 2)
+3
+```
+
+Everything you defined before the bad line is still bound, so you can just fix
+the typo and carry on.
+
+**Scripting it.** `ainl repl --stdin` is the same loop with the banner and
+prompts off, so a session is a plain script you can commit, pipe, and diff:
+
+```sh
+$ printf '(def x 41)\n(def x (+ x 1))\nx\n' | ainl repl --stdin
+42
+```
+
+Results go to stdout and errors to stderr, so a failing line in the middle of a
+script does not corrupt the results:
+
+```sh
+ainl repl --stdin < session.ainl > out.txt   # errors stay on the terminal
+```
+
+The REPL is a front end for the interpreter backend only — it adds no syntax,
+and `ainl run` / `compile` / `transpile` are how you reach the other backends.
+Full rules: [SYNTAX.md §3a](SYNTAX.md).
+
+Leave with `(exit)`, `exit`, `(quit)`, `quit`, `:q`, or Ctrl-D.
 
 ## 4. The language in five minutes
 

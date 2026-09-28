@@ -220,6 +220,55 @@ One documented divergence, in JS only: a JS `Number` is a single type, so
 output is valid JSON that re-parses to an equal value in both cases. This is
 the same int/float collapse the language already documents for `print`.
 
+## 3a. `ainl repl` — interactive and scripted
+
+The REPL is a front end, not a new language: **every form it accepts is
+documented above, and it introduces no syntax of its own.** The grammar is
+unchanged, so a program typed at the REPL is the same program a file holds.
+(Scope: the REPL runs on the interpreter/VM backend only. The AOT and
+transpiler backends are reached with `ainl run` / `compile` / `transpile`,
+which are unchanged.)
+
+What the REPL does add is a *submission* rule. Three facts below are the only
+ones a model or a script author needs.
+
+**A submission is read until its strings and parens close.** An unclosed `(`
+keeps reading (the prompt becomes `…`), and a string literal may span lines:
+
+```lisp
+(+ 1          ; unclosed `(` → the REPL waits
+   2)         ; `…` prompt; the two lines are ONE form, giving 3
+```
+
+- If a `(` has no matching `)`, the REPL keeps reading (prompt `…`). A form
+  is routinely written across lines.
+- If a string literal has no closing `"`, the REPL keeps reading. AINL strings
+  may contain newlines.
+- An **extra** `)` is *not* a continuation: it is submitted so the parser
+  reports the real `unexpected ')'`. A REPL that waited for a `(` here would
+  show a `…` prompt forever with no error.
+- A `;` comment never causes a continuation.
+
+**One form is echoed; `def`, `nil` and `()` are silent.** The value of the
+*last* form in a submission is printed, except that a symbol (what `def`
+returns), `nil`, and the empty list print nothing:
+
+```lisp
+(def x 6)      ; prints nothing (returns the symbol x)
+x              ; => 6
+(print x)      ; prints 6 via `print`, and prints nothing itself (returns nil)
+```
+
+**Errors print and the session continues.** An error is reported as
+`line N: <message>` on **stderr** and the next line is evaluated normally, so
+`ainl repl --stdin < prog.ainl > out.txt` yields a clean result file even when
+a line in the middle fails. A failed line does not undo earlier `def`s, and each
+line gets a fresh step budget (a runaway `while` fails alone).
+
+`--stdin` is the same loop with the banner and prompts suppressed — it is how
+the tests drive it and how you script it. See
+[GETTING_STARTED.md](GETTING_STARTED.md) for a worked session.
+
 ## 4. Canonical examples
 
 ```lisp

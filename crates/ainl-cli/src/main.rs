@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //!   run <file>     evaluate a program
-//!   repl           interactive read-eval-print loop
+//!   repl           interactive read-eval-print loop (--stdin for a script)
 //!   ast <file>     print the parsed AST (with spans) for tooling / source maps
 //!   eval <code>    evaluate a snippet passed on the command line
 //!   compile <file> AOT-compile to a standalone C binary (AINL -> C -> cc)
@@ -12,9 +12,9 @@
 //!   version        print version, build target, and source commit
 
 mod doctor;
+mod repl;
 
-use ainl_core::{parser::Node, Env};
-use std::io::{self, BufRead, Write};
+use ainl_core::parser::Node;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
         Some("compile") => cmd_compile(&args[1..]),
         Some("transpile") => cmd_transpile(&args[1..]),
         Some("grammar") => cmd_grammar(&args[1..]),
-        Some("repl") => cmd_repl(),
+        Some("repl") => cmd_repl(&args[1..]),
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("version") | Some("--version") | Some("-v") => {
             println!("{}", version_line());
@@ -74,7 +74,7 @@ fn print_help() {
          ainl compile <file.ainl> -o <out> --keep-c <file.c>   keep the generated C\n  \
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
-         ainl repl                start an interactive REPL\n  \
+         ainl repl                interactive REPL (multi-line input, --stdin for a script)\n  \
          ainl doctor              self-test this install (exit 0 only if all pass)\n  \
          ainl version             print version, build target, and source commit\n"
     );
@@ -430,37 +430,22 @@ fn cmd_grammar(rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_repl() -> ExitCode {
-    println!("ainl {VERSION} REPL — type (exit) or Ctrl-D to quit");
-    let env = Env::with_prelude();
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    loop {
-        print!("λ ");
-        let _ = stdout.flush();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                println!();
-                break;
+/// `ainl repl [--stdin]`.
+///
+/// `--stdin` suppresses the banner and the `λ` prompt and is what a script or
+/// a test uses; without it the same loop runs interactively. It is one flag
+/// rather than a second implementation on purpose — a REPL whose tested path
+/// and shipped path differ is a REPL whose tests prove nothing.
+fn cmd_repl(rest: &[String]) -> ExitCode {
+    let mut stdin_mode = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--stdin" => stdin_mode = true,
+            other => {
+                eprintln!("unknown flag '{other}' (supported: --stdin)");
+                return ExitCode::FAILURE;
             }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("input error: {e}");
-                break;
-            }
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "(exit)" || trimmed == "exit" {
-            break;
-        }
-        match ainl_core::run_in(trimmed, &env) {
-            Ok(v) => println!("{}", v.repr()),
-            Err(e) => eprintln!("{e}"),
         }
     }
-    ExitCode::SUCCESS
+    repl::run(stdin_mode)
 }

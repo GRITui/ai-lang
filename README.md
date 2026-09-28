@@ -237,6 +237,8 @@ reports it as **SKIP**, not a failure — everything else works without `cc`.
 cargo build --release
 
 ainl run examples/hello.ainl                  # interpret
+ainl repl                                      # interactive REPL
+ainl repl --stdin < session.ainl > out.txt     # scriptable REPL session
 ainl compile examples/fib.ainl -o fib && ./fib # AOT → native binary
 ainl transpile examples/fib.ainl --to python  # → python | js | ruby
 ainl ast examples/fib.ainl --json             # stable JSON + source spans

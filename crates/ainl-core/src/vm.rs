@@ -987,3 +987,18 @@ pub fn run_in(src: &str, env: &Env) -> Result<Value> {
     let code = compile_top(&forms)?;
     run(&code, env)
 }
+
+/// Compile and run a *single* already-parsed top-level form in `env`.
+///
+/// The REPL needs this to submit one form at a time: a submission that is
+/// several top-level forms must not lose the `def`s its earlier forms made
+/// just because a later one failed. Evaluating form-by-form commits each form
+/// to `env` as it completes, so `(def a 1) (nosuch)` still leaves `a` bound —
+/// which is also what the tree-walking evaluator does, and therefore a case the
+/// two paths must agree on.
+///
+/// Each call gets a fresh step budget, same as [`run_in`].
+pub fn run_form(form: &Node, env: &Env) -> Result<Value> {
+    let code = compile_top(std::slice::from_ref(form))?;
+    run(&code, env)
+}

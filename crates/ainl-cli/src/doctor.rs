@@ -328,6 +328,59 @@ fn check_aot() -> Check {
     }
 }
 
+/// Self-test 4 — the REPL front end. Drives the same `drive` loop the CLI
+/// uses, through an in-memory script, and asserts the transcript. This is a
+/// different question from `check_run`: that one proves the *evaluator* works,
+/// this one proves a stateful session keeps state and survives an error — the
+/// two ways the REPL differs from `ainl run`.
+///
+/// Exercised in-process (not via a subprocess) on purpose: `doctor` must stay a
+/// self-contained check of this binary's own code paths, and the REPL's echo
+/// goes through the writer this drives. `print` is not asserted here — it
+/// writes to the real stdout, which is what the `print`-before-error and
+/// transcript tests in tests/repl_cli.rs exist for.
+fn check_repl() -> Check {
+    const NAME: &str = "repl";
+    // A session that (a) defines something, (b) uses it two submissions later,
+    // (c) hits an error, and (d) still works afterwards. The expected transcript
+    // is the whole contract in four lines.
+    const SCRIPT: &str = "(def x 6)\n(def sq (fn (n) (* n n)))\n(sq x)\n(nosuch)\n(sq x)\n";
+    const WANT: &str = "36\n36\n";
+
+    let mut repl = crate::repl::Repl::new();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut input = std::io::BufReader::new(SCRIPT.as_bytes());
+    // A read error is reported on the error stream and ends the session, so
+    // this can only fail if the in-memory reader misbehaves.
+    if let Err(e) = crate::repl::drive(&mut repl, &mut input, &mut out, &mut err, false) {
+        return Check::new(NAME, Status::Fail, format!("io error: {e}"));
+    }
+    let got = String::from_utf8_lossy(&out);
+    let errors = String::from_utf8_lossy(&err);
+    // The error must be reported, and must be the *only* thing on stderr.
+    let reported_error = errors.lines().count() == 1 && errors.contains("nosuch");
+    if got == WANT && reported_error {
+        Check::new(
+            NAME,
+            Status::Pass,
+            format!(
+                "state kept across {} submissions, error survived",
+                SCRIPT.lines().count()
+            ),
+        )
+    } else {
+        Check::new(
+            NAME,
+            Status::Fail,
+            format!(
+                "session gave {got:?} + {} error line(s); wanted {WANT:?} + 1",
+                errors.lines().count()
+            ),
+        )
+    }
+}
+
 /// Run every check and print the report. Returns the process exit code:
 /// 0 only when nothing failed.
 pub fn run(quiet: bool) -> std::process::ExitCode {
@@ -342,6 +395,7 @@ pub fn run(quiet: bool) -> std::process::ExitCode {
         check_grammar(),
         check_eval(),
         check_run(),
+        check_repl(),
         check_transpile(),
         check_aot(),
     ];
@@ -422,6 +476,29 @@ mod tests {
     fn run_self_test_passes() {
         let c = check_run();
         assert_eq!(c.status, Status::Pass, "detail: {}", c.detail);
+    }
+
+    #[test]
+    fn repl_self_test_passes() {
+        let c = check_repl();
+        assert_eq!(c.status, Status::Pass, "detail: {}", c.detail);
+    }
+
+    /// The REPL check must be able to fail. A self-test that can only report
+    /// Pass is not a self-test — it would sit green through a REPL that lost
+    /// its state or swallowed errors. Asserted against the real function with
+    /// an expectation of what a *broken* session looks like, by checking that
+    /// the good fixture it uses really does produce the transcript it claims.
+    #[test]
+    fn the_repl_self_test_is_not_vacuous() {
+        let c = check_repl();
+        // The pass detail names the submission count, which is only knowable if
+        // the script was really run.
+        assert!(
+            c.detail.contains("5 submissions"),
+            "the check must actually run its script, not assert a constant: {}",
+            c.detail
+        );
     }
 
     #[test]

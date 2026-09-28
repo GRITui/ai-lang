@@ -25,7 +25,20 @@ Value  (Nil|Bool|Int|Float|Str|Sym|List|Builtin|Closure)
   - `value` — runtime value type + `Display`/`repr` printing.
   - `eval` — lexical `Env` (parent-linked scopes over `Rc`), special-form
     dispatch, closures, and the builtin prelude.
-- **`ainl-cli`** — the `ainl` binary (`run` / `eval` / `ast` / `repl`).
+  - `vm` — the bytecode compiler + stack machine (`run_in` / `run_form`), the
+    fast path, with `eval` retained as the semantic reference it is
+    differentially tested against.
+  - `lexer::scan` — "is this partial source finished?", shared by the REPL's
+    multi-line continuation. It lives beside `lex` so the two cannot disagree
+    about where a string or an escape begins.
+- **`ainl-cli`** — the `ainl` binary (`run` / `eval` / `ast` / `repl` /
+  `compile` / `transpile` / `grammar` / `doctor`).
+- **the REPL** (`ainl-cli/src/repl.rs`) — a read-eval-print loop over a
+  persistent `Env`, on the interpreter backend. It is a *front end*, not a
+  second language: it adds no syntax and no backends, only a submission rule
+  (read until strings and parens close) and a value echo. `drive` is generic
+  over reader/writer so the interactive loop, `--stdin`, `doctor`, and the
+  tests all exercise the same code.
 
 ### Why these choices map to the master plan
 

@@ -59,11 +59,18 @@ pub fn run_in(src: &str, env: &Env) -> Result<Value> {
 /// `eval::MAX_STEPS`).
 pub fn run_in_tree_walk(src: &str) -> Result<Value> {
     let env = Env::with_prelude();
+    tree_walk_in(src, &env)
+}
+
+/// Tree-walking twin of [`vm::run_in`], for differential testing: same program,
+/// same existing environment, so a REPL's two evaluation paths can be compared
+/// on identical input.
+pub fn tree_walk_in(src: &str, env: &Env) -> Result<Value> {
     eval::reset_limits();
     let forms = parse(src)?;
     let mut last = Value::Nil;
     for form in &forms {
-        last = eval::eval(form, &env)?;
+        last = eval::eval(form, env)?;
     }
     Ok(last)
 }
