@@ -18,6 +18,11 @@
 #include <stdarg.h>
 #include <math.h>
 
+/* ---- error handling ---------------------------------------------------- */
+static int g_err = 0;
+static char g_errmsg[1024];
+static void set_err(const char *fmt, ...);
+
 /* ---- step counter (bounds runaway loops / recursion) ------------------- */
 static uint64_t g_steps = 0;
 static uint64_t g_max_steps = 2000000;
@@ -28,22 +33,23 @@ static void steps_init(void) {
     if (v > 0) g_max_steps = (uint64_t)v;
   }
 }
-/* Returns 0 on ok, -1 if the step budget is exhausted. */
-static int tick(void) {
+/* Bump the step budget. On exhaustion, set g_err (the generated code checks
+ * g_err after each while-iteration and at the end of main) so runaway loops
+ * and recursion are bounded and reported, matching the interpreter's safety
+ * property. Granularity: one tick per while-iteration and per function call
+ * (the two runaway vectors), rather than per node eval — this bounds runaway
+ * work without adding per-expression overhead to the hot loop. */
+static void tick(void) {
   g_steps++;
   if (g_steps > g_max_steps) {
-    fprintf(stderr,
-            "step limit exceeded (max %llu evaluation steps) \xe2\x80\x94 "
-            "likely an infinite loop or runaway recursion\n",
-            (unsigned long long)g_max_steps);
-    return -1;
+    set_err(
+        "step limit exceeded (max %llu evaluation steps) — likely an "
+        "infinite loop or runaway recursion",
+        (unsigned long long)g_max_steps);
   }
-  return 0;
 }
 
 /* ---- error handling ---------------------------------------------------- */
-static int g_err = 0;
-static char g_errmsg[1024];
 static void set_err(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -586,85 +592,74 @@ static void format_float(double x, char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "-inf");
     return;
   }
-  if (x == 0.0) {
-    snprintf(buf, bufsz, "0.0");
-    return;
-  }
-  if (x == floor(x) && fabs(x) < 1e16) {
+  if (isfinite(x) && fmod(x, 1.0) == 0.0) {
     snprintf(buf, bufsz, "%.1f", x);
     return;
   }
-  /* shortest round-trip via %.*e, then reformat Rust-style */
+  int neg = signbit(x);
+  double ax = neg ? -x : x;
+  if (ax == 0.0) {
+    snprintf(buf, bufsz, neg ? "-0.0" : "0.0");
+    return;
+  }
+  /* Shortest round-trip digits via %.*e (p digits after the point = p+1
+   * significant figures). Rust's f64 Display uses the same shortest
+   * round-trip digits but ALWAYS in fixed-point notation (never
+   * scientific), so we reformat below. */
   char tmp[64];
-  int best_p = 17;
-  for (int p = 1; p <= 17; p++) {
-    snprintf(tmp, sizeof(tmp), "%.*e", p, x);
-    if (strtod(tmp, NULL) == x) {
+  int best_p = 16;
+  for (int p = 0; p <= 16; p++) {
+    snprintf(tmp, sizeof(tmp), "%.*e", p, ax);
+    if (strtod(tmp, NULL) == ax) {
       best_p = p;
       break;
     }
   }
-  snprintf(tmp, sizeof(tmp), "%.*e", best_p, x);
-  /* parse d.ddd e±exp */
-  int sign = 1;
+  snprintf(tmp, sizeof(tmp), "%.*e", best_p, ax);
+  /* Parse d.ddd e±exp. */
   char *p = tmp;
-  if (*p == '-') {
-    sign = -1;
-    p++;
-  }
-  int64_t exp10 = (int64_t)strtol(p + (strchr(p, 'e') - p), NULL, 10);
-  /* mantissa digits (strip the dot) */
+  char *e = strchr(p, 'e');
+  int64_t exp10 = (int64_t)strtol(e + 1, NULL, 10);
+  /* Mantissa digits (strip the dot). */
   char digits[32];
   int nd = 0;
-  for (char *q = p; *q && *q != 'e'; q++) {
+  for (char *q = p; q < e; q++) {
     if (*q != '.')
       digits[nd++] = *q;
   }
   digits[nd] = 0;
-  /* value = 0.digits * 10^(exp10+1) ; first digit is digits[0] */
-  int64_t point = exp10 + 1; /* number of digits before the decimal point */
-  if (point >= 0 && point < 21 && exp10 >= -5) {
-    /* fixed-point */
-    char out[64];
-    int oi = 0;
-    if (sign < 0)
-      out[oi++] = '-';
-    if (point <= 0) {
+  /* value = 0.digits * 10^(exp10+1); digits before the decimal point = exp10+1. */
+  int64_t point = exp10 + 1;
+  char out[4096];
+  int oi = 0;
+  if (point <= 0) {
+    out[oi++] = '0';
+    out[oi++] = '.';
+    for (int k = 0; k < (int)(-point); k++)
       out[oi++] = '0';
-      out[oi++] = '.';
-      for (int k = 0; k < (int)(-point); k++)
-        out[oi++] = '0';
-      for (int k = 0; k < nd; k++)
-        out[oi++] = digits[k];
-    } else if (point >= nd) {
-      for (int k = 0; k < nd; k++)
-        out[oi++] = digits[k];
-      for (int k = 0; k < (int)(point - nd); k++)
-        out[oi++] = '0';
-    } else {
-      for (int k = 0; k < point; k++)
-        out[oi++] = digits[k];
-      out[oi++] = '.';
-      for (int k = point; k < nd; k++)
-        out[oi++] = digits[k];
-    }
-    out[oi] = 0;
-    snprintf(buf, bufsz, "%s", out);
+    for (int k = 0; k < nd; k++)
+      out[oi++] = digits[k];
+  } else if (point >= nd) {
+    for (int k = 0; k < nd; k++)
+      out[oi++] = digits[k];
+    for (int k = 0; k < (int)(point - nd); k++)
+      out[oi++] = '0';
+    out[oi++] = '.';
+    out[oi++] = '0'; /* integer-valued -> ".0" */
   } else {
-    /* scientific: d.ddd e±exp */
-    char out[64];
-    int oi = 0;
-    if (sign < 0)
-      out[oi++] = '-';
-    out[oi++] = digits[0];
-    if (nd > 1) {
-      out[oi++] = '.';
-      for (int k = 1; k < nd; k++)
-        out[oi++] = digits[k];
-    }
-    snprintf(out + oi, sizeof(out) - oi, "e%lld", (long long)exp10);
-    snprintf(buf, bufsz, "%s", out);
+    for (int k = 0; k < (int)point; k++)
+      out[oi++] = digits[k];
+    out[oi++] = '.';
+    for (int k = (int)point; k < nd; k++)
+      out[oi++] = digits[k];
   }
+  out[oi] = 0;
+  if (neg) {
+    memmove(out + 1, out, (size_t)oi);
+    out[0] = '-';
+    out[oi + 1] = 0;
+  }
+  snprintf(buf, bufsz, "%s", out);
 }
 
 /* Render a value to a string buffer (Display). Returns the buffer. */
@@ -882,8 +877,8 @@ static Value builtin_mod(Value *args, int nargs) {
   if (b == -1)
     return v_int(0);
   int64_t r = a % b;
-  if (r != 0 && (r < 0) != (b < 0))
-    r += b;
+  if (r < 0)
+    r += (b < 0) ? -b : b; /* Euclidean: result in [0, |b|) */
   return v_int(r);
 }
 
@@ -1270,6 +1265,7 @@ static Value builtin_error(Value *args, int nargs) {
 
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
+  tick(); /* bounds recursion / runaway calls */
   if (g_err)
     return v_nil();
   if (callee.tag == V_BUILTIN) {
@@ -1470,8 +1466,8 @@ static inline Value a_mod(Value a, Value b) {
   if (y == -1)
     return v_int(0);
   int64_t r = x % y;
-  if (r != 0 && (r < 0) != (y < 0))
-    r += y;
+  if (r < 0)
+    r += (y < 0) ? -y : y; /* Euclidean: result in [0, |y|) */
   return v_int(r);
 }
 

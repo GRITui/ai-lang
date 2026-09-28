@@ -299,9 +299,7 @@ impl Gen {
         let nargs = arg_tmps.len();
         let t = self.fresh();
         if nargs == 0 {
-            self.emit_code(&format!(
-                "Value {t} = v_call({callee_tmp}, NULL, 0);\n"
-            ));
+            self.emit_code(&format!("Value {t} = v_call({callee_tmp}, NULL, 0);\n"));
         } else {
             let args_arr = self.fresh_arr();
             self.emit_code(&format!(
@@ -330,14 +328,11 @@ impl Gen {
         let val_tmp = self.gen_expr(&items[2], env);
         if self.scoping.is_empty() {
             // Top-level: bind to a global slot.
-            let i = *self
-                .globals
-                .entry(name.clone())
-                .or_insert_with(|| {
-                    let i = self.global_names.len();
-                    self.global_names.push(name.clone());
-                    i
-                });
+            let i = *self.globals.entry(name.clone()).or_insert_with(|| {
+                let i = self.global_names.len();
+                self.global_names.push(name.clone());
+                i
+            });
             self.emit_code(&format!("slot_set(g_top, {i}, {val_tmp});\n"));
         } else {
             self.add_local(&name);
@@ -348,10 +343,7 @@ impl Gen {
             ));
         }
         let t = self.fresh();
-        self.emit_code(&format!(
-            "Value {t} = v_sym(\"{}\");\n",
-            c_escape(&name)
-        ));
+        self.emit_code(&format!("Value {t} = v_sym(\"{}\");\n", c_escape(&name)));
         t
     }
 
@@ -431,10 +423,7 @@ impl Gen {
                 "char **{parr} = malloc({nparams} * sizeof(char *));\n"
             ));
             for (k, p) in params.iter().enumerate() {
-                self.emit_code(&format!(
-                    "{parr}[{k}] = strdup(\"{}\");\n",
-                    c_escape(p)
-                ));
+                self.emit_code(&format!("{parr}[{k}] = strdup(\"{}\");\n", c_escape(p)));
             }
             let variadic_c = match &variadic {
                 Some(v) => format!("strdup(\"{}\")", c_escape(v)),
@@ -502,8 +491,7 @@ impl Gen {
         if let Node::List(binds, _) = binds_node {
             for bind in binds {
                 if let Node::List(pair, _) = bind {
-                    if let (Some(Node::Sym(name, _)), Some(val_node)) =
-                        (pair.first(), pair.get(1))
+                    if let (Some(Node::Sym(name, _)), Some(val_node)) = (pair.first(), pair.get(1))
                     {
                         let val_tmp = self.gen_expr(val_node, &let_env);
                         self.emit_code(&format!(
@@ -576,19 +564,14 @@ impl Gen {
         match node {
             Node::Int(i, _) => self.emit_code(&format!("{target} = v_int({i});\n")),
             Node::Float(x, _) => self.emit_code(&format!("{target} = v_float({x:?});\n")),
-            Node::Str(s, _) => {
-                self.emit_code(&format!("{target} = v_str({});\n", c_string(s)))
-            }
+            Node::Str(s, _) => self.emit_code(&format!("{target} = v_str({});\n", c_string(s))),
             Node::Sym(name, _) => {
                 let expr = match name.as_str() {
                     "true" => "v_bool(1)",
                     "false" => "v_bool(0)",
                     "nil" => "v_nil()",
                     _ => {
-                        self.emit_code(&format!(
-                            "{target} = v_sym({});\n",
-                            c_string(name)
-                        ));
+                        self.emit_code(&format!("{target} = v_sym({});\n", c_string(name)));
                         return;
                     }
                 };
@@ -614,9 +597,7 @@ impl Gen {
                     "Value {arr}[{n}] = {{ {} }};\n",
                     item_tmps.join(", ")
                 ));
-                self.emit_code(&format!(
-                    "{target} = v_list_from_array({arr}, {n});\n"
-                ));
+                self.emit_code(&format!("{target} = v_list_from_array({arr}, {n});\n"));
                 for tmp in &item_tmps {
                     self.emit_code(&format!("v_unref(&{tmp});\n"));
                 }
@@ -670,13 +651,9 @@ impl Gen {
         ));
         self.emit("  Scope *g_env = scope_new(NULL);\n");
         self.emit("  scope_install_prelude(g_env);\n");
-        self.emit(
-            "  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n",
-        );
+        self.emit("  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n");
         self.emit(main_code);
-        self.emit(
-            "  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n",
-        );
+        self.emit("  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n");
         self.emit("  scope_unref(g_env);\n");
         self.emit("  return 0;\n");
         self.emit("}\n");
