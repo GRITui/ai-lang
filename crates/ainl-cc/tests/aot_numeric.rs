@@ -29,10 +29,14 @@ fn compile_aot(src: &str, name: &str) -> PathBuf {
     let c_path = dir.join(format!("{name}.c"));
     let bin = dir.join(name);
     std::fs::write(&c_path, c).expect("write .c");
+    // `-lm`: on glibc (Linux) fmod() lives in libm, not libc, so the link
+    // fails without it. macOS folds libm into libSystem, hence the flag is
+    // redundant (but harmless) there.
     let out = Command::new("cc")
         .args(["-O2", "-o"])
         .arg(&bin)
         .arg(&c_path)
+        .arg("-lm")
         .output()
         .expect("run cc (AOT backend needs a host C compiler)");
     assert!(

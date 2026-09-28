@@ -130,7 +130,8 @@ jobs:
       - name: Emit standalone C, link static with musl-gcc
         run: |
           ./target/release/ainl compile examples/hello.ainl -o hello.c --c-only
-          x86_64-linux-musl-gcc -O2 -static -o hello.musl hello.c
+          # -lm: fmod() (float formatting) lives in libm, not libc.
+          x86_64-linux-musl-gcc -O2 -static -o hello.musl hello.c -lm
           file hello.musl
           LDD_OUT=$(ldd hello.musl 2>&1)
           echo "== ldd =="

@@ -242,7 +242,7 @@ impl Gen {
         match node {
             Node::Int(i, _) => {
                 let t = self.fresh();
-                self.emit_code(&format!("Value {t} = v_int({i});\n"));
+                self.emit_code(&format!("Value {t} = v_int({});\n", c_int_literal(*i)));
                 t
             }
             Node::Float(x, _) => {
@@ -604,7 +604,9 @@ impl Gen {
     fn gen_quote_into(&mut self, node: &Node, target: &str) {
         self.emit_code(&format!("Value {target};\n"));
         match node {
-            Node::Int(i, _) => self.emit_code(&format!("{target} = v_int({i});\n")),
+            Node::Int(i, _) => {
+                self.emit_code(&format!("{target} = v_int({});\n", c_int_literal(*i)))
+            }
             Node::Float(x, _) => self.emit_code(&format!("{target} = v_float({x:?});\n")),
             Node::Str(s, _) => self.emit_code(&format!("{target} = v_str({});\n", c_string(s))),
             Node::Sym(name, _) => {
@@ -728,6 +730,21 @@ impl Gen {
         self.emit("  scope_unref(g_env);\n");
         self.emit("  return 0;\n");
         self.emit("}\n");
+    }
+}
+
+/// A C expression for the i64 literal `i`.
+///
+/// `INT64_MIN` (-9223372036854775808) is special: its magnitude is not
+/// representable as a signed C integer, so the plain literal is parsed as
+/// unsigned and negated, which gcc warns about
+/// (-Wimplicitly-unsigned-literal) and which C23 tightens. Emit the
+/// two's-complement identity instead, which is exact and portable.
+fn c_int_literal(i: i64) -> String {
+    if i == i64::MIN {
+        "((int64_t)INT64_MIN)".to_string()
+    } else {
+        format!("{i}LL")
     }
 }
 

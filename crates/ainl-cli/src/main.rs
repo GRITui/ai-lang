@@ -299,8 +299,13 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
         eprintln!("cannot write {c_path}: {e}");
         return ExitCode::FAILURE;
     }
+    // `-lm` is not implied by libc: on glibc (Linux) fmod() and friends live
+    // in libm, so without it the link fails with "undefined reference to
+    // `fmod'" — the generated runtime's float formatting needs it. macOS
+    // folds libm into libSystem, which is why this only shows up on Linux.
+    // It is a no-op where the flag is redundant.
     let status = std::process::Command::new("cc")
-        .args(["-O2", "-o", &out, &c_path])
+        .args(["-O2", "-o", &out, &c_path, "-lm"])
         .status();
     if keep_c.is_none() {
         let _ = std::fs::remove_file(&c_path);
