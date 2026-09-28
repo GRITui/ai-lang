@@ -67,6 +67,86 @@ jobs:
       - name: Verify transpiled output matches the interpreter
         run: ./scripts/check-transpile.sh
 
+  aot:
+    name: AOT (C -> cc) byte-identical + step cap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      # cc is preinstalled on ubuntu runners.
+      - name: Verify cc is present
+        run: cc --version
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Compiles every example + the 40k benchmark with `ainl compile` (which
+      # shells out to cc) and diffs the compiled binary's stdout against
+      # `ainl run`. Also checks the step cap and its AINL_MAX_STEPS override.
+      - name: AOT parity + step-counter gate
+        run: ./scripts/check-aot.sh
+
+  aot-standalone:
+    name: AOT binary runs on clean Linux (musl, static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Provides /usr/bin/x86_64-linux-musl-gcc.
+      - name: Install musl-gcc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      # Standalone proof: the *compiled AINL program* — not the ainl binary —
+      # must link with nothing but libc. Emitting the .c with --keep-c and
+      # linking it with musl-gcc proves the output carries its own runtime (the
+      # micro-runtime is inlined into the single .c) and needs no host AINL.
+      - name: Emit standalone C, link static with musl-gcc
+        run: |
+          ./target/release/ainl compile examples/hello.ainl -o hello.c --c-only
+          x86_64-linux-musl-gcc -O2 -static -o hello.musl hello.c
+          file hello.musl
+          LDD_OUT=$(ldd hello.musl 2>&1)
+          echo "== ldd =="
+          echo "$LDD_OUT"
+          echo "$LDD_OUT" | grep -Eq "not a dynamic executable|statically linked"
+
+      - name: Run it (uploads the standalone binary as an artifact)
+        run: |
+          ./hello.musl
+          ls -lh hello.musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ainl-aot-standalone-musl
+          path: hello.musl
+
   gbnf-conformance:
     name: GBNF conformance (well-formed + fuzz grammar ⊆ parser)
     runs-on: ubuntu-latest

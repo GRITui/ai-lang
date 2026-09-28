@@ -6,6 +6,10 @@ Cargo.lock
 # Release packaging output
 /dist
 
+# AOT codegen scratch (ainl compile writes this next to -o and removes it;
+# a killed compile can leave one behind)
+/.*.ainl-codegen.c
+
 # Secrets (keep tokens/keys out of the repo)
 *.env
 config.env

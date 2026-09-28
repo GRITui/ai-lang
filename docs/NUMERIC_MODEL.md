@@ -54,6 +54,42 @@ results depending on where it runs, and none of the four transpilers can
 detect this ahead of time — it's a runtime value, not something visible in
 the static AST a transpiler works from.
 
+## The AOT compiler targets the *interpreter's* model, not the transpilers'
+
+`ainl compile` (Stage 2, `crates/ainl-cc`) does **not** reproduce the C
+transpiler's wrapping behaviour described above. It is required to match the
+**AINL interpreter** exactly — i64 with promotion to f64 on overflow, the same as
+Python/Ruby and *not* the same as the C/JS targets.
+
+That distinction is the whole point, and it is enforced rather than asserted:
+`crates/ainl-cc/tests/aot_numeric.rs` compiles each edge case with `ainl_cc`,
+runs the binary, and diffs against `ainl_core`'s own result. Covered:
+integer arithmetic, i64 overflow at both `INT64_MAX`/`INT64_MIN` in `+`/`-`/`*`,
+float shortest-round-trip formatting (`(/ 1.0 3)`, `(+ 0.1 0.2)`), int/float
+mixing and cross-type comparison, and runtime type errors.
+
+Writing the C runtime to that model surfaced three genuine defects, all of which
+returned plausible-looking wrong answers rather than failing loudly:
+
+- `(* 2 -9223372036854775808)` returned `0` instead of
+  `-18446744073709551616.0`. The overflow check computed the unsigned magnitude
+  product first — `2 × 2^63` wraps `uint64` to `0` — and the wrapped `0` then
+  *passed* the range test. The check is now a division (`ub > limit / ua`), so
+  the product is formed only once it is known to fit.
+- Any product landing exactly on `2^63` in magnitude (e.g.
+  `(* -1 -9223372036854775808)`, which is in range and equals
+  `9223372036854775808.0`) hit `-(int64_t)ur`, which is undefined behaviour at
+  that magnitude (not representable as `int64_t`); clang folded it to `0`.
+- The hot-path arithmetic inlines (`a_add`/`a_sub2`/`a_mul`/`a_div`) skipped the
+  operand type check, reinterpreting a `V_STR`'s pointer as a `double`. That is
+  a silent union-type-confusion read — `(+ 1 "a")` returned `1.0` rather than
+  raising `expected a number, got str`.
+
+So the transpiler divergence table above is a property of *cross-language*
+targets; within the AINL toolchain (interpreter, bytecode VM, and AOT binary)
+the numeric model is identical, and there is a test that fails if it stops being
+so.
+
 ## Options if this needs to be closed (not done — tracked here for whoever picks it up)
 
 1. **Make the interpreter arbitrary-precision too**, matching Python/Ruby.

@@ -131,6 +131,120 @@ a step cap is for. The cap remains a known limitation for legitimately large
 but linear programs; the fix direction (make the cap configurable / raise it,
 and document it) is unchanged.
 
+## Stage 2 — AOT compiler (AINL → C → `cc`)
+
+`crates/ainl-cc` compiles the AST to a **single self-contained C file** — the
+micro-runtime (value model, refcounting, cons cells, symbol interning, scopes,
+closures, 27 builtins, step counter) is inlined into the output, so the compiled
+program links against nothing but libc. `ainl compile prog.ainl -o prog` runs
+`cc`; `ainl run` is untouched and still goes through the VM.
+
+The trade is explicit: **the compiler needs a host toolchain (`cc`); the output
+needs nothing.** Zero new external dependencies — `ainl-cc` depends only on
+`ainl-core`.
+
+### The three numbers
+
+40,000-iteration sum-to-N loop (`bench/loop40k.ainl`), release build, best of 25.
+Measured on Apple Silicon / macOS 26.2, clang `-O2`
+(`./scripts/bench-aot.sh`):
+
+| Engine | 40k sum-to loop | vs tree-walk |
+|---|---|---|
+| AINL tree-walk (in-process) | 34.8 ms | 1.0× |
+| AINL bytecode VM (in-process) | 5.9 ms | ~6× |
+| **AINL AOT (whole process)** | **2.20 ms** | **~16×** |
+| native Rust equivalent (whole process) | 1.79 ms | ~19× |
+
+So the "on par with Rust" pillar holds: **the AOT binary is within 1.23× of a
+hand-written Rust program** for the same loop (target was ≤2×).
+
+### Why 1.23×, when the loop itself is 30× faster than the interpreter
+
+Of the AOT binary's 2.20 ms, **1.56 ms is process startup** — fork, exec, dynamic
+link, libc init. That floor is measured directly, not estimated: a trivial
+compiled program (`(print 1)`) costs 1.56 ms, and the same harness measures
+1.87 ms for the Rust equivalent. Subtracting it:
+
+| | AOT | Rust |
+|---|---|---|
+| total (whole process) | 2.20 ms | 1.79 ms |
+| process startup floor | 1.56 ms | 1.87 ms |
+| **compute only (total − floor)** | **0.64 ms** | **not resolvable** |
+
+AOT compute-only is 0.64 ms = **~54× the tree-walk**
+(`crates/ainl-cc/tests/aot_perf.rs` asserts this ≥30× gate).
+
+The Rust compute column is deliberately blank. Its startup floor (1.87 ms) came
+out *above* its total (1.79 ms), so the subtraction goes negative: the Rust
+loop's entire work is below this harness's noise floor, and quoting a compute
+ratio against it would be inventing precision. What the data does support is the
+whole-process figure — **AOT 2.20 ms vs Rust 1.79 ms, i.e. 1.23×** — because
+that is the number a user of either program actually pays, and both sides are
+measured the same way. A dynamically-typed, refcounted value model with a tag
+check on every arithmetic op will not match a bare `i64` loop; the AOT backend
+is within 2× of Rust for the same program, which was the target.
+
+**Methodology note.** These process-inclusive numbers are measured with
+`scripts/execbench.c` (fork+exec the target from C, no intermediate process).
+Timing a ~2 ms binary with `python3 -c 'subprocess.run(...)'` or `/usr/bin/time`
+charges the *timer's* own startup to the binary: measured here as ~27 ms, which
+is >10× the thing being measured and makes every AOT number look like 28 ms. Any
+sub-millisecond AOT benchmark that uses an external timer is measuring the
+timer.
+
+### What the AOT backend had to fix to get there
+
+Four real bugs, all found by the parity/numeric test suites rather than by the
+examples (every example and the 40k loop passed throughout):
+
+1. **Variadic operators were truncated.** `gen_call`'s fast path matched any call
+   whose callee was a known 2-arg operator without checking arity, so `(+ 1 2 3 4 5)`
+   inlined the first two operands and silently **dropped the rest** — printing
+   `3` where the interpreter prints `15`. The 40k loop uses 2-arg `+`, which is
+   why the headline benchmark never caught it.
+2. **Arithmetic inlines never type-checked.** `a_add`/`a_sub2`/`a_mul`/`a_div`
+   read `u.f` unconditionally on the non-int path, reinterpreting a `V_STR`'s
+   `Str*` as a `double`. `(+ 1 "a")` returned `1.0` instead of raising
+   `expected a number, got str`; `(* 2 "a")` returned a garbage float. Silent UB.
+3. **`checked_mul` overflowed its own check.** For `INT64_MIN` (magnitude 2^63),
+   `(* 2 -9223372036854775808)` computed magnitudes `2 × 2^63 = 2^64`, which wraps
+   `uint64` to 0 — the wrap then *passed* the `ur > limit` test and returned `0`.
+   Fixed with a division-based check (`ub > limit / ua`) so the product is only
+   formed once known to fit.
+4. **Undefined negation at the sign boundary.** `-(int64_t)ur` is UB when `ur` is
+   exactly 2^63 (not representable as `int64_t`); clang folded it to `0`. Fixed
+   with `(int64_t)(0 - ur)`, the same bit pattern without UB.
+
+`crates/ainl-cc/tests/` now covers all of it: `aot_parity.rs` (4/4 examples
+byte-identical + step cap), `aot_numeric.rs` (i64-overflow promotion to f64,
+float formatting, type errors — each asserted against `ainl_core`, not a
+hardcoded string), `aot_perf.rs` (the ≥30× compute gate).
+
+### Codegen shape
+
+- **Top-level `def`s** use dense global slots (`g_top[]`), so the hot loop
+  indexes `g_top[0]`/`g_top[1]` directly — no name lookup.
+- **Function locals** use the runtime's name-based `Scope` chain, which is what
+  closures, `let` and nested `def` need.
+- **Binary operators** inline to `a_add`/`a_lt`/… instead of going through
+  `v_call`'s switch; 3+-operand forms fall back to `v_call` → `numeric_fold`.
+- **`def`'s result symbol is pre-interned.** `def` evaluates to its own name, and
+  in a hot loop that symbol is built and immediately discarded. Calling
+  `v_sym()` per iteration re-ran the intern-table probe (FNV hash + `strcmp`)
+  for a constant. Hoisting each distinct def name to one file-scope `static`
+  initialized once at startup took the loop from 28.7× to 53.6× the tree-walk —
+  a 1.6× win from deleting pure waste.
+
+### Safety property preserved
+
+The C runtime keeps the interpreter's step cap: **2,000,000 by default**,
+overridable with the `AINL_MAX_STEPS` environment variable. Ticks are per
+`while` iteration and per function call (the two runaway vectors) rather than per
+node, so the cap bounds runaway work without adding per-expression cost to the
+hot loop. Exhaustion sets a runtime error and exits non-zero. Enforced in CI by
+`scripts/check-aot.sh` and in `aot_parity.rs`.
+
 ## Verdict
 
 The pre-fix "do not benchmark AINL on speed — it always loses to CPython/MRI"

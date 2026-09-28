@@ -1,0 +1,8 @@
+; The 40k sum-to-N benchmark from docs/PERFORMANCE.md.
+; Sums 0..39999 = 799980000 and prints it.
+(def i 0)
+(def s 0)
+(while (< i 40000)
+  (def s (+ s i))
+  (def i (+ i 1)))
+(print s)
