@@ -33,7 +33,8 @@ for. The grammar is the only thing separating the two modes:
 | unconstrained | **0/20 (0%)** | 20/20 (100%) | 0/20 (0%) |
 
 **When the model is strong** — Qwen3.8-27B-FP8, 12 checkable-answer tasks
-scored by exact stdout match:
+scored by exact stdout match. Ten completed; two were lost to a gateway
+timeout storm and are recorded as *not run*, not as failures:
 
 | mode | GBNF membership | runs | **correct** |
 |---|---:|---:|---:|
