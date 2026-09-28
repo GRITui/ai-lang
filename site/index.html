@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINL — the language an LLM can't get wrong</title>
+<meta name="description" content="A language whose grammar is 10 GBNF rules and 561 bytes. Hand it to any constrained decoder and the output is valid by construction.">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+    --acc:#7ee787; --warn:#ffa657; --bad:#ff7b72; --link:#58a6ff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg); line-height:1.65;
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px}
+  code,pre{font-family:var(--mono);font-size:14px}
+  code:not(pre code){background:#21262d;padding:.15em .4em;border-radius:4px}
+  pre{
+    background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:16px 18px;overflow-x:auto;line-height:1.5;
+  }
+  pre code{background:none;padding:0}
+  a{color:var(--link);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  header{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+  h1{font-size:2.5rem;line-height:1.15;margin:0 0 16px;letter-spacing:-.02em}
+  h1 .sub{display:block;font-size:1.15rem;color:var(--dim);font-weight:400;
+    letter-spacing:0;margin-top:12px;line-height:1.5}
+  .lede{font-size:1.1rem;color:var(--dim);max-width:64ch;margin:24px 0 0}
+  .cta{margin-top:28px;display:flex;gap:12px;flex-wrap:wrap}
+  .btn{
+    display:inline-block;padding:10px 18px;border-radius:6px;
+    border:1px solid var(--line);background:var(--panel);
+    font-size:.95rem;font-weight:500;
+  }
+  .btn:hover{border-color:var(--dim);text-decoration:none}
+  .btn.primary{background:var(--acc);color:#0d1117;border-color:var(--acc)}
+
+  section{padding:56px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:1.5rem;margin:0 0 8px;letter-spacing:-.01em}
+  h2 .n{color:var(--dim);font-weight:400;margin-right:10px;font-variant-numeric:tabular-nums}
+  .sec-sub{color:var(--dim);margin:0 0 24px;max-width:66ch}
+
+  table{border-collapse:collapse;width:100%;margin:20px 0;font-size:.94rem}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600;font-size:.85rem;text-transform:uppercase;letter-spacing:.04em}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  tr.hi td{color:var(--acc);font-weight:600}
+  tr.dim td{color:var(--dim)}
+  caption{caption-side:bottom;color:var(--dim);font-size:.85rem;padding-top:12px;text-align:left}
+
+  .tag{display:inline-block;padding:2px 7px;border-radius:4px;font-size:.75rem;
+    font-weight:600;font-family:var(--mono);letter-spacing:.02em}
+  .t-good{background:rgba(126,231,135,.15);color:var(--acc)}
+  .t-bad{background:rgba(255,123,114,.15);color:var(--bad)}
+
+  .callout{
+    background:var(--panel);border:1px solid var(--line);
+    border-left:3px solid var(--warn);border-radius:0 8px 8px 0;
+    padding:16px 20px;margin:24px 0;
+  }
+  .callout p{margin:0 0 10px}
+  .callout p:last-child{margin:0}
+  .callout .h{font-weight:600;color:var(--warn);display:block;margin-bottom:6px}
+
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin:24px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}
+  .card .n{font-size:1.6rem;font-family:var(--mono);font-weight:600;
+    font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .card .l{color:var(--dim);font-size:.88rem;margin-top:4px}
+  .card.good .n{color:var(--acc)} .card.warn .n{color:var(--warn)} .card.bad .n{color:var(--bad)}
+
+  .step{display:grid;grid-template-columns:32px 1fr;gap:16px;margin:22px 0;align-items:start}
+  .step .i{
+    width:32px;height:32px;border-radius:50%;background:var(--panel);
+    border:1px solid var(--line);display:flex;align-items:center;
+    justify-content:center;font-family:var(--mono);font-size:.85rem;color:var(--acc);
+  }
+  .step .b h3{margin:4px 0 8px;font-size:1rem}
+  .step .b p{margin:0 0 10px;color:var(--dim);font-size:.94rem}
+
+  ul{margin:12px 0;padding-left:22px}
+  li{margin:7px 0}
+  footer{padding:40px 0 64px;color:var(--dim);font-size:.9rem}
+  .small{font-size:.9rem;color:var(--dim)}
+  hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+  @media (max-width:640px){
+    h1{font-size:1.85rem} .wrap{padding:0 18px} section{padding:40px 0}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>
+    The language an LLM can't get wrong
+    <span class="sub">AINL's entire grammar is 10 GBNF rules and 561 bytes. Hand it to any
+    constrained decoder — llama.cpp, vLLM, Ollama, LM Studio — and the output is valid
+    by construction, not by retrying.</span>
+  </h1>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/GRITui/ai-lang">View on GitHub</a>
+    <a class="btn" href="https://github.com/GRITui/ai-lang/blob/main/docs/PIPELINE.md">The pipeline walkthrough</a>
+    <a class="btn" href="https://github.com/GRITui/ai-lang/blob/main/docs/GENERATION.md">The experiments</a>
+  </div>
+</header>
+
+<section>
+  <h2><span class="n">01</span>The proof</h2>
+  <p class="sec-sub">Two runs, each comparing the <em>same model, same prompts, same
+  temperature</em> with and without the grammar applied. The check is GBNF membership —
+  is the output in the language of the exported grammar? That is the sound detector;
+  <code>ainl ast</code> is not, because the parser is a superset of the grammar and
+  accepts invalid input.</p>
+
+  <h3 style="font-size:1.05rem;margin:28px 0 4px">When the model is the bottleneck</h3>
+  <p class="small" style="margin:0 0 8px">Qwen2.5-0.5B, 20 prompts, llama.cpp constrained decode — the case AINL is designed for.</p>
+  <table>
+    <thead><tr><th>mode</th><th class="num">GBNF membership</th><th class="num">parses</th><th class="num">runs</th></tr></thead>
+    <tbody>
+      <tr class="hi"><td><strong>constrained</strong></td><td class="num"><span class="tag t-good">20/20 · 100%</span></td><td class="num">20/20</td><td class="num dim">0/20</td></tr>
+      <tr><td>unconstrained</td><td class="num"><span class="tag t-bad">0/20 · 0%</span></td><td class="num">20/20</td><td class="num dim">0/20</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="font-size:1.05rem;margin:28px 0 4px">When the model is strong</h3>
+  <p class="small" style="margin:0 0 8px">Qwen3.8-27B-FP8, 12 checkable tasks, scored by exact stdout match.</p>
+  <table>
+    <thead><tr><th>mode</th><th class="num">GBNF membership</th><th class="num">runs</th><th class="num">correct</th></tr></thead>
+    <tbody>
+      <tr class="hi"><td><strong>constrained</strong></td><td class="num"><span class="tag t-good">10/10 · 100%</span></td><td class="num">10/10</td><td class="num">9/10</td></tr>
+      <tr><td>unconstrained</td><td class="num">10/10</td><td class="num">10/10</td><td class="num">9/10</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <span class="h">The second result matters more than the first.</span>
+    <p>The constraint <strong>never fails</strong> — 20/20 and 10/10, two models, two
+    decoders. That is the guarantee.</p>
+    <p>But on a strong model it is <strong>insurance, not an improvement</strong>: both
+    arms scored 9/10 and produced byte-identical output. The model already writes valid
+    AINL unprompted, so there is nothing left for the grammar to rescue.
+    <strong>Constraint value scales inversely with model capability.</strong></p>
+  </div>
+
+  <h3 style="font-size:1.05rem;margin:28px 0 8px">What it does not buy you</h3>
+  <p><strong>It guarantees syntax, not semantics.</strong> The one miss in the 27B run is
+  the proof. The model treated <code>list</code> as a two-argument constructor, so
+  <code>(double-each (list 1 2 3))</code> printed <code>(2 (4 (6)))</code> instead of
+  <code>(2 4 6)</code>. That program is syntactically perfect — it passes the grammar, it
+  runs, and it is wrong. No grammar can fix it; it is a property of the model.</p>
+</section>
+
+<section>
+  <h2><span class="n">02</span>Validation is cheap enough to always run</h2>
+  <p class="sec-sub">A sound membership check on the exported grammar. Per-byte cost is
+  flat across a 625× size range, so this is linear, not quadratic — you can afford to
+  check every single generation.</p>
+  <table>
+    <thead><tr><th class="num">bytes</th><th class="num">validate</th><th class="num">µs/byte</th></tr></thead>
+    <tbody>
+      <tr><td class="num">82</td><td class="num">47.3 µs</td><td class="num">0.576</td></tr>
+      <tr><td class="num">410</td><td class="num">240.2 µs</td><td class="num">0.586</td></tr>
+      <tr><td class="num">2 050</td><td class="num">1 209.8 µs</td><td class="num">0.590</td></tr>
+      <tr><td class="num">10 250</td><td class="num">6 036.4 µs</td><td class="num">0.589</td></tr>
+      <tr><td class="num">51 250</td><td class="num">30 969.0 µs</td><td class="num">0.604</td></tr>
+    </tbody>
+    <caption>At ~0.6 µs/byte, a 10 KB program validates in about 6 ms.</caption>
+  </table>
+</section>
+
+<section>
+  <h2><span class="n">03</span>generate → validate → compile → run</h2>
+  <p class="sec-sub">Every command below was run on the commit this page was written
+  against, on a program a model actually wrote.</p>
+
+  <div class="step"><div class="i">1</div><div class="b">
+    <h3>Generate under the grammar</h3>
+    <p>Local llama.cpp, or any OpenAI-compatible gateway. The grammar is portable; the
+    language is not in the way.</p>
+<pre><code>llama-cli -m model.gguf -f prompt.txt \
+    --grammar-file &lt;(ainl grammar --gbnf) -st</code></pre>
+  </div></div>
+
+  <div class="step"><div class="i">2</div><div class="b">
+    <h3>Validate — O(n)</h3>
+    <p>Is the output in the grammar's language? This is the same check the published
+    numbers are scored with.</p>
+<pre><code>$ python3 scripts/gen-harness/validate_gbnf.py fib-10.ainl
+True
+$ python3 scripts/gen-harness/validate_gbnf.py some_python.py
+False</code></pre>
+    <p class="small">The negative control is the point: free-form Python is rejected.
+    <code>ainl ast</code> would have accepted it.</p>
+  </div></div>
+
+  <div class="step"><div class="i">3</div><div class="b">
+    <h3>Compile — AINL → C → native</h3>
+    <p>One self-contained C file; the micro-runtime is inlined, so the binary links
+    against nothing but libc.</p>
+<pre><code>$ ainl compile fib-10.ainl -o fib10
+compiled fib-10.ainl -> fib10</code></pre>
+  </div></div>
+
+  <div class="step"><div class="i">4</div><div class="b">
+    <h3>Run</h3>
+<pre><code>$ ainl run fib-10.ainl
+55
+$ ./fib10
+55</code></pre>
+  </div></div>
+</section>
+
+<section>
+  <h2><span class="n">04</span>Speed</h2>
+  <p class="sec-sub">40,000-iteration loop, release build, best of 25. The AOT binary
+  lands within 1.27× of hand-written Rust for the same program.</p>
+  <table>
+    <thead><tr><th>engine</th><th class="num">40k sum-to loop</th><th class="num">vs tree-walk</th></tr></thead>
+    <tbody>
+      <tr><td>AINL tree-walk</td><td class="num">35.4 ms</td><td class="num dim">1.0×</td></tr>
+      <tr><td>AINL bytecode VM</td><td class="num">5.9 ms</td><td class="num">~6×</td></tr>
+      <tr class="hi"><td><strong>AINL AOT</strong> (whole process)</td><td class="num">2.25 ms</td><td class="num">~16×</td></tr>
+      <tr class="dim"><td>native Rust (whole process)</td><td class="num">1.77 ms</td><td class="num">~20×</td></tr>
+    </tbody>
+    <caption>Of the AOT binary's 2.25 ms, 1.56 ms is process startup. Subtracting the measured floor, AOT compute is 0.69 ms — about 51× the interpreter.</caption>
+  </table>
+</section>
+
+<section>
+  <h2><span class="n">05</span>What didn't work</h2>
+  <p class="sec-sub">Listed because a pitch that only shows wins isn't a pitch you can
+  trust.</p>
+  <div class="grid">
+    <div class="card bad">
+      <div class="n">+108%</div>
+      <div class="l"><strong>Token density: the goal was not met.</strong> AINL uses
+      ~2× the tokens of idiomatic Python, and more than JS (+64%) or Ruby (+95%).
+      The original "token-dense, optimized for LLM context" premise is disproved.
+      AINL's real advantage is reliability of generation, not token count.</div>
+    </div>
+    <div class="card warn">
+      <div class="n">0/20</div>
+      <div class="l"><strong>A 0.5B model cannot write AINL.</strong> The grammar held at
+      100%; the outputs were byte-identical degenerate templates and none ran.
+      Syntax was never the bottleneck — model capability was. Use a 27B-class model.</div>
+    </div>
+    <div class="card">
+      <div class="n">—</div>
+      <div class="l"><strong>No semantic guarantee.</strong> Constrained decoding removes
+      an entire class of failure (invalid syntax) and no classes of logical error.
+      The model still has to be right.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">06</span>The rest of the language</h2>
+  <p class="sec-sub">A generation target is only useful if the output is worth keeping.</p>
+  <ul>
+    <li><strong>One unambiguous parse tree.</strong> Uniform <code>(op arg...)</code>, no
+    infix, no precedence, no terminators. Serialized to stable JSON with source spans
+    and read back losslessly.</li>
+    <li><strong>Lossless interop.</strong> The same AST projects to idiomatic Python,
+    JavaScript, and Ruby — byte-equivalent across all four backends.</li>
+    <li><strong>46 builtins</strong> across the interpreter, the AOT binary, and all three
+    transpiler targets, with byte-identical output on every one.</li>
+    <li><strong>Zero external dependencies.</strong> A small static Rust binary.</li>
+  </ul>
+  <pre><code>(def sq (fn (x) (* x x)))
+(print (sq 12))            ; 144
+
+(def fib (fn (n)
+  (if (&lt; n 2) n
+    (+ (fib (- n 1)) (fib (- n 2))))))
+(print (fib 20))          ; 6765</code></pre>
+</section>
+
+<footer>
+  <p><strong>AINL</strong> — dual-licensed Apache 2.0 / MIT.
+  <a href="https://github.com/GRITui/ai-lang">Source</a> ·
+  <a href="https://github.com/GRITui/ai-lang/blob/main/docs/GENERATION.md">GENERATION.md</a> ·
+  <a href="https://github.com/GRITui/ai-lang/blob/main/docs/PIPELINE.md">PIPELINE.md</a> ·
+  <a href="https://github.com/GRITui/ai-lang/blob/main/docs/PERFORMANCE.md">PERFORMANCE.md</a> ·
+  <a href="https://github.com/GRITui/ai-lang/blob/main/docs/SYNTAX.md">SYNTAX.md</a></p>
+  <p>Every number on this page is a committed measurement. The negative results are
+  here too, because they are the ones that tell you what the thing actually is.</p>
+</footer>
+
+</div>
+</body>
+</html>
