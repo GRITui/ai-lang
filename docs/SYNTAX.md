@@ -539,10 +539,14 @@ failure, on any file that errored, and on a suite that contains no tests at all 
 ```
 ok   tests/file_io.ainl (30 passed)
 FAIL tests/json.ainl — 36 passed, 1 failed: parses an empty array
-     runtime error: test failed: parses an empty array: expected "[]", got "" at line 41, col 1
+     runtime error: test failed: parses an empty array: expected [], got  at line 41, col 1 (byte 920)
 
 36 passed, 1 failed, 0 errors across 2 files
 ```
+
+The per-file line and the summary always agree: the total counts the tests that
+passed *before* the failure in each failing file, because a failing test aborts
+its file and the ones after it never ran.
 
 A **failed test** and an **errored file** are reported differently, because only
 one of them is fixed by editing a test: a file that fails to parse, or that
