@@ -213,7 +213,7 @@ impl Gen {
             }
             Node::Float(x, _) => {
                 let t = self.fresh();
-                self.emit_code(&format!("Value {t} = v_float({x});\n"));
+                self.emit_code(&format!("Value {t} = v_float({x:?});\n"));
                 t
             }
             Node::Str(s, _) => {
@@ -539,6 +539,7 @@ impl Gen {
         self.emit_code(&format!("Value {t} = v_nil();\n"));
         self.emit_code("while (1) {\n");
         self.emit_code("  {\n");
+        self.emit_code("  tick(); if (g_err) break;\n");
         let cond_tmp = self.gen_expr(cond_node, env);
         self.emit_code(&format!(
             "  if (!v_truthy(&{cond_tmp})) {{ v_unref(&{cond_tmp}); break; }}\n"
@@ -574,7 +575,7 @@ impl Gen {
         self.emit_code(&format!("Value {target};\n"));
         match node {
             Node::Int(i, _) => self.emit_code(&format!("{target} = v_int({i});\n")),
-            Node::Float(x, _) => self.emit_code(&format!("{target} = v_float({x});\n")),
+            Node::Float(x, _) => self.emit_code(&format!("{target} = v_float({x:?});\n")),
             Node::Str(s, _) => {
                 self.emit_code(&format!("{target} = v_str({});\n", c_string(s)))
             }
