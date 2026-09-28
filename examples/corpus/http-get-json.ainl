@@ -67,13 +67,23 @@
 
 ; --- a JSON endpoint -------------------------------------------------------
 ; The body is a STRING, so parsing is an explicit second step. There is no
-; automatic decode on `http-get`, and there is no `try` to catch a malformed
-; one, so a client that cannot trust its server has to check the content type
-; first — see error-handling.ainl for why that check is currently mandatory.
+; automatic decode on `http-get`. A malformed body raises, and a `try`/`catch`
+; around the parse is the honest way to handle a server you do not control —
+; see try-catch.ainl. Checking the content type first is still worth doing when
+; you want to avoid the error path at all: a body that is not JSON is a fact
+; about the response, and a check states that directly. Both are shown here.
 (def items (show "GET /items" (str base "/items")
                  (hash "Accept" "application/json")))
 
-(def parsed (json-parse (get items "body")))
+(def body (get items "body"))
+; AINL has no `str` indexing and no `starts-with?`, so the cheapest honest
+; pre-check on a string is `(= (len body) 0)` — which catches the empty body a
+; truncated response gives you, and leaves everything else to the `catch`.
+(def parsed
+  (if (= (len body) 0)
+    "empty body"
+    (try (json-parse body)
+         (catch (e) (str "unparseable: " (get e "message"))))))
 (print "     parsed:" parsed)
 (print "     first id:" (get (first (get parsed "data")) "id"))
 (print "     count:" (len (get parsed "data")))

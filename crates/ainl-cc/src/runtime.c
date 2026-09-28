@@ -1233,9 +1233,11 @@ static Value builtin_get(Value *args, int nargs) {
  *
  * It also CLEARS g_err. That is the whole of the AOT unwind: the error has
  * already been recorded in g_errmsg, and a `catch` consumes it, so the code
- * after the dispatch must not see the flag. A generated `try` therefore does
- *   ev = v_error_value();   /* clears g_err * /
- * immediately after the failing body, before running the handler.
+ * after the dispatch must not see the flag. A generated `try` therefore calls
+ * v_error_value() immediately after the failing body, before running the
+ * handler. Spelled in prose rather than as a nested C comment because an
+ * embedded comment terminator closes this block comment early, and the stray
+ * text that follows is a -Wcomment warning on every single AOT compile.
  *
  * `kind` is always "runtime" here, and that is not a shortcut: the only errors
  * this runtime raises at run time are runtime errors, so the constant is what

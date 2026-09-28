@@ -568,8 +568,39 @@ fn find_line_end(buf: &[u8]) -> Option<(usize, usize)> {
     buf.iter().position(|&b| b == b'\n').map(|i| (i, i + 1))
 }
 
+/// Classify an OS I/O failure into AINL's OWN stable wording.
+///
+/// The host's `io::Error` Display is deliberately NOT interpolated into the
+/// message. That string is `strerror` output: errno 61 is `ECONNREFUSED` on
+/// macOS/BSD and errno 111 on Linux, and each platform formats it differently
+/// (`Connection refused (os error 61)`). Once a `catch` can bind the message,
+/// that spelling becomes observable and non-portable — the same program on the
+/// same machine would produce a different caught value per backend. Mapping to
+/// a fixed table here keeps the diagnostic detail (what failed, and why) while
+/// making the bytes AINL's own.
+///
+/// Applied at this one function so all eight call sites change together.
+fn io_reason(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused => "connection refused",
+        ErrorKind::ConnectionReset => "connection reset by peer",
+        ErrorKind::ConnectionAborted => "connection aborted",
+        ErrorKind::NotConnected => "not connected",
+        ErrorKind::AddrInUse => "address in use",
+        ErrorKind::AddrNotAvailable => "address not available",
+        ErrorKind::PermissionDenied => "permission denied",
+        ErrorKind::TimedOut => "timed out",
+        ErrorKind::UnexpectedEof => "unexpected end of stream",
+        ErrorKind::BrokenPipe => "broken pipe",
+        ErrorKind::AlreadyExists => "already exists",
+        ErrorKind::WouldBlock => "would block",
+        _ => "i/o error",
+    }
+}
+
 fn io_error(what: &str, e: &std::io::Error) -> Error {
-    Error::runtime(format!("http: {what} failed: {e}"))
+    Error::runtime(format!("http: {what} failed: {}", io_reason(e)))
 }
 
 /// The parsed response, before it becomes an AINL value.

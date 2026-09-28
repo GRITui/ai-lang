@@ -105,15 +105,20 @@ impl Js {
             self.needed.insert("_AinlError");
             self.needed.insert("_Hash");
         }
-        // AINL-level `error` must throw the type `catch` looks for.
-        if self.needed.contains("_error") {
-            self.needed.insert("_AinlError");
-        }
         // The list/hash/file builtins below all validate their arguments and raise
         // AINL's own message instead of letting a host TypeError escape. `catch`
         // binds that message, so a host one would be a cross-backend divergence on
         // the error path. The builtin passes its own name in because AINL's wording
         // leads with it (`first expects list, got int`).
+        //
+        // This pass runs BEFORE the `_error` -> `_AinlError` rule below, because
+        // it is what can insert `_error` in the first place: a program that only
+        // reaches `_error` indirectly (through a `(len x)` type guard, say) has
+        // no `error` form and no `try`, yet still generates a
+        // `throw new _AinlError(...)` from `_error`. Checking `_error` before
+        // this loop would miss it and the program would fail at RUN time with
+        // `ReferenceError: _AinlError is not defined` — on the error path, which
+        // is exactly the path `try` exists to exercise.
         for n in [
             "_add",
             "_sub",
@@ -142,6 +147,11 @@ impl Js {
                 self.needed.insert("_error");
                 self.needed.insert("_ainl_tname");
             }
+        }
+        // AINL-level `error` must throw the type `catch` looks for. Runs after
+        // the loop above, which is what can insert `_error` indirectly.
+        if self.needed.contains("_error") {
+            self.needed.insert("_AinlError");
         }
         // The list builtins guard through `_alist`, the hash ones through `_ahash`.
         for n in ["_first", "_rest", "_cons", "_push"] {
@@ -941,8 +951,16 @@ const RUNTIME: &[(&str, &str)] = &[
         // construction — every backend prints a map in insertion order, and
         // `message` before `kind` is what makes the caught value byte-identical
         // across all five.
+        //
+        // `_Hash.from(pairs)`, NOT `new _Hash(pairs)`: `_Hash extends Array`, and
+        // the `Array` constructor given a single non-numeric argument produces an
+        // array HOLDING that argument — `new Array(pairs)` is `[pairs]`, not
+        // `pairs`. So `new _Hash(pairs)` built a ONE-element hash whose only
+        // "pair" was the whole pairs array, every `(get e "message")` missed, and
+        // a program that caught ten errors printed ten `nil`. `_Hash.from` is the
+        // flattening call this file's own `_assoc`/`_keys` already use.
         "_caught",
-        "function _caught(e) { return new _Hash([[\"message\", String(e.message)], [\"kind\", \"runtime\"]]); }",
+        "function _caught(e) { return _Hash.from([[\"message\", String(e.message)], [\"kind\", \"runtime\"]]); }",
     ),
     (
         // The `try` itself. A dedicated helper (rather than an inline

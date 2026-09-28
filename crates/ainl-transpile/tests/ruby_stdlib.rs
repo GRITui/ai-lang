@@ -272,7 +272,12 @@ fn path_base_does_not_use_rubys_split_which_drops_trailing_empties() {
 
 #[test]
 fn stdlib_runtime_is_omitted_when_unused() {
-    let out = rb("(+ 1 2)");
+    // `(print "hi")` genuinely needs no arithmetic and no type-name helper.
+    // `(+ 1 2)` no longer qualifies: it routes through `_add`, which calls
+    // `_ainl_tname` (to name a bad operand) and `_ainl_tname` branches on
+    // AHash, so those are now correctly emitted. See ruby.rs's
+    // `hash_runtime_omitted_when_unused` for the same reasoning.
+    let out = rb(r#"(print "hi")"#);
     for helper in [
         "_read_file",
         "_write_file",

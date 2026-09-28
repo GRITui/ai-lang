@@ -723,7 +723,7 @@ impl Gen {
         // `v_error_value()` both builds the caught hash and clears `g_err`, so
         // the flag is consumed exactly once, by the innermost `catch` that
         // sees it — which is what makes nested `try` pick the innermost handler.
-        self.emit_code(&format!("if (g_err) {{\n"));
+        self.emit_code("if (g_err) {\n");
         let ev = self.fresh();
         self.emit_code(&format!("Value {ev} = v_error_value();\n"));
         // `scope_define` takes ownership of one ref of the value, so `ev` is

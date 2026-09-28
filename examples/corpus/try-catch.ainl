@@ -1,0 +1,105 @@
+; @example   try-catch
+; @summary   Handling a failure that CAN happen, without dying.
+; @teaches   try, catch, error, get, error messages
+; @scope     portable
+; @expect    reached the end without dying
+; @run       ainl run examples/corpus/try-catch.ainl
+;
+; CATCHING A FAILURE THAT CAN HAPPEN.
+;
+; The example beside this one, `error-handling`, is about failures you should
+; AVOID: check before you act, and reserve `error` for a broken invariant. This
+; one is the other half — the failure you EXPECT and must carry on past.
+;
+; A runtime error is catchable:
+;
+;     (try body... (catch (e) handler...))
+;
+; If `body` succeeds its value is the value of the whole form. If it raises,
+; `e` is bound to the error, the handler runs, and ITS value is the value of
+; the whole form. So `try` is an ordinary expression, and the natural way to
+; write it is to bind the result:
+;
+;     (def status (try (risky-thing) (catch (e) "fallback")))
+;
+; `e` is a map with two keys, in this order: "message" (a string) and "kind"
+; (the string "runtime"). The order is part of the contract — every backend
+; prints a map in insertion order, so `message` first is what makes a caught
+; value print identically everywhere.
+
+; --- the smallest useful catch --------------------------------------------
+; Division by zero is a runtime error, and it is the clearest demonstration:
+; the body cannot produce a value at all, so only the handler can.
+;
+; The success case uses `+` rather than `/` deliberately. AINL's `/` is float
+; division and JavaScript has only one number type, so `(/ 10 2)` prints 5.0 on
+; four backends and 5 on the fifth — a known, pre-existing divergence that this
+; example is marked `portable` and must not rest on. The caught-error line
+; below is unaffected: the division never produces a value to print.
+(print "1+2 =" (try (+ 1 2) (catch (e) "unreachable")))
+(print "10/0 =" (try (/ 10 0) (catch (e) (str "caught: " (get e "message")))))
+
+; A caught error is a NORMAL VALUE. It can be stored, carried and read later,
+; which is what makes `try` usable as a building block and not just a guard.
+(def saved (try (error "the disk is full") (catch (e) e)))
+(print "stored:" (get saved "message") "kind:" (get saved "kind"))
+
+; --- the pattern: a value or a reason -------------------------------------
+; This is the ordinary shape — attempt the operation, and if it cannot be done,
+; return a stated alternative instead of propagating. Reading a file is the
+; canonical case, because a missing file is an expected outcome of any program
+; that takes a path from a user, not a malfunction.
+(def path "ainl-corpus-does-not-exist.txt")
+
+(def contents
+  (try (read-file path)
+       (catch (e) nil)))
+
+(if (= contents nil)
+  (do
+    (print "could not read" path "->" (get (try (read-file path) (catch (e) e)) "message"))
+    nil)
+  (print "read" (len contents) "bytes"))
+
+; Note the shape above: the FALLBACK is `nil`, and the diagnostic is computed
+; separately. That is deliberate. If the handler had to both report and produce
+; a usable value, a caller would have to unwrap a two-field result to find out
+; whether the operation worked — and a string that reads like a message is
+; indistinguishable from data. Return the value you want; report separately.
+
+; --- one catch, many attempts ----------------------------------------------
+; Because a `try` is an expression, a loop body can contain several and the
+; loop simply continues. This is the shape a health check or a batch import
+; needs: a failure on item N must not cost you items N+1..n.
+(def paths (list "a-missing-file.txt" "another-missing.txt" "still-missing"))
+(def results (list))
+(def i 0)
+(while (< i (len paths))
+  (def p (nth paths i))
+  (def outcome (try (read-file p)
+                   (catch (e) (str "FAILED: " (get e "message")))))
+  (def results (push results outcome))
+  (def i (+ i 1)))
+(print "batch:" results)
+(print "reached the end without dying")
+
+; --- nesting: the innermost catch wins -------------------------------------
+; When a `try` is inside another `try`, the inner handler sees the error first
+; and the outer one never runs — unless the inner handler itself raises, in
+; which case the error propagates OUT to the outer `catch`.
+(print "nested:"
+  (try (try (error "inner")
+            (catch (e) (str "inner handled: " (get e "message"))))
+       (catch (e) "outer must not run")))
+
+; --- when NOT to catch -----------------------------------------------------
+; `catch` is for a failure the program can meaningfully continue past. It is
+; not a way to make a bug quiet: swallowing an error you did not expect leaves
+; a program that runs to completion having done nothing useful, and the
+; diagnostic is the only thing that would have told you. A broken invariant
+; should still call `error` and exit non-zero — see `error-handling`.
+;
+; That is the whole discipline: `try` for the expected, `error` for the
+; impossible, and a check before either when the check is cheap.
+(print "done")
+(exit 0)

@@ -45,6 +45,7 @@ comment   ::= ";" ... end-of-line          ; ignored
 | `and` | `(and a b ...)` | Short-circuit; returns first falsey or the last value. |
 | `or` | `(or a b ...)` | Short-circuit; returns first truthy or `false`. |
 | `import` | `(import "m.ainl")` / `(import "m.ainl" as m)` | Top-level only. Loads a module file and binds its top-level `def`s into this file's scope, or one name `m` holding a map of them. See §3b. |
+| `try` | `(try body... (catch (e) handler...))` | Run `body`; on a runtime error bind it to `e` and run `handler`. Opens a scope (§2a). See §3e. |
 
 `import` is the one special form that is not an expression: it produces
 bindings, not a value, and it is resolved before any other form runs.
@@ -58,9 +59,10 @@ every other form evaluates its sub-forms directly in the scope it was itself
 evaluated in:
 
 | Form | Opens a new scope? |
-|------|---|
+|------|-------------------|
 | `fn` (a fresh one per call) | **Yes** |
 | `let` | **Yes** |
+| `try` (each side gets its own, as siblings) | **Yes** |
 | `if`, `do`, `while`, `and`, `or` | No — they share the caller's scope |
 
 The consequence: `def` inside `if`/`do`/`while`/`and`/`or` **mutates** whatever
@@ -560,6 +562,113 @@ transpilers. The only difference is the one §5a already documents: the
 interpreter and the VM append a position, because they hold the source, and the
 AOT binary does not, because it embeds none. The **message body is identical
 everywhere**, which is what `test_parity.rs` asserts.
+
+## 3e. Error handling: `try` / `catch`
+
+```lisp
+(try
+  body-form ...
+  (catch (e) handler-form ...))
+```
+
+If `body` succeeds, `try` returns the body's last value and the handler never
+runs. If any form in `body` raises, `e` is bound to the error and the handler
+runs; `try` returns the handler's last value.
+
+```lisp
+(print (try (+ 1 2) (catch (e) "unreachable")))        ; => 3
+(print (try (/ 1 0) (catch (e) (get e "message"))))    ; => division by zero
+(print (try (error "boom") (catch (e) e)))             ; => {"message" "boom" "kind" "runtime"}
+```
+
+Both sides are **value sequences**, not single expressions, and `try` itself is
+an ordinary expression — `(def status (try … (catch (e) …)))` is the natural
+form, and it works. In *expression* position a side may only be one form, the
+same limit `let` has; the transpilers say so rather than silently dropping a
+form.
+
+### The value `e` binds to
+
+`e` is a **map with exactly two keys, in this order**:
+
+| Key | Value |
+|-----|-------|
+| `message` | the error message, a `str` |
+| `kind` | `"runtime"` |
+
+The key **order is part of the contract**. Every backend prints a map in
+insertion order, and `message` before `kind` is what makes a printed caught
+value byte-identical across all five backends. Do not build the map yourself
+with `hash` and rely on your backend's ordering — use `try`/`catch`.
+
+`kind` is derived from the **error variant**, not from the error instance. Only
+`"runtime"` is reachable by `catch`, because a lex or parse error stops the
+program before any of it runs.
+
+### Message bodies are AINL's, not the host's
+
+A `catch` binds a message that a program may compare or print, so the bytes
+have to be the same on every backend and on every operating system. Two rules
+follow, and both are load-bearing:
+
+- **No OS error text.** `http-get` to a dead port reports
+  `http: cannot connect to 127.0.0.1:1 failed: connection refused`. The reason
+  is AINL's own wording, mapped from the OS error class — *not* `strerror`
+  output. `Connection refused (os error 61)` is macOS spelling, and the same
+  failure is errno 111 spelled differently on Linux. Parse a caught `message`
+  by AINL's text; the OS detail is deliberately not there.
+- **No host exception text.** `read-file` on a missing path reports
+  `read-file: cannot read 'x.txt'` on all backends, not Python's
+  `FileNotFoundError`, JS's `ENOENT` object or Ruby's `Errno::ENOENT`.
+
+### Nesting, scope, and what a `try` is a scope for
+
+Nested `try` works and the **innermost `catch` wins** — the inner handler runs
+and the error does not reach the outer one.
+
+`try` opens a scope, like `let` and not like `do`. The body and the handler each
+get a fresh child of the *enclosing* scope, and they are **siblings**: a `def`
+in the body is not visible to the handler. This matters when the body fails
+partway, because a handler then cannot read a half-initialised binding from the
+form that threw. A `def` in a *successful* body is likewise invisible outside
+the `try`.
+
+An error raised **by the handler** is not caught by that same `try`; it
+propagates outward to the next enclosing `try`, and if there is none it ends the
+program.
+
+`try` may appear anywhere a form may appear: on its own, inside `fn`, `let`,
+`while`, or another `try`.
+
+### An uncaught error is unchanged
+
+An error no `try` handles still prints to stderr as
+`runtime error: <message> at line L, col C (byte B)` and exits non-zero. Nothing
+about the failure path changed; `catch` only adds a way to handle one.
+
+Each `try` body also gets a fresh step budget, the same rule a top-level run
+and a REPL submission get — so an inner runaway loop is reported as a caught
+error rather than escaping to the top.
+
+### Backend scope: all four
+
+`try`/`catch` is supported on **all four backends**. The message body of a
+caught error is byte-identical across the interpreter, the VM, the AOT C
+runtime, and the Python, JS and Ruby transpilers.
+
+**The AOT unwind** is result-threading, not `setjmp`/`longjmp`. The C runtime
+already funnels every failure through `set_err` → `g_err`, so the error channel
+exists; what a generated `try` adds is a dispatch to the handler when that flag
+is set, and `v_error_value()` clears the flag as it builds the caught map — so
+code after the dispatch does not re-see it. `setjmp`/`longjmp` was rejected
+because it would skip the refcount release of every `Value` temporary in the
+body, leaking heap on every caught error — in exactly the loop a health-check
+runs in.
+
+**One deliberate difference.** An unbound symbol is a *compile-time* failure in
+Python, JS and Ruby, so a `catch` cannot intercept it there; the interpreter
+and VM fail at run time and `catch` does see it. A program that relies on
+catching an unbound symbol is therefore interpreter/VM-only.
 
 ## 4. Canonical examples
 

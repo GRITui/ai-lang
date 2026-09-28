@@ -322,3 +322,48 @@ fn an_error_from_a_builtin_inside_a_nested_call_is_caught() {
         "read-file: cannot read 'definitely-not-here.txt'",
     );
 }
+
+#[test]
+fn the_health_checker_scenario_is_now_expressible() {
+    // The e2e scenario the Tier 3 anchor named: probe a list of ports, catch
+    // the dead ones, report per port, and KEEP GOING. Before `try` a single
+    // dead port killed the whole run at exit 1 and the ports after it were
+    // never probed — which is why this program could not be written at all.
+    //
+    // Ports 1/2/3 are all dead on a stock machine, so every one is caught; the
+    // point is that the loop completes and the value is a list, not a crash.
+    // The whole program runs in both evaluators, which is what makes this a
+    // statement about `try` and not about a particular port being closed.
+    both(
+        r#"(def ports (list 1 2 3))
+           (def results (list))
+           (def i 0)
+           (while (< i (len ports))
+             (def p (nth ports i))
+             (def status (try (http-get (str "http://127.0.0.1:" p "/health"))
+                              (catch (e) "000")))
+             (def results (push results (str p "=" status)))
+             (def i (+ i 1)))
+           results"#,
+        r#"("1=000" "2=000" "3=000")"#,
+    );
+}
+
+#[test]
+fn a_caught_connection_failure_carries_no_os_error_text() {
+    // The 4-backend rule applied to the OS error string. `Connection refused
+    // (os error 61)` is macOS `strerror` output: errno 61 is ECONNREFUSED on
+    // macOS/BSD and 111 on Linux, and each host formats it differently. Once a
+    // `catch` can bind the message, that spelling is observable and the same
+    // program would produce a different caught value per platform. The reason
+    // must therefore be AINL's own wording.
+    let got = vm(r#"(try (http-get "http://127.0.0.1:1/x") (catch (e) (get e "message")))"#);
+    assert_eq!(
+        got, "http: cannot connect to 127.0.0.1:1 failed: connection refused",
+        "the caught message must be AINL's wording, not the OS's"
+    );
+    assert!(
+        !got.contains("os error") && !got.contains("errno"),
+        "the OS error text leaked into a catchable message: {got:?}"
+    );
+}

@@ -154,16 +154,20 @@ impl Py {
             self.needed.insert("_AinlError");
             self.needed.insert("_Hash");
         }
-        // AINL-level `error` must raise the type `catch` looks for. Asking for
-        // `_error` alone would emit the raise without the class it raises.
-        if self.needed.contains("_error") {
-            self.needed.insert("_AinlError");
-        }
         // The checked helpers call `_error` and `_ainl_tname` by name, and
         // `_ainl_tname` itself branches on `_Hash`/`_Sym`, so both must be
         // emitted first. RUNTIME is emitted in declaration order, and the
         // helper cluster is declared ABOVE the type-name helper, so ordering
         // here is what keeps the generated module importable.
+        //
+        // This pass runs BEFORE the `_error` -> `_AinlError` rule below,
+        // because it is what can insert `_error` in the first place: a program
+        // that only reaches `_error` indirectly (through a `(len x)` type
+        // guard, say) has no `error` form and no `try`, yet still generates a
+        // `raise _AinlError(...)` from `_error`. Checking `_error` before this
+        // loop would miss it, and the program would fail at RUN time with
+        // `NameError: name '_AinlError' is not defined` — on the error path,
+        // which is exactly the path `try` exists to exercise.
         for n in [
             "_add", "_sub", "_mul", "_div", "_mod", "_alist", "_ahash", "_len", "_first", "_rest",
             "_nth", "_cons", "_push", "_get", "_assoc", "_has", "_keys", "_vals",
@@ -172,6 +176,11 @@ impl Py {
                 self.needed.insert("_error");
                 self.needed.insert("_ainl_tname");
             }
+        }
+        // AINL-level `error` must raise the type `catch` looks for. Asking for
+        // `_error` alone would emit the raise without the class it raises.
+        if self.needed.contains("_error") {
+            self.needed.insert("_AinlError");
         }
         // The list builtins all guard through `_alist`; the hash ones through
         // `_ahash`. Pulling the right predicate in is what keeps a program that
@@ -314,6 +323,17 @@ impl Py {
         let params = python_params(params_node)?;
         self.line(&format!("def {name}({params}):"));
         self.indent += 1;
+        // A `& rest` parameter must hold an AINL LIST, not Python's tuple.
+        // `def sum(*xs)` binds a tuple, and every AINL list builtin refuses
+        // one — `(len xs)`, `(first xs)` and `(rest xs)` all raise "expects
+        // list, got ?", where `?` is `_ainl_tname` failing to name a type that
+        // should not exist. Converting here keeps the rest parameter an
+        // ordinary AINL value, so the program behaves the same as it does in
+        // the interpreter. The slice keeps a 0-arg call binding `[]` rather
+        // than `None`, matching `(fn (& xs) ...)` called with no arguments.
+        if let Some(rest) = rest_param(params_node)? {
+            self.line(&format!("{rest} = list({rest})"));
+        }
         if body.is_empty() {
             self.line("return None");
         } else {
@@ -814,6 +834,27 @@ fn python_params(params_node: &Node) -> Result<String> {
     Ok(shared::parse_params(params_node, "*", sanitize)?.join(", "))
 }
 
+/// The name of the `& rest` parameter, if the parameter list has one.
+///
+/// Reported separately from `python_params` because the caller needs to emit
+/// something for it beyond the parameter itself: a Python `*rest` binds a
+/// tuple, and an AINL rest parameter is a list.
+fn rest_param(params_node: &Node) -> Result<Option<String>> {
+    let Node::List(param_nodes, _) = params_node else {
+        return Err(Error::runtime("fn params must be a list"));
+    };
+    let Some(i) = param_nodes
+        .iter()
+        .position(|n| matches!(n, Node::Sym(p, _) if p == "&"))
+    else {
+        return Ok(None);
+    };
+    match param_nodes.get(i + 1) {
+        Some(Node::Sym(rest, _)) => Ok(Some(sanitize(rest))),
+        _ => Err(Error::runtime("'&' must be followed by a rest parameter")),
+    }
+}
+
 /// Turn an AINL symbol into a valid Python identifier.
 fn sanitize(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
@@ -1040,8 +1081,16 @@ const RUNTIME: &[(&str, &str)] = &[
         // The check is `type(x) in (int, float)` rather than `isinstance`,
         // because Python's bool is a subclass of int and `(true + 1)` must
         // report `got bool` — the same message the other backends give.
+        //
+        // The fold is a plain loop, NOT `sum(xs)`. AINL names a function
+        // `sum` with no difficulty (`(def sum (fn (& xs) ...))` is in
+        // examples/hello.ainl), and a module-level `def sum` shadows the
+        // builtin for the WHOLE module — including inside `_add`. Calling
+        // `sum(xs)` there re-entered the AINL function with a tuple, and the
+        // program died with "expected a number, got ?" instead of adding its
+        // arguments. A loop has no name to collide with.
         "_add",
-        "def _add(*xs):\n    for x in xs:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n    return sum(xs)",
+        "def _add(*xs):\n    for x in xs:\n        if type(x) not in (int, float): _error('expected a number, got ' + _ainl_tname(x))\n    r = 0\n    for x in xs: r += x\n    return r",
     ),
     (
         "_mul",
