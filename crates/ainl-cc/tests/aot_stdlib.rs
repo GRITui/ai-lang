@@ -66,16 +66,39 @@ fn compile_aot(src: &str, name: &str) -> PathBuf {
     bin
 }
 
+/// Run a program under the interpreter.
+///
+/// The source goes in a file rather than through `ainl eval` so the program
+/// text is identical to what the AOT compiler sees, and so `exit`'s code comes
+/// back the same way. The filename must be unique per call: these tests run in
+/// parallel threads, and a shared path would mean one test's `ainl run` reading
+/// whichever source another test wrote last.
 fn interpreter(src: &str) -> std::process::Output {
-    // A file rather than `ainl eval` so the program text is identical to what
-    // the AOT compiler sees, and so `exit`'s code comes back the same way.
-    let path = std::env::temp_dir().join("ainl-aot-stdlib-interp.ainl");
-    std::fs::write(&path, src).expect("write .ainl");
-    Command::new(ainl_bin())
+    let (ok, path) = run_interpreter(src);
+    assert!(ok, "could not stage interpreter input");
+    let out = Command::new(ainl_bin())
         .arg("run")
         .arg(&path)
         .output()
-        .expect("run ainl")
+        .expect("run ainl");
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+/// Write `src` to a uniquely-named temp .ainl file. The path is derived from the
+/// process id and a counter, which is enough to keep parallel tests apart on a
+/// single machine (they share a temp dir) without pulling in a random-number
+/// dependency.
+fn run_interpreter(src: &str) -> (bool, PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "ainl-aot-stdlib-interp-{}-{n}.ainl",
+        std::process::id()
+    ));
+    let ok = std::fs::write(&path, src).is_ok();
+    (ok, path)
 }
 
 /// The first line of a failed run's stderr, normalized for the one difference
