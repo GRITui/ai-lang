@@ -1,10 +1,10 @@
-# Release pipeline (C5).
+# Release pipeline (C5 + Stage 3.2 packaging).
 #
 # Triggered by pushing a `v*` tag. Builds both release assets natively —
 # Linux x86_64 musl on an ubuntu runner (musl links statically by default;
 # no Docker/cross needed) and macOS aarch64 on an arm64 runner — verifies
 # the Linux artifact is fully static, smoke-tests both binaries, packages
-# them, and attaches them to a GitHub release.
+# them, generates SHA256SUMS, and attaches everything to a GitHub release.
 #
 # Repeatable: cut a new release by bumping the workspace version in
 # Cargo.toml, committing, and pushing the next `v*` tag.
@@ -20,6 +20,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The tag as pushed, e.g. "v0.3.0". Asset names embed this verbatim
+  # (ainl-v0.3.0-<target>.tar.gz), so it must keep its leading "v" — deriving
+  # a second variable here is how "ainl-vv0.3.0" happens.
+  TAG: ${{ github.ref_name }}
 
 jobs:
   linux-musl:
@@ -27,6 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Baked into the binary by crates/ainl-cli/build.rs so `ainl --version`
+          # reports the exact revision an artifact was built from. Without
+          # fetch-depth 0 the clone is shallow and the commit is unavailable.
+          fetch-depth: 0
 
       - name: Install Rust (stable + musl target)
         uses: dtolnay/rust-toolchain@stable
@@ -45,7 +54,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-musl-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-musl-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       - name: Build static release binary
         run: cargo build --release --target x86_64-unknown-linux-musl
@@ -63,17 +72,22 @@ jobs:
           LDD_OUT=$(ldd "$BIN" 2>&1)
           echo "$LDD_OUT" | grep -Eq "not a dynamic executable|statically linked"
 
-      - name: Smoke test (ainl eval '(* 6 7)' == 42)
+      # The real self-diagnostic, not a one-liner: on a release runner the
+      # binary must pass its own doctor, which covers the interpreter, the
+      # stdlib, the grammar export, all three transpilers, and the generated C.
+      - name: Self-test (ainl doctor)
+        run: ./target/x86_64-unknown-linux-musl/release/ainl doctor
+      - name: Provenance (ainl --version must name this commit)
         run: |
-          OUT=$(./target/x86_64-unknown-linux-musl/release/ainl eval '(* 6 7)')
-          echo "eval output: $OUT"
-          [ "$OUT" = "42" ]
+          OUT=$(./target/x86_64-unknown-linux-musl/release/ainl --version)
+          echo "$OUT"
+          echo "$OUT" | grep -q "${GITHUB_SHA::12}"
+          echo "$OUT" | grep -q "x86_64-unknown-linux-musl"
 
       - name: Package
         run: |
-          V=${GITHUB_REF_NAME#v}
           T=x86_64-unknown-linux-musl
-          D=ainl-v${V}-${T}
+          D=ainl-v${TAG}-${T}
           mkdir "$D"
           cp target/$T/release/ainl "$D/ainl"
           cp README.md LICENSE-MIT LICENSE-APACHE "$D/"
@@ -83,14 +97,16 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ format('ainl-{0}-x86_64-unknown-linux-musl', github.ref_name) }}
-          path: ${{ format('ainl-{0}-x86_64-unknown-linux-musl.tar.gz', github.ref_name) }}
+          name: ainl-${{ github.ref_name }}-x86_64-unknown-linux-musl
+          path: ainl-v${{ env.TAG }}-x86_64-unknown-linux-musl.tar.gz
 
   macos:
     name: macOS aarch64
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -102,21 +118,23 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Smoke test (ainl eval '(* 6 7)' == 42)
+      - name: Self-test (ainl doctor)
+        run: ./target/release/ainl doctor
+      - name: Provenance (ainl --version must name this commit)
         run: |
-          OUT=$(./target/release/ainl eval '(* 6 7)')
-          echo "eval output: $OUT"
-          [ "$OUT" = "42" ]
+          OUT=$(./target/release/ainl --version)
+          echo "$OUT"
+          echo "$OUT" | grep -q "${GITHUB_SHA::12}"
+          echo "$OUT" | grep -q "aarch64-apple-darwin"
 
       - name: Package
         run: |
-          V=${GITHUB_REF_NAME#v}
-          D=ainl-v${V}-aarch64-apple-darwin
+          D=ainl-v${TAG}-aarch64-apple-darwin
           mkdir "$D"
           cp target/release/ainl "$D/ainl"
           cp README.md LICENSE-MIT LICENSE-APACHE "$D/"
@@ -126,8 +144,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ format('ainl-{0}-aarch64-apple-darwin', github.ref_name) }}
-          path: ${{ format('ainl-{0}-aarch64-apple-darwin.tar.gz', github.ref_name) }}
+          name: ainl-${{ github.ref_name }}-aarch64-apple-darwin
+          path: ainl-v${{ env.TAG }}-aarch64-apple-darwin.tar.gz
 
   release:
     name: GitHub release
@@ -141,6 +159,29 @@ jobs:
         with:
           path: dist
 
+      # One checksums file over BOTH assets, computed in a single place so the
+      # two platform jobs cannot disagree about what was published. Paths are
+      # flattened first: download-artifact nests them under the artifact name,
+      # and a SHA256SUMS naming a path is useless to `shasum -c`.
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p sums
+          find dist -name '*.tar.gz' -exec cp {} sums/ \;
+          cd sums
+          ls -l
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "== SHA256SUMS =="
+          cat SHA256SUMS
+          # Every asset must appear exactly once, or a release ships with an
+          # asset the installer cannot verify.
+          n_tgz=$(ls *.tar.gz | wc -l)
+          n_sums=$(wc -l < SHA256SUMS)
+          echo "assets=$n_tgz sums=$n_sums"
+          [ "$n_tgz" = "$n_sums" ]
+          # Self-check: the file we are about to publish must actually verify.
+          sha256sum -c SHA256SUMS
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -148,4 +189,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "AINL ${GITHUB_REF_NAME}" \
             --notes-file RELEASE_NOTES.md \
-            dist/*/*.tar.gz
+            sums/*.tar.gz sums/SHA256SUMS
