@@ -151,39 +151,39 @@ Measured on Apple Silicon / macOS 26.2, clang `-O2`
 
 | Engine | 40k sum-to loop | vs tree-walk |
 |---|---|---|
-| AINL tree-walk (in-process) | 34.8 ms | 1.0× |
+| AINL tree-walk (in-process) | 35.4 ms | 1.0× |
 | AINL bytecode VM (in-process) | 5.9 ms | ~6× |
-| **AINL AOT (whole process)** | **2.20 ms** | **~16×** |
-| native Rust equivalent (whole process) | 1.79 ms | ~19× |
+| **AINL AOT (whole process)** | **2.25 ms** | **~16×** |
+| native Rust equivalent (whole process) | 1.77 ms | ~20× |
 
-So the "on par with Rust" pillar holds: **the AOT binary is within 1.23× of a
+So the "on par with Rust" pillar holds: **the AOT binary is within 1.27× of a
 hand-written Rust program** for the same loop (target was ≤2×).
 
-### Why 1.23×, when the loop itself is 30× faster than the interpreter
+### Why ~1.27×, when the loop itself is 50× faster than the interpreter
 
-Of the AOT binary's 2.20 ms, **1.56 ms is process startup** — fork, exec, dynamic
+Of the AOT binary's 2.25 ms, **1.56 ms is process startup** — fork, exec, dynamic
 link, libc init. That floor is measured directly, not estimated: a trivial
 compiled program (`(print 1)`) costs 1.56 ms, and the same harness measures
-1.87 ms for the Rust equivalent. Subtracting it:
+1.76 ms for the Rust equivalent. Subtracting it:
 
 | | AOT | Rust |
 |---|---|---|
-| total (whole process) | 2.20 ms | 1.79 ms |
-| process startup floor | 1.56 ms | 1.87 ms |
-| **compute only (total − floor)** | **0.64 ms** | **not resolvable** |
+| total (whole process) | 2.25 ms | 1.77 ms |
+| process startup floor | 1.56 ms | 1.76 ms |
+| **compute only (total − floor)** | **0.69 ms** | **not resolvable** |
 
-AOT compute-only is 0.64 ms = **~54× the tree-walk**
+AOT compute-only is 0.69 ms = **~51× the tree-walk**
 (`crates/ainl-cc/tests/aot_perf.rs` asserts this ≥30× gate).
 
-The Rust compute column is deliberately blank. Its startup floor (1.87 ms) came
-out *above* its total (1.79 ms), so the subtraction goes negative: the Rust
-loop's entire work is below this harness's noise floor, and quoting a compute
-ratio against it would be inventing precision. What the data does support is the
-whole-process figure — **AOT 2.20 ms vs Rust 1.79 ms, i.e. 1.23×** — because
-that is the number a user of either program actually pays, and both sides are
-measured the same way. A dynamically-typed, refcounted value model with a tag
-check on every arithmetic op will not match a bare `i64` loop; the AOT backend
-is within 2× of Rust for the same program, which was the target.
+The Rust compute column is deliberately blank. Its startup floor (1.76 ms) came
+out within noise of its total (1.77 ms), so the subtraction is ~0.01 ms — the
+Rust loop's entire work is below this harness's noise floor, and quoting a
+compute ratio against it would be inventing precision. What the data does
+support is the whole-process figure — **AOT 2.25 ms vs Rust 1.77 ms, i.e.
+1.27×** — because that is the number a user of either program actually pays, and
+both sides are measured the same way. A dynamically-typed, refcounted value
+model with a tag check on every arithmetic op will not match a bare `i64` loop;
+the AOT backend is within 2× of Rust for the same program, which was the target.
 
 **Methodology note.** These process-inclusive numbers are measured with
 `scripts/execbench.c` (fork+exec the target from C, no intermediate process).
@@ -233,7 +233,7 @@ hardcoded string), `aot_perf.rs` (the ≥30× compute gate).
   in a hot loop that symbol is built and immediately discarded. Calling
   `v_sym()` per iteration re-ran the intern-table probe (FNV hash + `strcmp`)
   for a constant. Hoisting each distinct def name to one file-scope `static`
-  initialized once at startup took the loop from 28.7× to 53.6× the tree-walk —
+  initialized once at startup took the loop from 28.7× to ~51× the tree-walk —
   a 1.6× win from deleting pure waste.
 
 ### Safety property preserved
