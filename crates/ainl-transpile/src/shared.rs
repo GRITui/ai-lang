@@ -21,9 +21,11 @@ pub(crate) trait ExprEmit {
 }
 
 /// `(op a b c...)` -> `(a op b op c)`, with `identity` for the 0-arg case and
-/// no parens for the 1-arg case. Used for `+`/`*` everywhere, and for
-/// `and`/`or` on the two targets (JS, Ruby) with no native chained form —
-/// the shape is identical either way.
+/// no parens for the 1-arg case. Used for `+`/`*` everywhere.
+///
+/// NOT for `and` / `or` on any target — those are [`logic`], because joining
+/// their operands with the host operator decides the answer with host
+/// truthiness, and AINL has its own.
 pub(crate) fn infix<E: ExprEmit>(
     e: &mut E,
     args: &[Node],
@@ -35,6 +37,42 @@ pub(crate) fn infix<E: ExprEmit>(
         0 => Ok(identity.to_string()),
         1 => Ok(parts.into_iter().next().unwrap()),
         _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
+    }
+}
+
+/// `(and a b c…)` / `(or a b c…)` -> a short-circuit on **AINL** truthiness.
+///
+/// Two reasons this cannot be [`infix`] with `&&` / `||`:
+///
+/// * AINL says only `nil` and `false` are falsey, so `0` and `""` are TRUTHY.
+///   Every host used here treats both as falsey, and a chain written with the
+///   host operator would therefore stop early on values AINL considers true —
+///   `(and 0 "x")` answers `"x"` here and `0` in the interpreter.
+/// * The host operator returns an *operand*, not a boolean. So the answer is
+///   not merely the wrong truthiness reading but a different VALUE: `(or 0 "")`
+///   returns `0` under `||` and `""` in AINL.
+///
+/// So each operand but the last is coerced through `_truthy` — the target's
+/// local name for the AINL predicate — and the last is returned as-is, which is
+/// what makes the chain a genuine short-circuit rather than a boolean fold.
+pub(crate) fn logic<E: ExprEmit>(e: &mut E, args: &[Node], op: &str) -> Result<String> {
+    let parts = e.expr_all(args)?;
+    match parts.len() {
+        // The identities: `(and)` is `true` and `(or)` is `false`.
+        0 => Ok(if op == "and" { "true" } else { "false" }.to_string()),
+        1 => Ok(parts.into_iter().next().unwrap()),
+        _ => {
+            let last = &parts[parts.len() - 1];
+            let mut head = format!("_truthy({})", parts[0]);
+            for p in &parts[1..parts.len() - 1] {
+                head.push_str(&format!(" {op} _truthy({p})"));
+            }
+            Ok(if op == "and" {
+                format!("(({head}) && {last})")
+            } else {
+                format!("(({head}) || {last})")
+            })
+        }
     }
 }
 

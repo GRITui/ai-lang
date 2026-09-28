@@ -89,6 +89,12 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     // the `enum` in runtime.c is extended in exactly the same order, and
     // crates/ainl-cc/tests/aot_stdlib.rs checks both directions.
     ("test", 54),
+    /* Tier 3 collections. Appending keeps every earlier id at the value it has
+     * always had — the three tables (this, the enum in runtime.c, and the
+     * runtime's name table) are pinned against each other by
+     * crates/ainl-cc/tests/aot_stdlib.rs. `map` / `filter` / `reduce` are
+     * special forms, not builtins, so they have no id. */
+    ("sort", 55),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).
@@ -122,6 +128,13 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
 /// is exactly what `crates/ainl-cc/tests/aot_stdlib.rs` enforces, and the rule
 /// is documented for users in docs/SYNTAX.md §5a "Error messages".
 pub fn generate(forms: &[Node]) -> Result<String> {
+    // Lower the `map` / `filter` / `reduce` special forms before anything else
+    // looks at the tree (see ainl_core::collection_forms). The interpreter and
+    // the VM do the same, so all six backends compile the *same* loop rather
+    // than each re-deriving it. Done before the interpreter-only scan so a
+    // program that only used these forms is not misreported.
+    let lowered = ainl_core::collection_forms::lower(forms);
+    let forms = &lowered[..];
     if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
         return Err(ainl_core::Error::runtime(format!(
             "ainl compile: `{sym}` is interpreter-only (found at byte {}) — \

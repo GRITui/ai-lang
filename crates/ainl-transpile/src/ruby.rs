@@ -23,6 +23,13 @@ pub fn transpile_ruby_src(src: &str) -> Result<String> {
 }
 
 pub fn transpile_ruby(forms: &[Node], src: &str) -> Result<String> {
+    // Lower `map` / `filter` / `reduce` before emitting (see
+    // ainl_core::collection_forms), so the loop is shared with every other
+    // backend. Without this, Ruby's own `map` — a method on Enumerable, so a
+    // bare `map(f, xs)` would be a NoMethodError, and an unhandled `(map f xs)`
+    // could bind to it in some other position — would be in scope for collision.
+    let lowered = ainl_core::collection_forms::lower(forms);
+    let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut rb = Rb {
         body: String::new(),
@@ -60,6 +67,13 @@ impl Rb {
         // in `_disp` and `_repr` — and it names a bad operand's type.
         if self.needed.contains("_test") {
             self.needed.insert("_ainl_tname");
+        }
+        // Tier 3 collections: `_sort` names AINL types in its errors and
+        // delegates the comparator's sign to `_cmp_sign`.
+        if self.needed.contains("_sort") {
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_cmp_sign");
+            self.needed.insert("_sort_key");
         }
         // `try`. `_ainl_try` needs `AinlError` (the `rescue` clause type) and
         // `_caught` (which builds the hash and needs `AHash`), and the RUNTIME
@@ -278,7 +292,7 @@ impl Rb {
         let Some((cond, body)) = args.split_first() else {
             return Err(Error::runtime("while expects (while cond body...)"));
         };
-        let c = self.expr(cond)?;
+        let c = self.cond(cond)?;
         self.line(&format!("while {c}"));
         self.indent += 1;
         for f in body {
@@ -303,7 +317,7 @@ impl Rb {
     fn stmt_if(&mut self, args: &[Node]) -> Result<()> {
         match args {
             [cond, then] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if {c}"));
                 self.indent += 1;
                 self.stmt(then)?;
@@ -312,7 +326,7 @@ impl Rb {
                 Ok(())
             }
             [cond, then, els] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if {c}"));
                 self.indent += 1;
                 self.stmt(then)?;
@@ -346,8 +360,8 @@ impl Rb {
                 ">" => return shared::cmp(self, args, ">"),
                 "<=" => return shared::cmp(self, args, "<="),
                 ">=" => return shared::cmp(self, args, ">="),
-                "and" => return shared::infix(self, args, "&&", "true"),
-                "or" => return shared::infix(self, args, "||", "false"),
+                "and" => return shared::logic(self, args, "&&"),
+                "or" => return shared::logic(self, args, "||"),
                 "not" => return shared::unary(self, args, "!"),
                 "mod" => return self.infix_mod(args),
                 "if" => return self.expr_if(args),
@@ -388,6 +402,12 @@ impl Rb {
                 // all four backends. `_test` compares the *rendered* value,
                 // which is the same thing the assertion spells.
                 "test" => return self.call_builtin("_test", args, Some("_test")),
+                // ---- Tier 3 collections ----
+                // `map` / `filter` / `reduce` are special forms lowered to loops
+                // before emit. Deliberately no arm: `map` is an Enumerable
+                // method in Ruby, and an emitted bare `map(...)` would be a
+                // NoMethodError rather than anything meaningful.
+                "sort" => return self.call_builtin("_sort", args, Some("_sort")),
                 // ---- Stage 3.1 stdlib ----
                 // Each maps to the host's own idiom (File.read, ENV[],
                 // Time.now.to_i, sleep, Math.sqrt) so the emitted Ruby reads like
@@ -610,13 +630,26 @@ impl Rb {
         Ok(format!("_mod({x}, {y})"))
     }
 
+    /// AINL's condition, as a host boolean.
+    ///
+    /// NOT `self.expr(cond)`. Ruby's `if` uses host truthiness, and although
+    /// Ruby happens to agree with AINL about `0` and `""` (both truthy in both),
+    /// agreement by luck is not agreement: Ruby's only falsey values are `nil`
+    /// and `false`, which is AINL's rule by coincidence, not by contract. Naming
+    /// it makes the rule explicit, keeps Ruby in step if the hosts are ever
+    /// swapped, and silences Ruby's `string literal in condition` warning.
+    fn cond(&mut self, node: &Node) -> Result<String> {
+        self.need("_truthy");
+        Ok(format!("_truthy({})", self.expr(node)?))
+    }
+
     fn expr_if(&mut self, args: &[Node]) -> Result<String> {
         let (cond, then, els) = match args {
             [c, t] => (c, t, None),
             [c, t, e] => (c, t, Some(e)),
             _ => return Err(Error::runtime("if expects (if cond then [else])")),
         };
-        let c = self.expr(cond)?;
+        let c = self.cond(cond)?;
         let t = self.expr(then)?;
         let e = match els {
             Some(e) => self.expr(e)?,
@@ -815,6 +848,10 @@ fn ruby_str(s: &str) -> String {
 }
 
 const RUNTIME: &[(&str, &str)] = &[
+    (
+        "_truthy",
+        "def _truthy(x)\n  # AINL: only `nil` and `false` are falsey. `0` and `\"\"` are TRUTHY. Ruby\n  # agrees today, but by coincidence rather than by contract, so every `if`\n  # and every `and`/`or` chain goes through this rather than the host's rules.\n  return false if x.nil?\n  return false if x == false\n  true\nend",
+    ),
     // A map is an array of [k, v] pairs; this subclass exists only so
     // `_disp` can tell a hash apart from a plain list at print time (a print
     // call can't otherwise know a variable's AINL-level type). Ruby's
@@ -833,6 +870,27 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_test",
         "def _test(name, actual, expected)\n  raise RuntimeError, 'test expects a str name, got ' + _ainl_tname(name) unless name.is_a?(String)\n  raise RuntimeError, 'test expects a str expected value, got ' + _ainl_tname(expected) unless expected.is_a?(String)\n  got = _disp(actual)\n  return true if got == expected\n  raise RuntimeError, \"test failed: #{name}: expected #{expected}, got #{got}\"\nend",
+    ),
+    // ---- Tier 3 collections: `sort` ----
+    //
+    // Ruby's `Array#sort` IS stable and `sort_by` is NOT, so neither can be
+    // used for the comparator form: `sort_by { |v| ... }` would break the
+    // stability guarantee the card requires, on this host alone. The comparator
+    // form therefore uses `sort` with a two-element key of [sign, original
+    // index], and the default form uses `sort_by` over an explicit
+    // [class-tag, value, index] triple — the index is what makes the order
+    // independent of Ruby's `sort_by` instability.
+    (
+        "_sort_key",
+        "def _sort_key(x)\n  return [0, x, ''] if x.is_a?(Numeric)\n  return [1, 0, x] if x.is_a?(String)\n  raise RuntimeError, 'sort expects a list of numbers or of strings, got a list mixing ' + _ainl_tname(x) + ' and ?'\nend",
+    ),
+    (
+        "_cmp_sign",
+        "def _cmp_sign(f, a, b)\n  r = f.call(a, b)\n  raise RuntimeError, 'sort comparator must return a number, got ' + _ainl_tname(r) unless r.is_a?(Numeric)\n  return -1 if r < 0\n  return 1 if r > 0\n  0\nend",
+    ),
+    (
+        "_sort",
+        "def _sort(*args)\n  if args.length == 2\n    cmpf = args[0]\n    xs = args[1]\n    raise RuntimeError, 'sort expects a fn, got ' + _ainl_tname(cmpf) unless cmpf.respond_to?(:call)\n  elsif args.length == 1\n    cmpf = nil\n    xs = args[0]\n  else\n    raise RuntimeError, 'sort expects (sort list) or (sort fn list)'\n  end\n  raise RuntimeError, 'sort expects a list, got ' + _ainl_tname(xs) unless xs.is_a?(Array)\n  if cmpf.nil?\n    # A pre-pass, but ONLY for the default form. A key alone cannot see a MIXED\n    # list: tagging numbers before strings with a leading 0/1 would happily\n    # order [1, 'a']. The interpreter and the C runtime reject that, so the check\n    # runs before any ordering. The comparator form is exempt — a comparator is\n    # exactly how a program sorts a list of records, and the interpreter and the\n    # C runtime only type-check in the default form.\n    unless xs.empty?\n      first = _sort_key(xs[0])[0]\n      xs.each do |v|\n        if _sort_key(v)[0] != first\n          raise RuntimeError, 'sort expects a list of numbers or of strings, got a list mixing ' + _ainl_tname(xs[0]) + ' and ' + _ainl_tname(v)\n        end\n      end\n    end\n    # `_sort_key` puts a number's value in slot 1 and a string's bytes in slot 2,\n    # with the other slot neutral ('' / 0). Since the pre-pass proved the list is\n    # all one type, comparing [tag, slot1, slot2, index] orders numbers by value\n    # and strings bytewise. The trailing index is the stability rule: equal\n    # elements keep their input order.\n    return xs.each_with_index.sort_by { |v, i| k = _sort_key(v); [k[0], k[1], k[2], i] }.map { |v, _i| v }\n  end\n  # `sort` (not `sort_by`): on a tie the lower original index wins, which is the\n  # stability rule, stated rather than inherited from the host.\n  xs.each_with_index.sort { |(av, ai), (bv, bi)| c = _cmp_sign(cmpf, av, bv); c.zero? ? (ai <=> bi) : c }.map { |v, _i| v }\nend",
     ),
     ("_str", "def _str(*xs)\n  xs.map { |x| _disp(x) }.join(\"\")\nend"),
     // Type guards shared by the list and hash builtins.

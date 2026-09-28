@@ -22,6 +22,12 @@ pub fn transpile_js_src(src: &str) -> Result<String> {
 }
 
 pub fn transpile_js(forms: &[Node], src: &str) -> Result<String> {
+    // Lower `map` / `filter` / `reduce` before emitting (see
+    // ainl_core::collection_forms), so the loop is shared with every other
+    // backend. Note this also keeps AINL's `map` from colliding with
+    // `Array.prototype.map` in the generated code.
+    let lowered = ainl_core::collection_forms::lower(forms);
+    let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut js = Js {
         body: String::new(),
@@ -59,6 +65,13 @@ impl Js {
         // in `_disp`, `_repr`, `_Hash` and `_Sym`.
         if self.needed.contains("_test") {
             self.needed.insert("_typename");
+        }
+        // Tier 3 collections: `_sort` names AINL types in its errors and
+        // delegates the comparator's sign to `_cmp_sign`.
+        if self.needed.contains("_sort") {
+            self.needed.insert("_typename");
+            self.needed.insert("_cmp_sign");
+            self.needed.insert("_sort_key");
         }
         let disp_used = self.needed.iter().any(|n| {
             matches!(
@@ -410,7 +423,7 @@ impl Js {
     fn stmt_if(&mut self, args: &[Node], ret: bool) -> Result<()> {
         match args {
             [cond, then] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if ({c}) {{"));
                 self.indent += 1;
                 self.stmt(then, ret)?;
@@ -425,7 +438,7 @@ impl Js {
                 Ok(())
             }
             [cond, then, els] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if ({c}) {{"));
                 self.indent += 1;
                 self.stmt(then, ret)?;
@@ -459,8 +472,8 @@ impl Js {
                 ">" => return shared::cmp(self, args, ">"),
                 "<=" => return shared::cmp(self, args, "<="),
                 ">=" => return shared::cmp(self, args, ">="),
-                "and" => return shared::infix(self, args, "&&", "true"),
-                "or" => return shared::infix(self, args, "||", "false"),
+                "and" => return shared::logic(self, args, "&&"),
+                "or" => return shared::logic(self, args, "||"),
                 "not" => return shared::unary(self, args, "!"),
                 "mod" => {
                     let [a, b] = args else {
@@ -510,6 +523,12 @@ impl Js {
                 // all four backends. `_test` compares the *rendered* value,
                 // which is the same thing the assertion spells.
                 "test" => return self.call_builtin("_test", args, Some("_test")),
+                // ---- Tier 3 collections ----
+                // `map` / `filter` / `reduce` are special forms lowered to loops
+                // before emit, so there is deliberately no arm for them: JS has
+                // its own `Array.prototype.map`/`filter`, and letting AINL's
+                // names reach those would silently change the meaning.
+                "sort" => return self.call_builtin("_sort", args, Some("_sort")),
                 // ---- Stage 3.1 stdlib ----
                 // Each maps to the host's own idiom (fs.readFileSync,
                 // process.env, Date.now()/1000, Math.sqrt) so the emitted JS
@@ -643,13 +662,28 @@ impl Js {
             [c, t, e] => (c, t, Some(e)),
             _ => return Err(Error::runtime("if expects (if cond then [else])")),
         };
-        let c = self.expr(cond)?;
+        let c = self.cond(cond)?;
         let t = self.expr(then)?;
         let e = match els {
             Some(e) => self.expr(e)?,
             None => "null".to_string(),
         };
         Ok(format!("({c} ? {t} : {e})"))
+    }
+
+    /// AINL's condition, as a host boolean.
+    ///
+    /// NOT `self.expr(cond)`. JavaScript's `?:` uses host truthiness, and AINL
+    /// disagrees with it about two values: `0` and `""` are TRUTHY in AINL, and
+    /// falsey in JS. Emitting the condition bare would make `(if 0 "t" "f")`
+    /// answer `f` here and `t` in the interpreter, the VM, the C runtime and
+    /// Ruby — four backends against one. The `filter` builtin's predicate is the
+    /// case that matters: a port that inherits host truthiness drops every `0`
+    /// and `""` from the result, silently.
+    fn cond(&mut self, node: &Node) -> Result<String> {
+        // Any `if` needs `_truthy`, in both statement and expression position.
+        self.need("_truthy");
+        Ok(format!("_truthy({})", self.expr(node)?))
     }
 
     /// `try` in expression position — `(def status (try … (catch (e) …)))` is
@@ -878,6 +912,10 @@ fn js_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym { constructor(name) { this.name = name; } }"),
     ("_sym", "function _sym(s) { return new _Sym(s); }"),
+    (
+        "_truthy",
+        "function _truthy(x) {\n  // AINL: only `nil` and `false` are falsey. `0` and `\"\"` are TRUTHY, which\n  // is where AINL parts company with JS — both are falsey here. Every `if` in\n  // the emitted program goes through this, so the two languages cannot\n  // disagree about a condition.\n  if (x === null || x === undefined) return false;\n  if (x === false) return false;\n  return true;\n}",
+    ),
     // A map is an array of [k, v] pairs; this subclass exists only so
     // `_disp` can tell a hash apart from a plain list at print time (a
     // print call can't otherwise know a variable's AINL-level type).
@@ -902,6 +940,26 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_test",
         "function _test(name, actual, expected) {\n  if (typeof name !== \"string\") throw new Error(\"test expects a str name, got \" + _typename(name));\n  if (typeof expected !== \"string\") throw new Error(\"test expects a str expected value, got \" + _typename(expected));\n  const got = _disp(actual);\n  if (got === expected) return true;\n  throw new Error(\"test failed: \" + name + \": expected \" + expected + \", got \" + got);\n}",
+    ),
+    // ---- Tier 3 collections: `sort` ----
+    //
+    // `Array.prototype.sort` is specified stable from ES2019, but the spec says
+    // nothing about *how* to compare, and the defaults diverge: JS orders
+    // strings by UTF-16 code unit, while the interpreter orders by byte. So the
+    // comparator is supplied explicitly in both forms and the stability rule is
+    // made independent of the host by decorating each element with its original
+    // index and breaking ties on it.
+    (
+        "_sort_key",
+        "function _sort_key(x) {\n  if (typeof x === \"number\") return [0, x, \"\"];\n  if (typeof x === \"string\") return [1, 0, x];\n  _error(\"sort expects a list of numbers or of strings, got a list mixing \" + _typename(x) + \" and ?\");\n}",
+    ),
+    (
+        "_cmp_sign",
+        "function _cmp_sign(f, a, b) {\n  const r = f(a, b);\n  if (typeof r !== \"number\") _error(\"sort comparator must return a number, got \" + _typename(r));\n  return r < 0 ? -1 : (r > 0 ? 1 : 0);\n}",
+    ),
+    (
+        "_sort",
+        "function _sort(...args) {\n  let cmpf = null, xs;\n  if (args.length === 2) { cmpf = args[0]; xs = args[1]; if (typeof cmpf !== \"function\") _error(\"sort expects a fn, got \" + _typename(cmpf)); }\n  else if (args.length === 1) { xs = args[0]; }\n  else { _error(\"sort expects (sort list) or (sort fn list)\"); }\n  if (!Array.isArray(xs) || xs instanceof _Hash) _error(\"sort expects a list, got \" + _typename(xs));\n  const n = xs.length;\n  const idx = new Array(n);\n  for (let i = 0; i < n; i++) idx[i] = i;\n  if (cmpf === null) {\n    // A pre-pass, because a key alone cannot see a MIXED list: tagging numbers\n    // before strings with a leading 0/1 would happily order [1, \"a\"]. The\n    // interpreter and the C runtime reject it, so the check runs first.\n    if (n > 0) {\n      const first = _sort_key(xs[0])[0];\n      for (let i = 0; i < n; i++) {\n        if (_sort_key(xs[i])[0] !== first) _error(\"sort expects a list of numbers or of strings, got a list mixing \" + _typename(xs[0]) + \" and \" + _typename(xs[i]));\n      }\n    }\n    idx.sort((p, q) => { const a = _sort_key(xs[p]), b = _sort_key(xs[q]); if (a[0] !== b[0]) return a[0] - b[0]; if (a[1] !== b[1]) return a[1] - b[1]; if (a[2] < b[2]) return -1; if (a[2] > b[2]) return 1; return p - q; });\n  } else {\n    idx.sort((p, q) => { const c = _cmp_sign(cmpf, xs[p], xs[q]); return c !== 0 ? c : p - q; });\n  }\n  return idx.map((i) => xs[i]);\n}",
     ),
     ("_str", "function _str(...xs) { return xs.map(_disp).join(\"\"); }"),
     (

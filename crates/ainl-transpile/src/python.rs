@@ -29,6 +29,15 @@ pub fn transpile_python_src(src: &str) -> Result<String> {
 /// Transpile already-parsed forms to Python. `src` is used only for source-map
 /// line comments.
 pub fn transpile_python(forms: &[Node], src: &str) -> Result<String> {
+    // Lower `map` / `filter` / `reduce` to the `let` + `while` loops they are
+    // (see ainl_core::collection_forms) before emitting. Every backend does this,
+    // so the loop is written once and cannot drift between them — and this
+    // emitter never needs a Python-specific `map`/`filter`/`reduce`, which
+    // would otherwise silently bind to the *host's* builtins of those names
+    // (Python's `map` returns an iterator, Ruby's `map` is a method). Lowering
+    // first is what keeps `(map f xs)` meaning AINL's `map` on every backend.
+    let lowered = ainl_core::collection_forms::lower(forms);
+    let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut py = Py {
         body: String::new(),
@@ -68,6 +77,13 @@ impl Py {
         // in `_disp`, `_repr`, `_Hash` and `_Sym`.
         if self.needed.contains("_test") {
             self.needed.insert("_typename");
+        }
+        // `_sort` reports AINL type names in its errors, and the comparator form
+        // delegates the sign to `_cmp_sign`.
+        if self.needed.contains("_sort") {
+            self.needed.insert("_typename");
+            self.needed.insert("_cmp_sign");
+            self.needed.insert("_sort_key");
         }
         // Resolve runtime dependencies: the display cluster references `_Sym`,
         // and `_sym` (from quoted symbols) needs the `_Sym` class.
@@ -431,7 +447,7 @@ impl Py {
     fn stmt_if(&mut self, args: &[Node], ret: bool) -> Result<()> {
         match args {
             [cond, then] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if {c}:"));
                 self.indent += 1;
                 self.stmt(then, ret)?;
@@ -446,7 +462,7 @@ impl Py {
                 Ok(())
             }
             [cond, then, els] => {
-                let c = self.expr(cond)?;
+                let c = self.cond(cond)?;
                 self.line(&format!("if {c}:"));
                 self.indent += 1;
                 self.stmt(then, ret)?;
@@ -531,6 +547,14 @@ impl Py {
                 // all four backends. `_test` compares the *rendered* value,
                 // which is the same thing the assertion spells.
                 "test" => return self.call_builtin("_test", args, Some("_test")),
+                // ---- Tier 3 collections ----
+                // `map` / `filter` / `reduce` are special forms lowered to
+                // loops before emit, so there is no arm for them here — and
+                // deliberately so: Python has its own `map`/`filter`, and
+                // binding AINL's names to the host's would silently change
+                // the meaning (the host's `map` is a lazy iterator, not a
+                // list). `sort` is a real builtin in every backend.
+                "sort" => return self.call_builtin("_sort", args, Some("_sort")),
                 // ---- Stage 3.1 stdlib ----
                 // The multi-arg / statement-shaped ones get bespoke arms; the
                 // rest reuse call_builtin. Each maps to the host's own idiom
@@ -669,12 +693,37 @@ impl Py {
         Ok(format!("({})", parts.join(&format!(" {op} "))))
     }
 
+    /// AINL's `and` / `or`, which short-circuit on AINL truthiness.
+    ///
+    /// NOT the host operator. `(and 0 "x")` is `"x"` in AINL — `0` is truthy, so
+    /// the chain continues — but `0` in Python, because `0` is falsey there. The
+    /// host operator also returns an OPERAND rather than a boolean, so
+    /// `(or 0 "")` would answer `0` here and `""` in the interpreter: a different
+    /// value, not just a different truthiness reading. Routing both operands
+    /// through `_truthy` and returning the original makes the chain a genuine
+    /// short-circuit.
     fn chain_logic(&mut self, args: &[Node], op: &str) -> Result<String> {
         let parts = self.expr_all(args)?;
         match parts.len() {
+            // The identities: `(and)` is `true` and `(or)` is `false`, not nil.
             0 => Ok(if op == "and" { "True" } else { "False" }.to_string()),
             1 => Ok(parts.into_iter().next().unwrap()),
-            _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
+            _ => {
+                self.need("_truthy");
+                // Every operand but the last is coerced to a host boolean; the
+                // last is returned as-is, which is what makes `(or 0 "")` answer
+                // `""` rather than `False`.
+                let mut out = format!("_truthy({})", parts[0]);
+                for p in &parts[1..parts.len() - 1] {
+                    out.push_str(&format!(" {op} _truthy({p})"));
+                }
+                let last = &parts[parts.len() - 1];
+                if op == "and" {
+                    Ok(format!("(({out}) and {last})"))
+                } else {
+                    Ok(format!("(({out}) or {last})"))
+                }
+            }
         }
     }
 
@@ -684,13 +733,28 @@ impl Py {
             [c, t, e] => (c, t, Some(e)),
             _ => return Err(Error::runtime("if expects (if cond then [else])")),
         };
-        let c = self.expr(cond)?;
+        let c = self.cond(cond)?;
         let t = self.expr(then)?;
         let e = match els {
             Some(e) => self.expr(e)?,
             None => "None".to_string(),
         };
         Ok(format!("({t} if {c} else {e})"))
+    }
+
+    /// AINL's condition, as a host boolean.
+    ///
+    /// NOT `self.expr(cond)`. Python's `if` uses host truthiness, and AINL
+    /// disagrees with it about two values: `0` and `""` are TRUTHY in AINL, and
+    /// falsey in Python. Emitting the condition bare would make `(if 0 "t" "f")`
+    /// answer `f` here and `t` in the interpreter, the VM, the C runtime and
+    /// Ruby — four backends against one. The `filter` builtin's predicate is the
+    /// case that matters: a port that inherits host truthiness drops every `0`
+    /// and `""` from the result, silently.
+    fn cond(&mut self, node: &Node) -> Result<String> {
+        // Any `if` needs `_truthy`, in both statement and expression position.
+        self.need("_truthy");
+        Ok(format!("_truthy({})", self.expr(node)?))
     }
 
     /// `try` in expression position — `(def status (try … (catch (e) …)))` is
@@ -947,6 +1011,10 @@ fn python_str(s: &str) -> String {
 const RUNTIME: &[(&str, &str)] = &[
     ("_Sym", "class _Sym(str):\n    pass"),
     ("_sym", "def _sym(s):\n    return _Sym(s)"),
+    (
+        "_truthy",
+        "def _truthy(x):\n    # AINL: only `nil` and `false` are falsey. `0` and `\"\"` are TRUTHY, which\n    # is where AINL parts company with Python — `if 0` and `if \"\"` are falsey\n    # here. Every `if` in the emitted program goes through this, so the two\n    # languages cannot disagree about a condition.\n    if x is None: return False\n    if x is False: return False\n    return True",
+    ),
     // A map is a list of [k, v] pairs; this subclass exists only so `_disp`
     // can tell a hash apart from a plain list at print time (a print call
     // can't otherwise know a variable's AINL-level type).
@@ -971,6 +1039,37 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_test",
         "def _test(name, actual, expected):\n    if not isinstance(name, str) or isinstance(name, _Sym): raise RuntimeError('test expects a str name, got %s' % _typename(name))\n    if not isinstance(expected, str) or isinstance(expected, _Sym): raise RuntimeError('test expects a str expected value, got %s' % _typename(expected))\n    got = _disp(actual)\n    if got == expected: return True\n    raise RuntimeError('test failed: %s: expected %s, got %s' % (name, expected, got))",
+    ),
+    // ---- Tier 3 collections: `sort` ----
+    //
+    // Python's `sorted` is stable, so `key=` would be enough for the *order*,
+    // but three things are re-implemented by hand rather than delegated:
+    //
+    // * The default key. Python compares str by CODE POINT; the interpreter
+    //   orders by Rust's `str` Ord (byte order) and the C runtime by `strcmp`.
+    //   The three disagree on any non-ASCII string, so the key is
+    //   `s.encode('utf-8')` — the same decision `_list_dir` already makes.
+    // * Mixed-type rejection. Python's `<` between an int and a str raises a
+    //   host `TypeError` whose text is not AINL's; the check below raises the
+    //   interpreter's own message, so stderr stays byte-equal across backends.
+    // * The comparator's return type. A comparator returning a bool would
+    //   silently read as 0/1 and look like a working sort, so a non-number is
+    //   named instead.
+    //
+    // `sort_by_key` is decorated to carry the original index, which is what
+    // makes the stability guarantee explicit rather than inherited: on a tie
+    // the lower index wins, so equal elements keep their input order.
+    (
+        "_sort_key",
+        "def _sort_key(x):\n    if isinstance(x, (bool,)) or x is None: raise TypeError('sort expects a list of numbers or of strings, got a list mixing %s and ?' % _typename(x))\n    if isinstance(x, (int, float)): return (0, x, b'')\n    if isinstance(x, str) and not isinstance(x, _Sym): return (1, 0, x.encode('utf-8'))\n    raise TypeError('sort expects a list of numbers or of strings, got a list mixing %s and ?' % _typename(x))",
+    ),
+    (
+        "_sort",
+        "def _sort(*args):\n    if len(args) == 2:\n        cmpf, xs = args\n        if not callable(cmpf): raise TypeError('sort expects a fn, got %s' % _typename(cmpf))\n    elif len(args) == 1:\n        cmpf, xs = None, args[0]\n    else:\n        raise TypeError('sort expects (sort list) or (sort fn list)')\n    if not isinstance(xs, list): raise TypeError('sort expects a list, got %s' % _typename(xs))\n    if cmpf is None:\n        # A pre-pass, but ONLY for the default form (this branch). The key function alone cannot detect a MIXED list: numbering numbers before strings with a leading 0/1 tag would happily order [1, \"a\"] and return it. The interpreter and the C runtime reject the mixed list, so the rejection has to happen before any ordering. The comparator form is exempt -- a comparator is exactly how a program sorts a list of records, and the interpreter and C runtime only type-check in the default form.\n        if xs:\n            first = _sort_key(xs[0])\n            for v in xs:\n                if (_sort_key(v)[0] == 0) != (first[0] == 0):\n                    raise TypeError('sort expects a list of numbers or of strings, got a list mixing %s and %s' % (_typename(xs[0]), _typename(v)))\n        return [v for _, v in sorted(enumerate(xs), key=lambda p: (_sort_key(p[1]), p[0]))]\n    import functools\n    def _cmp(pa, pb):\n        # `< 0` keeps `pa` first, so on a tie the lower original index wins —\n        # the stability rule, made explicit rather than inherited from\n        # sorted()'s own guarantee.\n        c = _cmp_sign(cmpf, pa[1], pb[1])\n        return c if c != 0 else pa[0] - pb[0]\n    return [v for _, v in sorted(enumerate(xs), key=functools.cmp_to_key(_cmp))]",
+    ),
+    (
+        "_cmp_sign",
+        "def _cmp_sign(f, a, b):\n    r = f(a, b)\n    if isinstance(r, bool) or not isinstance(r, (int, float)): raise TypeError('sort comparator must return a number, got %s' % _typename(r))\n    return -1 if r < 0 else (1 if r > 0 else 0)",
     ),
     (
         // Type guards for the list and hash builtins.
