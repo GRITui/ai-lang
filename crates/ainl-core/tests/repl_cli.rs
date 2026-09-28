@@ -79,9 +79,27 @@ fn repl_stdin_args(args: &[&str], input: &str) -> Session {
         .expect("spawn ainl");
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
-        stdin
-            .write_all(input.as_bytes())
-            .expect("write to ainl stdin");
+        // A `BrokenPipe` here is NOT a test failure, and must not be reported as
+        // one. `ainl` rejects a bad flag and exits before this write lands —
+        // `an_unknown_flag_is_rejected_rather_than_ignored` does exactly that,
+        // and on a slow runner the write loses the race. The child's exit code
+        // and stderr are the assertion for that test; a pipe the child has
+        // already closed carries no information about them.
+        //
+        // It is a real, rare race rather than a Linux quirk: this failed on
+        // ubuntu-latest in CI while passing on macOS, and the fix is to not
+        // assert on the *transport* when the thing under test is the child's
+        // behavior.
+        if let Err(e) = stdin.write_all(input.as_bytes()) {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "writing stdin failed for a reason other than the child exiting: {e}"
+            );
+        }
+        // Closing stdin is what signals EOF to the REPL loop, and that write
+        // can fail the same way, so it is guarded for the same reason.
+        let _ = stdin.flush();
     }
     let out = child.wait_with_output().expect("wait for ainl");
     Session {
