@@ -602,6 +602,75 @@ fn aot_tier1_error_messages_are_identical_to_the_interpreters() {
 // ---- error-message identity (the card's "byte-for-byte" requirement) -------
 
 #[test]
+fn aot_json_error_messages_are_identical_to_the_interpreters() {
+    // The JSON reader and writer are a second, independent C implementation of
+    // the same spec, so an error path that exists on one side and not the other
+    // is exactly the bug this catches — and the *message* is what a user reads,
+    // so exit-code parity alone would not be enough. One case per rejection
+    // family, plus both non-finite and the non-string-key rule.
+    let cases: &[(&str, &str)] = &[
+        // Malformed documents.
+        (r#"(json-parse "{")"#, "j_open"),
+        (r#"(json-parse "[1,]")"#, "j_trailing_comma"),
+        (r#"(json-parse "{\"a\"}")"#, "j_no_colon"),
+        (r#"(json-parse "tru")"#, "j_partial_kw"),
+        (r#"(json-parse "01")"#, "j_leading_zero"),
+        (r#"(json-parse "1.")"#, "j_dot_no_digit"),
+        (r#"(json-parse "1e")"#, "j_exp_no_digit"),
+        // Trailing content.
+        (r#"(json-parse "1 2")"#, "j_trailing"),
+        // Strings.
+        (r#"(json-parse "\"unterminated")"#, "j_unterminated"),
+        (r#"(json-parse "\"\\q\"")"#, "j_bad_escape"),
+        (r#"(json-parse "\"\\u12\"")"#, "j_short_u"),
+        (r#"(json-parse "\"\\ud800\"")"#, "j_lone_hi"),
+        (r#"(json-parse "\"\\udc00\"")"#, "j_lone_lo"),
+        (r#"(json-parse "\"\\ud800\\u0041\"")"#, "j_bad_pair"),
+        // Argument types.
+        (r#"(json-parse 1)"#, "j_type"),
+        (r#"(json-parse nil)"#, "j_type_nil"),
+        // Values with no JSON form.
+        (r#"(json-serialize (quote sym))"#, "j_sym"),
+        (r#"(json-serialize (fn (x) x))"#, "j_fn"),
+        // AINL errors on a division by zero, so +inf is reached by overflow.
+        (r#"(json-serialize (+ 1e308 1e308))"#, "j_inf"),
+        (r#"(json-serialize (hash 1.5 "v"))"#, "j_key_type"),
+    ];
+    for (src, name) in cases {
+        assert_error_parity(src, name);
+    }
+}
+
+#[test]
+fn aot_json_stdout_is_identical_to_the_interpreters() {
+    // The float rule is where a JSON writer most easily diverges from the
+    // interpreter, because the C runtime already had a *different* float
+    // routine (format_float, a port of Value's Display) that it would be
+    // natural to reuse — and reusing it splits 1e300 in two. Each of these
+    // takes a different branch of the rule.
+    let cases: &[(&str, &str)] = &[
+        (r#"(print (json-serialize 0.5))"#, "j_half"),
+        (r#"(print (json-serialize (/ 1.0 3)))"#, "j_third"),
+        (r#"(print (json-serialize 1e21))"#, "j_big"),
+        (r#"(print (json-serialize 1e-7))"#, "j_small"),
+        (r#"(print (json-serialize 1e300))"#, "j_huge"),
+        (r#"(print (json-serialize 1.25e17))"#, "j_frac_big"),
+        (r#"(print (json-serialize 5e-324))"#, "j_subnormal"),
+        (
+            r#"(print (json-serialize (json-parse "{\"z\":1.5,\"a\":2.5}")))"#,
+            "j_order",
+        ),
+        (
+            r#"(print (json-serialize (json-parse "\"\\u00e9\\ud83d\\ude00\\u0007\"")))"#,
+            "j_escapes",
+        ),
+    ];
+    for (src, name) in cases {
+        assert_stdout_parity(src, name);
+    }
+}
+
+#[test]
 fn aot_stdlib_error_messages_are_identical_to_the_interpreters() {
     // One case per family: a rejected host disagreement, a type error, and an
     // arity error. If any of these messages drift apart, the C runtime is no

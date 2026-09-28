@@ -595,7 +595,7 @@ mod tests {
         builtin_json_parse(&[Value::str(s)])
     }
     fn ser(v: &Value) -> String {
-        match builtin_json_serialize(&[v.clone()]).expect("serialize") {
+        match builtin_json_serialize(std::slice::from_ref(v)).expect("serialize") {
             Value::Str(s) => s.as_str().to_string(),
             other => panic!("json-serialize returned {}", other.type_name()),
         }
@@ -1003,7 +1003,7 @@ mod tests {
                 code: None,
             })),
         ] {
-            let e = builtin_json_serialize(&[v.clone()]).unwrap_err();
+            let e = builtin_json_serialize(std::slice::from_ref(&v)).unwrap_err();
             assert!(
                 e.to_string().contains("json-serialize: cannot serialize"),
                 "unexpected message: {e}"

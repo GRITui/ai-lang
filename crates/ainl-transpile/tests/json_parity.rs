@@ -171,9 +171,8 @@ fn run(prog: &str, target: &str) -> Option<String> {
                 "js" => "node",
                 _ => "ruby",
             };
-            if which(host).is_none() {
-                return None;
-            }
+            // A host that is not installed is a skip, not a failure.
+            which(host)?;
             // `ainl transpile` writes the generated program to stdout, so it is
             // captured from the pipe and written to a path the host recognises.
             let out = match target {
