@@ -405,3 +405,51 @@ jobs:
 
       - name: Run conformance check (well-formed + ≥1000 fuzzed strings parse)
         run: python3 scripts/gbnf-conformance.py --count 1000
+
+  gen:
+    name: ainl gen (repair loop fires; GBNF matchers agree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keys on the Rust/C sources as well as Cargo.toml, because this
+          # cache restores `target/` — which holds *binaries*. A Cargo.toml-only
+          # key let a .rs-only change restore a stale `ainl`, and a test that
+          # shells out to that binary then silently compared against a build
+          # from before the change. Broader than strictly necessary (rustc does
+          # its own invalidation) but never stale.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The two GBNF membership implementations — the Rust one the command
+      # ships and the Python one the generation harness has always used — must
+      # agree on every committed generation, every hand-picked edge, and 800
+      # fuzz inputs. They already did not: the first run of this check
+      # reported 9 mismatches that were a framing bug in the checker itself
+      # (the "\n\0\n" separator terminated a trailing comment, so the two
+      # sides were being fed different bytes). A disagreement here is a real
+      # finding, not a flake, so it is a gate.
+      - name: Rust and Python GBNF matchers agree
+        run: python3 scripts/check-gbnf-rust.py --count 400
+
+      # The repair loop cannot be reached by a passing test against the real
+      # model, because the model is too reliable to fail on demand. This stands
+      # up a local stub that returns a program which dies at run time, and
+      # asserts the command feeds back model-readable text and succeeds on the
+      # retry. It also pins the two honesty guarantees: --no-probe must not
+      # claim the constraint was verified, and --grammar-field none must not
+      # claim a grammar was sent. No network, no API key.
+      - name: Repair loop fires, and the constraint report is honest
+        run: python3 scripts/check-gen-repair.py
