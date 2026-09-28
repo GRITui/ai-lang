@@ -26,7 +26,7 @@ pub fn transpile_js(forms: &[Node], src: &str) -> Result<String> {
     // ainl_core::collection_forms), so the loop is shared with every other
     // backend. Note this also keeps AINL's `map` from colliding with
     // `Array.prototype.map` in the generated code.
-    let lowered = ainl_core::collection_forms::lower(forms);
+    let lowered = ainl_core::collection_forms::lower(forms)?;
     let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut js = Js {
@@ -766,6 +766,10 @@ impl Js {
 }
 
 impl ExprEmit for Js {
+    fn need_truthy(&mut self) {
+        self.need("_truthy");
+    }
+
     fn expr(&mut self, node: &Node) -> Result<String> {
         match node {
             Node::Int(i, _) => Ok(i.to_string()),

@@ -528,7 +528,7 @@ fn a_program_with_no_collection_form_is_returned_unchanged() {
     // helper `def`s, no generated names, nothing.
     let src = "(def x 1) (+ x 1)";
     let forms = ainl_core::parse(src).unwrap();
-    let lowered = ainl_core::collection_forms::lower(&forms);
+    let lowered = ainl_core::collection_forms::lower(&forms).unwrap();
     assert_eq!(
         forms.len(),
         lowered.len(),
@@ -548,7 +548,7 @@ fn a_program_that_uses_one_gets_exactly_the_three_helpers() {
     // grow fifty copies of the loop.
     let src = "(map (fn (x) x) (list 1)) (map (fn (x) x) (list 2))";
     let forms = ainl_core::parse(src).unwrap();
-    let lowered = ainl_core::collection_forms::lower(&forms);
+    let lowered = ainl_core::collection_forms::lower(&forms).unwrap();
     assert_eq!(
         lowered.len(),
         5,
@@ -580,5 +580,41 @@ fn every_backend_lowers_through_the_same_function() {
     assert!(
         eval_src.contains("collection_forms::lower"),
         "the tree-walk must lower through the shared function"
+    );
+}
+
+#[test]
+fn a_non_function_operand_is_named_after_the_form_not_the_helper() {
+    // `fn`-as-data has to be a *checked* boundary, and the check has to name
+    // the form the reader wrote. Left to the desugared loop, `(map 5 …)` failed
+    // in five different ways and only one of them said "map":
+    //
+    //   interpreter  cannot call a int
+    //   python       'int' object is not callable
+    //   js           _ainl_f is not a function     <- the generated name
+    //
+    // The operand is checked before the rewrite, so all six evaluators raise
+    // the same message by construction. `message()` is compared, not the full
+    // error, because the interpreter additionally carries a position.
+    for (src, want) in [
+        ("(map 5 (list 1))", "map expects a fn, got int"),
+        ("(filter \"x\" (list 1))", "filter expects a fn, got str"),
+        ("(reduce 1.5 0 (list 1))", "reduce expects a fn, got float"),
+    ] {
+        let tree_err = run_in_tree_walk(src).expect_err(src).message().to_string();
+        assert_eq!(tree_err, want, "tree-walk, {src}");
+        let vm_err = run_str(src).expect_err(src).message().to_string();
+        assert_eq!(vm_err, want, "vm, {src}");
+    }
+}
+
+#[test]
+fn a_named_operand_is_still_allowed_because_it_may_hold_a_function() {
+    // The static check must not reject a bare symbol: that is what a callback
+    // normally looks like, and `(def dbl (fn (x) (* x 2)))` then
+    // `(map dbl …)` is the ordinary way to write this.
+    both(
+        r#"(def dbl (fn (x) (* x 2))) (map dbl (list 1 2 3))"#,
+        "(2 4 6)",
     );
 }

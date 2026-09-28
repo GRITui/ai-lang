@@ -36,7 +36,7 @@ pub fn transpile_python(forms: &[Node], src: &str) -> Result<String> {
     // would otherwise silently bind to the *host's* builtins of those names
     // (Python's `map` returns an iterator, Ruby's `map` is a method). Lowering
     // first is what keeps `(map f xs)` meaning AINL's `map` on every backend.
-    let lowered = ainl_core::collection_forms::lower(forms);
+    let lowered = ainl_core::collection_forms::lower(forms)?;
     let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut py = Py {
@@ -699,9 +699,16 @@ impl Py {
     /// the chain continues — but `0` in Python, because `0` is falsey there. The
     /// host operator also returns an OPERAND rather than a boolean, so
     /// `(or 0 "")` would answer `0` here and `""` in the interpreter: a different
-    /// value, not just a different truthiness reading. Routing both operands
-    /// through `_truthy` and returning the original makes the chain a genuine
-    /// short-circuit.
+    /// value, not just a different truthiness reading.
+    ///
+    /// So each operand becomes a host conditional rather than an operator
+    /// join — see [`crate::shared::logic`] for why that is the only shape that
+    /// returns an operand. Python spells the conditional `b if c else a`
+    /// (value first), where JS and Ruby spell it `c ? a : b`.
+    ///
+    /// `op` here is the AINL **form** name (`"and"` / `"or"`), the opposite of
+    /// what the shared helper takes; the two differ precisely because the
+    /// shared one has to know which host operator to emit and this one does not.
     fn chain_logic(&mut self, args: &[Node], op: &str) -> Result<String> {
         let parts = self.expr_all(args)?;
         match parts.len() {
@@ -710,19 +717,19 @@ impl Py {
             1 => Ok(parts.into_iter().next().unwrap()),
             _ => {
                 self.need("_truthy");
-                // Every operand but the last is coerced to a host boolean; the
-                // last is returned as-is, which is what makes `(or 0 "")` answer
-                // `""` rather than `False`.
-                let mut out = format!("_truthy({})", parts[0]);
-                for p in &parts[1..parts.len() - 1] {
-                    out.push_str(&format!(" {op} _truthy({p})"));
+                // Fold right, each earlier operand becoming a conditional
+                // against the rest. The falsey operand of `and` is the `else`
+                // arm, because that is the arm taken when it is falsey.
+                let is_and = op == "and";
+                let mut acc = parts[parts.len() - 1].clone();
+                for p in parts[..parts.len() - 1].iter().rev() {
+                    acc = if is_and {
+                        format!("({acc} if _truthy({p}) else {p})")
+                    } else {
+                        format!("({p} if _truthy({p}) else {acc})")
+                    };
                 }
-                let last = &parts[parts.len() - 1];
-                if op == "and" {
-                    Ok(format!("(({out}) and {last})"))
-                } else {
-                    Ok(format!("(({out}) or {last})"))
-                }
+                Ok(acc)
             }
         }
     }
@@ -876,6 +883,10 @@ impl Py {
 }
 
 impl ExprEmit for Py {
+    fn need_truthy(&mut self) {
+        self.need("_truthy");
+    }
+
     fn expr(&mut self, node: &Node) -> Result<String> {
         match node {
             Node::Int(i, _) => Ok(i.to_string()),

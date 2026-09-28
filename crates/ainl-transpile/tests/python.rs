@@ -18,9 +18,20 @@ fn function_becomes_def() {
 fn recursive_if_tail_returns_conditional() {
     let out = py("(def fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))");
     assert!(out.contains("def fib(n):"), "got:\n{out}");
-    // the tail `if` lowers to an if/else with returns in both branches
-    assert!(out.contains("if (n < 2):"), "got:\n{out}");
+    // the tail `if` lowers to an if/else with returns in both branches.
+    // The condition is wrapped in `_truthy` (not the bare host value): AINL
+    // treats `0` and `""` as TRUTHY, Python treats both as falsey, so an
+    // unguarded `if` would take the wrong branch on this target alone.
+    assert!(out.contains("if _truthy((n < 2)):"), "got:\n{out}");
     assert!(out.contains("return n"), "got:\n{out}");
+}
+
+#[test]
+fn if_uses_ainl_truthiness_not_pythons() {
+    // In Python both `0` and `""` are falsey; in AINL they are TRUTHY. A bare
+    // host `if` would make every `(if 0 ...)` take the else branch here only.
+    let out = py("(print (if 0 \"a\" \"b\"))");
+    assert!(out.contains("_truthy(0)"), "got:\n{out}");
 }
 
 #[test]
@@ -99,4 +110,34 @@ fn hash_runtime_omitted_when_unused() {
     assert!(!out.contains("def _hash("), "got:\n{out}");
     assert!(!out.contains("def _get("), "got:\n{out}");
     assert!(!out.contains("def _assoc("), "got:\n{out}");
+}
+
+#[test]
+fn and_or_return_an_operand_not_a_boolean() {
+    // AINL's `and` yields the first FALSEY OPERAND and `or` the first TRUTHY
+    // OPERAND. A host `and` / `or` yields an operand too, but only for the
+    // *last* one it evaluates and never with AINL's truthiness: `(or 0 "")` is
+    // `0` in AINL (`0` is truthy) and `False` in Python (`0` is falsey). So the
+    // chain is a host conditional — `b if c else a` — with every operand but
+    // the first guarded by `_truthy`.
+    let out = py(r#"(print (or 0 ""))"#);
+    assert!(
+        out.contains(r#"_print((0 if _truthy(0) else ""))"#),
+        "got:\n{out}"
+    );
+    // `(and nil false 3)` is `nil`, not `False`: the first falsey operand wins.
+    let out = py("(print (and nil false 3))");
+    assert!(
+        out.contains("_print(((3 if _truthy(False) else False) if _truthy(None) else None))"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn logic_emits_the_truthy_helper_it_calls() {
+    // `(and …)`/`(or …)` in a program with no `if` anywhere still has to ship
+    // the `_truthy` definition it references, or the emitted program dies with
+    // `NameError: name '_truthy' is not defined` at run time.
+    let out = py("(print (and a b))");
+    assert!(out.contains("def _truthy("), "got:\n{out}");
 }

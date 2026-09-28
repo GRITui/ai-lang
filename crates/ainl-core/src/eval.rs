@@ -262,7 +262,7 @@ pub fn run_forms(forms: &[Node], env: &Env) -> Result<Value> {
     // `def`s in front of the program, in an order where they are bound before
     // the first `map` call is evaluated. Rewriting node-by-node inside `eval`
     // would not: the use would be evaluated with the helper still unbound.
-    let lowered = crate::collection_forms::lower(forms);
+    let lowered = crate::collection_forms::lower(forms)?;
     let mut last = Value::Nil;
     for form in &lowered {
         last = eval(form, env)?;

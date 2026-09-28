@@ -67,6 +67,7 @@
 //! its stability is a stated property of each backend's code rather than an
 //! emergent consequence of a generated loop.
 
+use crate::error::{Error, Result};
 use crate::parser::{Node, Span};
 
 /// Generated locals, prefixed so they cannot capture a program variable.
@@ -131,7 +132,15 @@ pub fn rewrite(node: &Node) -> Option<Node> {
 /// A program that uses no collection form is returned **unchanged** — no
 /// prelude, no generated names in its output. That keeps `ainl ast` and the
 /// AOT / transpile output byte-identical to before for every existing program.
-pub fn lower(forms: &[Node]) -> Vec<Node> {
+///
+/// `Err` is a `map`/`filter`/`reduce` whose function operand is *statically*
+/// wrong — `(map 5 (list 1))`. It is reported here, before the rewrite,
+/// because the rewrite is what erases the evidence: the desugared loop would
+/// fail in five different ways depending on which backend noticed first, and
+/// three of the five would name a generated helper rather than the form the
+/// reader wrote. This runs before any backend sees the program, so all six
+/// evaluators produce the same message by construction.
+pub fn lower(forms: &[Node]) -> Result<Vec<Node>> {
     // Check the **original** forms, not `out`. A well-formed collection form has
     // already been rewritten into a call by this point, so scanning `out` for
     // one finds nothing and the helpers never get bound — the use then fails with
@@ -140,20 +149,99 @@ pub fn lower(forms: &[Node]) -> Vec<Node> {
     // program that *uses* a collection form must get the prelude either way, or
     // the real arity error would be buried under an unbound-helper error.
     let uses_collection = forms.iter().any(needs_prelude);
+    // The static operand check runs over the ORIGINAL forms, before the
+    // rewrite, because the rewrite is exactly what destroys the evidence.
+    check_operands(forms)?;
     let mut out: Vec<Node> = forms
         .iter()
         .map(|n| match rewrite(n) {
-            Some(r) => r,
-            None => lower_nested(n),
+            Some(r) => Ok(r),
+            None => Ok(lower_nested(n)),
         })
-        .collect();
+        .collect::<Result<_>>()?;
     if uses_collection {
         let span = forms.first().map(|f| f.span()).unwrap_or(Span::new(0, 0));
         let mut all = prelude(span);
         all.append(&mut out);
-        return all;
+        return Ok(all);
     }
-    out
+    Ok(out)
+}
+
+/// Reject a collection form whose function operand is **statically** not a
+/// function, anywhere in `forms`.
+///
+/// This is the `fn`-as-data type check, and it is here rather than in the
+/// generated loop because the rewrite is what erases the evidence. Left to the
+/// desugared helper, `(map 5 (list 1))` failed in five different ways depending
+/// on which backend noticed first:
+///
+/// ```text
+///   interpreter  runtime error: cannot call a int
+///   python       'int' object is not callable
+///   js           _ainl_f is not a function      <- leaks the generated name
+///   ruby         undefined method `call'
+/// ```
+///
+/// None of them names `map`, which is the word the reader wrote. Checked here,
+/// the message is one string produced once, before any backend sees the
+/// program, so all six evaluators agree by construction.
+///
+/// **A static check cannot be complete.** `(map x (list 1))` where `x` is a
+/// `def`-bound number is decided at run time and still reaches the helper's own
+/// error; this catches the operands a reader can see are wrong in the source,
+/// which is where a generated program is least helpful and the message matters
+/// most.
+fn check_operands(forms: &[Node]) -> Result<()> {
+    for f in forms {
+        check_operands_in(f)?;
+    }
+    Ok(())
+}
+
+fn check_operands_in(node: &Node) -> Result<()> {
+    let Node::List(items, _) = node else {
+        return Ok(());
+    };
+    if let Some(Node::Sym(op, _)) = items.first() {
+        if is_collection_form(op) {
+            // The arity comes first: a wrong-shaped form must still get the
+            // ordinary arity diagnostic, not a type complaint about a
+            // parameter that was never bound.
+            let arity = if op == "reduce" { 3 } else { 2 };
+            if items.len() == arity + 1 {
+                if let Some(why) = statically_not_callable(&items[1]) {
+                    // Plain `Error::runtime`, deliberately NOT `or_at`. This is
+                    // reported at transpile/compile time on the transpiler and
+                    // AOT targets, which embed no source, so §5a says they carry
+                    // no position — and a transpile-time error has no line to
+                    // point at anyway. The interpreter adds its own position
+                    // later, on the usual path.
+                    return Err(Error::runtime(format!("{op} expects a fn, got {why}")));
+                }
+            }
+        }
+    }
+    for n in items {
+        check_operands_in(n)?;
+    }
+    Ok(())
+}
+
+/// The type name to report for an operand that cannot be a function, or `None`
+/// when it might be one.
+///
+/// Deliberately narrow. A bare symbol is **not** rejected: `x` may well be a
+/// `def` holding a closure, and the whole point of `map` is that the callback
+/// is usually a name. Only the literal types that can never be callable are
+/// named here.
+fn statically_not_callable(f: &Node) -> Option<&'static str> {
+    match f {
+        Node::Int(..) => Some("int"),
+        Node::Float(..) => Some("float"),
+        Node::Str(..) => Some("str"),
+        _ => None,
+    }
 }
 
 /// True when `node` contains a collection form anywhere inside it.
@@ -199,9 +287,10 @@ fn lower_nested(node: &Node) -> Node {
 // expansion
 // ---------------------------------------------------------------------------
 
-/// Build the expansion for one well-formed form. `Err(())` means "not
-/// well-formed" — see [`rewrite`] for why that is not an error here.
-fn expand(op: &str, args: &[Node], span: Span) -> Result<Node, ()> {
+/// `Err(())` means "not well-formed" — see [`rewrite`] for why that is not an
+/// error here. This is [`Result`]-untyped on purpose: it is the *inner* shape
+/// of `rewrite`, which is an `Option`, and the arity path has no error to carry.
+fn expand(op: &str, args: &[Node], span: Span) -> std::result::Result<Node, ()> {
     match op {
         "map" | "filter" => {
             let [f, lst] = args else { return Err(()) };
@@ -435,10 +524,6 @@ fn call3(helper: &str, a: Node, b: Node, c: Node, span: Span) -> Node {
 
 fn sym(s: &str) -> Node {
     Node::Sym(s.to_string(), Span::new(0, 0))
-}
-
-fn nil(span: Span) -> Node {
-    Node::Sym("nil".to_string(), span)
 }
 
 fn first() -> Node {

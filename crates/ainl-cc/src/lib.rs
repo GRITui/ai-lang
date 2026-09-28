@@ -133,7 +133,7 @@ pub fn generate(forms: &[Node]) -> Result<String> {
     // the VM do the same, so all six backends compile the *same* loop rather
     // than each re-deriving it. Done before the interpreter-only scan so a
     // program that only used these forms is not misreported.
-    let lowered = ainl_core::collection_forms::lower(forms);
+    let lowered = ainl_core::collection_forms::lower(forms)?;
     let forms = &lowered[..];
     if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
         return Err(ainl_core::Error::runtime(format!(

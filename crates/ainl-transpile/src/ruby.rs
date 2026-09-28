@@ -28,7 +28,7 @@ pub fn transpile_ruby(forms: &[Node], src: &str) -> Result<String> {
     // backend. Without this, Ruby's own `map` — a method on Enumerable, so a
     // bare `map(f, xs)` would be a NoMethodError, and an unhandled `(map f xs)`
     // could bind to it in some other position — would be in scope for collision.
-    let lowered = ainl_core::collection_forms::lower(forms);
+    let lowered = ainl_core::collection_forms::lower(forms)?;
     let forms = &lowered[..];
     let idx = LineIndex::new(src);
     let mut rb = Rb {
@@ -733,6 +733,10 @@ impl Rb {
 }
 
 impl ExprEmit for Rb {
+    fn need_truthy(&mut self) {
+        self.need("_truthy");
+    }
+
     fn expr(&mut self, node: &Node) -> Result<String> {
         match node {
             Node::Int(i, _) => Ok(i.to_string()),

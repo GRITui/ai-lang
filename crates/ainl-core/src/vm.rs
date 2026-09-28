@@ -751,7 +751,7 @@ fn compile_top_seeded(forms: &[Node], extra_names: Vec<String>) -> Result<FnCode
     //
     // `collect_defs` is recursive over the whole tree, so the two `def`s
     // generated inside the `do` block are found along with the user's own.
-    let forms = &crate::collection_forms::lower(forms);
+    let forms = &crate::collection_forms::lower(forms)?;
     collect_defs(forms, &mut c.scope);
     let last = forms.len().saturating_sub(1);
     for (i, form) in forms.iter().enumerate() {

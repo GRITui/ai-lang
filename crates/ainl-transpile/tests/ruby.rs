@@ -43,7 +43,68 @@ fn variadic_uses_splat() {
 
 #[test]
 fn if_expression_is_ternary() {
-    assert!(rb("(print (if (< n 2) n 0))").contains("((n < 2) ? n : 0)"));
+    // In expression position (here, an argument) `if` lowers to a ternary, and
+    // the condition goes through `_truthy` rather than the bare host value.
+    // Ruby happens to agree with AINL that `0` and `""` are truthy, but by
+    // coincidence rather than by contract — so the guard is emitted here too,
+    // and this pins it. (It also silences Ruby's "string literal in
+    // condition" warning.)
+    assert!(
+        rb("(print (if (< n 2) n 0))").contains("(_truthy((n < 2)) ? n : 0)"),
+        "got:\n{}",
+        rb("(print (if (< n 2) n 0))")
+    );
+}
+
+#[test]
+fn and_emits_the_conjunction_not_the_disjunction() {
+    // Regression. `shared::logic` receives the HOST operator (`&&` / `||`) but
+    // chose its final join by testing `op == "and"` — the AINL form name, which
+    // never arrives. Both tests were therefore always false, so every `and`
+    // took the `or` branch and was emitted as a disjunction. It passed on any
+    // `and` whose operands were already boolean and blew up otherwise.
+    let out = rb("(print (and a b))");
+    assert!(
+        out.contains("_print((_truthy(a) ? b : a))"),
+        "an `and` must not be emitted as a disjunction, got:\n{out}"
+    );
+    // Scoped to the emitted expression: `_truthy`'s own body uses `nil?` and
+    // `==`, but a whole-file check is still too broad to read as a statement
+    // about this form.
+    let expr = out
+        .lines()
+        .find(|l| l.contains("_print(") && l.contains("?"))
+        .unwrap();
+    assert!(!expr.contains("||"), "got:\n{expr}");
+    assert!(!expr.contains("&&"), "got:\n{expr}");
+}
+
+#[test]
+fn and_or_return_an_operand_not_a_boolean() {
+    // AINL's `and` yields the first FALSEY OPERAND and `or` the first TRUTHY
+    // OPERAND. A host `&&` / `||` yields a boolean, so the chain is a
+    // conditional: `_truthy(a) ? b : a` for `and`, `_truthy(a) ? a : b` for
+    // `or`. `(or 0 "")` is `0` in AINL because `0` is truthy.
+    let out = rb(r#"(print (or 0 ""))"#);
+    assert!(
+        out.contains(r#"_print((_truthy(0) ? 0 : ""))"#),
+        "got:\n{out}"
+    );
+    // `(and nil false 3)` is `nil`, not `false`: the first falsey operand wins.
+    let out = rb("(print (and nil false 3))");
+    assert!(
+        out.contains("_print((_truthy(nil) ? (_truthy(false) ? 3 : false) : nil))"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn logic_emits_the_truthy_helper_it_calls() {
+    // `(and …)`/`(or …)` in a program with no `if` anywhere still has to ship
+    // the `_truthy` definition it references, or the emitted program dies with
+    // `undefined method '_truthy'` at run time.
+    let out = rb("(print (and a b))");
+    assert!(out.contains("def _truthy("), "got:\n{out}");
 }
 
 #[test]

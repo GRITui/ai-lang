@@ -15,34 +15,25 @@ use ainl_core::{Error, Result};
 pub(crate) trait ExprEmit {
     fn expr(&mut self, node: &Node) -> Result<String>;
 
+    /// Record that the emitted text uses the target's `_truthy` helper, so the
+    /// backend's prologue emits its definition.
+    ///
+    /// [`logic`] and `expr_if` both route a condition through `_truthy` and are
+    /// generic over this trait, so they cannot call a target-specific
+    /// `need("_truthy")` themselves — the requirement has to be declared here
+    /// and satisfied at each call site. Missing it produced a program that
+    /// *compiled* and printed the right first line, then died with
+    /// `ReferenceError: _truthy is not defined` on the first `(and …)`.
+    fn need_truthy(&mut self);
+
     fn expr_all(&mut self, nodes: &[Node]) -> Result<Vec<String>> {
         nodes.iter().map(|n| self.expr(n)).collect()
     }
 }
 
-/// `(op a b c...)` -> `(a op b op c)`, with `identity` for the 0-arg case and
-/// no parens for the 1-arg case. Used for `+`/`*` everywhere.
-///
-/// NOT for `and` / `or` on any target — those are [`logic`], because joining
-/// their operands with the host operator decides the answer with host
-/// truthiness, and AINL has its own.
-pub(crate) fn infix<E: ExprEmit>(
-    e: &mut E,
-    args: &[Node],
-    op: &str,
-    identity: &str,
-) -> Result<String> {
-    let parts = e.expr_all(args)?;
-    match parts.len() {
-        0 => Ok(identity.to_string()),
-        1 => Ok(parts.into_iter().next().unwrap()),
-        _ => Ok(format!("({})", parts.join(&format!(" {op} ")))),
-    }
-}
-
 /// `(and a b c…)` / `(or a b c…)` -> a short-circuit on **AINL** truthiness.
 ///
-/// Two reasons this cannot be [`infix`] with `&&` / `||`:
+/// NOT an infix chain on the host's `&&` / `||`, for two reasons:
 ///
 /// * AINL says only `nil` and `false` are falsey, so `0` and `""` are TRUTHY.
 ///   Every host used here treats both as falsey, and a chain written with the
@@ -52,26 +43,51 @@ pub(crate) fn infix<E: ExprEmit>(
 ///   not merely the wrong truthiness reading but a different VALUE: `(or 0 "")`
 ///   returns `0` under `||` and `""` in AINL.
 ///
-/// So each operand but the last is coerced through `_truthy` — the target's
-/// local name for the AINL predicate — and the last is returned as-is, which is
-/// what makes the chain a genuine short-circuit rather than a boolean fold.
+/// So a chain is a genuine short-circuit over **values**, not a boolean fold:
+/// AINL's `and` returns the first falsey *operand* and `or` the first truthy
+/// *operand*, so a host operator — which returns a boolean — cannot express it
+/// no matter how it is parenthesised.
+///
+/// The shape that does is a host conditional, because it is the one host
+/// construct that yields a chosen *value*:
+///
+/// ```text
+/// (or a b)  ->  _truthy(a) ? a : b
+/// (and a b) ->  _truthy(a) ? b : a
+/// ```
+///
+/// `and` puts the falsey operand in the `else` arm precisely because that arm
+/// is the one that runs when `_truthy(a)` is false. Chained left to right, each
+/// step testing the previous operand.
+///
+/// `op` is the **host** operator (`&&` / `||`), because that is what has to be
+/// emitted. The choice of identity and of final join is therefore made from the
+/// emitted operators, never from the AINL form name: `"and"` never arrives here,
+/// so an identity or join keyed on `op == "and"` would always take the `or`
+/// branch and silently turn every `and` into an `or`.
 pub(crate) fn logic<E: ExprEmit>(e: &mut E, args: &[Node], op: &str) -> Result<String> {
     let parts = e.expr_all(args)?;
+    // `&&` is the only operator that can be falsey on its left, so it is also
+    // the only one whose chain can propagate false upward.
+    let is_and = op == "&&";
     match parts.len() {
         // The identities: `(and)` is `true` and `(or)` is `false`.
-        0 => Ok(if op == "and" { "true" } else { "false" }.to_string()),
+        0 => Ok(if is_and { "true" } else { "false" }.to_string()),
         1 => Ok(parts.into_iter().next().unwrap()),
         _ => {
-            let last = &parts[parts.len() - 1];
-            let mut head = format!("_truthy({})", parts[0]);
-            for p in &parts[1..parts.len() - 1] {
-                head.push_str(&format!(" {op} _truthy({p})"));
+            e.need_truthy();
+            // Fold right: `acc` starts at the last operand, and each earlier
+            // one becomes a conditional against it. The last operand is never
+            // re-tested, which keeps its side effects to exactly one run.
+            let mut acc = parts[parts.len() - 1].clone();
+            for p in parts[..parts.len() - 1].iter().rev() {
+                acc = if is_and {
+                    format!("(_truthy({p}) ? {acc} : {p})")
+                } else {
+                    format!("(_truthy({p}) ? {p} : {acc})")
+                };
             }
-            Ok(if op == "and" {
-                format!("(({head}) && {last})")
-            } else {
-                format!("(({head}) || {last})")
-            })
+            Ok(acc)
         }
     }
 }
