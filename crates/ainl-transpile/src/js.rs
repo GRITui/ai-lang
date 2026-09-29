@@ -6,9 +6,13 @@
 //!
 //! Two JS-specific gotchas handled here:
 //! * JS has no chained comparison — `(< 1 2 3)` expands to `(1 < 2 && 2 < 3)`.
-//! * JS has a single `number` type, so AINL's int/float distinction is lost;
-//!   division that yields a whole number prints without a trailing `.0`. The
-//!   sample programs avoid that case and verify byte-identical.
+//! * JS has a single `number` type, so AINL's int/float distinction is lost —
+//!   `3.0` and `3` are the same value. `(print 3.0)` is emitted below with its
+//!   `.0` intact; the marker disappears when JS *parses* it, and a whole float
+//!   therefore prints as `3`. Nothing available at runtime can recover it, so
+//!   the value would have to carry the type instead — a numeric-model change,
+//!   not a display one. See docs/SYNTAX.md §3j and docs/NUMERIC_MODEL.md. The
+//!   measurements are pinned by tests/js_number_collapse.rs.
 
 use crate::shared::{self, ExprEmit};
 use ainl_core::parser::Node;
