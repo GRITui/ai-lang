@@ -110,6 +110,127 @@ fn aot_matches_interpreter_on_all_examples() {
     }
 }
 
+/// `and`/`or` return an OPERAND, not a boolean (SYNTAX.md 2). The AOT emitter
+/// used to seed its accumulator with `v_bool(1)` and overwrite it only on the
+/// short-circuit path, so an all-truthy chain returned that seed: `(and 1 2 3)`
+/// printed `true` under AOT C while every other backend printed `3`.
+///
+/// The comparison is against the interpreter rather than a literal, because the
+/// interpreter is the language's definition. The cases deliberately use
+/// non-boolean operands, since with booleans alone "returns a boolean" and
+/// "returns the operand" are indistinguishable — which is exactly why the bug
+/// survived the collections gate. Note that only `nil`/`false` are falsey, so
+/// `0` and `""` are truthy operands here.
+#[test]
+fn aot_and_or_return_operands_not_booleans() {
+    let src = r#"
+(print (and 1 2))
+(print (and 0 1))
+(print (and 0 ""))
+(print (and 1 2 3))
+(print (and 1 nil))
+(print (and nil 1))
+(print (and false 1))
+(print (and "a" "b"))
+(print (and 0 (list 1 2)))
+(print (and))
+(print (and 7))
+(print (or 0 1))
+(print (or nil 1))
+(print (or nil 0))
+(print (or 1 2 3))
+(print (or nil (list 1 2)))
+(print (or "a" "b"))
+(print (or))
+(print (or 7))
+(print (and 1 (or nil "inner")))
+(print (or nil (and 1 "inner")))
+"#;
+    let bin = compile_aot(src, "and_or_operands").expect("compiled");
+    let got = run_capture(&mut Command::new(&bin));
+
+    // Run the identical source through the interpreter, via the CLI.
+    let path = repo_root().join("target/and_or_operands.ainl");
+    std::fs::write(&path, src).expect("write .ainl");
+    let want = interpreter_stdout(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        got, want,
+        "AOT and/or returned a different value than the interpreter"
+    );
+    // Pin the answers themselves, so a change in what `and`/`or` MEAN cannot
+    // pass by moving both backends together. `and` returns the LAST operand;
+    // `or` returns the FIRST truthy one — so `(or 1 2 3)` is `1` and
+    // `(or "a" "b")` is `a`, while `(and 1 2 3)` is `3` and `(and "a" "b")`
+    // is `b`. Line 3 is `(and 0 "")`, which is the empty string: a blank line.
+    assert_eq!(
+        want.trim(),
+        "2\n1\n\n3\nnil\nnil\nfalse\nb\n(1 2)\ntrue\n7\n0\n1\n0\n1\n(1 2)\na\nfalse\n7\ninner\ninner",
+        "and/or semantics changed"
+    );
+}
+
+/// The value must survive as a real value, not just print correctly: a string
+/// or list returned from the AOT accumulator is read again by the next form, so
+/// losing the reference here would corrupt `str`/`len` rather than this output.
+#[test]
+fn aot_and_or_result_is_usable_afterwards() {
+    let src = r#"
+(def v (and 1 "kept"))
+(print v)
+(print (str "x" (and 1 "kept")))
+(def w (or nil (list 1 2)))
+(print (len w))
+(def pick (fn (x) (and x "default")))
+(print (pick 0))
+(print (pick nil))
+"#;
+    let bin = compile_aot(src, "and_or_usable").expect("compiled");
+    let got = run_capture(&mut Command::new(&bin));
+    let path = repo_root().join("target/and_or_usable.ainl");
+    std::fs::write(&path, src).expect("write .ainl");
+    let want = interpreter_stdout(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, want, "AOT and/or result was not usable afterwards");
+}
+
+/// `and`/`or` are lazy. The emitter has to test the accumulator BEFORE emitting
+/// the next operand's code, or a `goto` that gets the VALUE right still
+/// evaluates every operand on every run. A `print` in the dead branch is the
+/// observable difference, and `(/ 1 0)` there proves the operand was never
+/// evaluated at all.
+///
+/// The count is not asserted: a `fn` body ending in a value prints twice on
+/// every backend (a pre-existing quirk, unrelated to `and`/`or`), so only the
+/// *absence* of DEAD is a meaningful invariant here.
+#[test]
+fn aot_and_or_short_circuit() {
+    let src = r#"
+(def note (fn (s) (print s) nil))
+(print (and 1 (note "LIVE")))
+(print (or nil 1))
+(print (and false (note "DEAD")))
+(print (or true (note "DEAD")))
+(print (and nil (note "DEAD")))
+(print (or 0 (note "DEAD")))
+(print (and false (/ 1 0)))
+(print (or 1 (/ 1 0)))
+"#;
+    let bin = compile_aot(src, "and_or_short_circuit").expect("compiled");
+    let got = run_capture(&mut Command::new(&bin));
+    let path = repo_root().join("target/and_or_short_circuit.ainl");
+    std::fs::write(&path, src).expect("write .ainl");
+    let want = interpreter_stdout(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, want, "AOT and/or short-circuiting diverged");
+    assert!(!got.contains("DEAD"), "a dead branch was evaluated: {got}");
+    assert!(
+        !got.contains("division"),
+        "a dead branch raised a division error: {got}"
+    );
+}
+
 #[test]
 fn aot_40k_sum_is_correct() {
     let src = format!("(def i 0)\n(def s 0)\n(while (< i {N})\n  (def s (+ s i))\n  (def i (+ i 1)))\n(print s)\n");

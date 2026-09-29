@@ -42,8 +42,8 @@ comment   ::= ";" ... end-of-line          ; ignored
 | `let` | `(let ((n v)...) body...)` | Bind locals in a new scope, then run body. |
 | `while` | `(while cond body...)` | Loop while `cond` is truthy. Returns last body value or `nil`. |
 | `quote` | `(quote form)` | Return `form` as data (symbols/lists) without evaluating. |
-| `and` | `(and a b ...)` | Short-circuit; returns first falsey or the last value. |
-| `or` | `(or a b ...)` | Short-circuit; returns first truthy or `false`. |
+| `and` | `(and a b ...)` | Short-circuit; returns first falsey or the last value. It returns an **operand, not a boolean** — `(and 1 2 3)` is `3`, and `(and 1 "x")` is `"x"`. With no operands it is `true`. |
+| `or` | `(or a b ...)` | Short-circuit; returns first truthy or `false`. It returns an **operand, not a boolean** — `(or nil 0)` is `0` (0 is truthy, §1), and `(or nil false)` is `false`. With no operands it is `false`. |
 | `import` | `(import "m.ainl")` / `(import "m.ainl" as m)` | Top-level only. Loads a module file and binds its top-level `def`s into this file's scope, or one name `m` holding a map of them. See §3b. |
 | `try` | `(try body... (catch (e) handler...))` | Run `body`; on a runtime error bind it to `e` and run `handler`. Opens a scope (§2a). See §3e. |
 

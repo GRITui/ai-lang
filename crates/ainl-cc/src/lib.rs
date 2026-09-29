@@ -974,20 +974,48 @@ impl Gen {
         }
     }
 
+    /// `and` is a special form that returns an OPERAND, not a boolean: the first
+    /// falsey one (short-circuit), or the LAST value when none is falsey.
+    ///
+    /// The accumulator therefore has to be rebound to every operand, not just to
+    /// the falsey ones. Seeding it with `v_bool(1)` and overwriting only on the
+    /// short-circuit path left the seed behind whenever every operand was truthy,
+    /// so `(and 1 2 3)` yielded `true` instead of `3`.
+    ///
+    /// The zero-operand identity `(and) == true` is the one case a boolean seed is
+    /// correct for, and it is now emitted only there.
+    ///
+    /// Short-circuiting is the `goto`: the truthiness test sits at the TOP of each
+    /// step, BEFORE the next operand's code is emitted, and jumps past the rest.
+    /// Emitting the operand first and testing after it — the shape the old code
+    /// used — would still return the right value but would evaluate every operand
+    /// on every run, which is not what `and` means.
     fn gen_and(&mut self, items: &[Node], env: &str) -> String {
         let t = self.fresh();
         let label = format!("and_done_{t}");
-        self.emit_code(&format!("Value {t} = v_bool(1);\n"));
-        for a in &items[1..] {
-            let tmp = self.gen_expr(a, env);
-            self.emit_code(&format!("if (!v_truthy(&{tmp})) {{\n"));
-            self.emit_code(&format!("  v_unref(&{t});\n"));
-            self.emit_code(&format!("  {t} = {tmp};\n"));
-            self.emit_code(&format!("  v_ref(&{t});\n"));
-            self.emit_code(&format!("  v_unref(&{tmp});\n"));
+        // `items[0]` is the `and` symbol; `items[1..]` are the operands.
+        let ops = &items[1..];
+        if ops.is_empty() {
+            // `(and)` is the identity `true`, with no operand to return. No label
+            // is emitted because nothing can jump to it.
+            self.emit_code(&format!("Value {t} = v_bool(1);\n"));
+            return t;
+        }
+        // Seed the accumulator with the FIRST operand rather than a boolean, so
+        // `t` always holds a live, owned value at the merge point.
+        let first = self.gen_expr(&ops[0], env);
+        self.emit_code(&format!("Value {t} = {first};\n"));
+        for a in &ops[1..] {
+            // A falsey accumulator is the answer, and the remaining operands must
+            // not be evaluated at all.
+            self.emit_code(&format!("if (!v_truthy(&{t})) {{\n"));
             self.emit_code(&format!("  goto {label};\n"));
             self.emit_code("}\n");
-            self.emit_code(&format!("v_unref(&{tmp});\n"));
+            // The previous operand was truthy and is being replaced, so it drops
+            // its reference; the new one takes over as the result.
+            let tmp = self.gen_expr(a, env);
+            self.emit_code(&format!("v_unref(&{t});\n"));
+            self.emit_code(&format!("{t} = {tmp};\n"));
         }
         self.emit_code(&format!("{label}:\n"));
         t
