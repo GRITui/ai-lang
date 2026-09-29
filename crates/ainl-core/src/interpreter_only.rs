@@ -112,6 +112,31 @@ pub const RESTRICTED: &[Restricted] = &[
         sym: crate::db::DB_FLUSH,
         refused_by: &[Backend::Transpilers],
     },
+    // The value layer. `db-get` is deliberately absent from this list — it is
+    // already above, and a second entry for one name would make the scanner
+    // report it twice in a program that used it twice. The new names go in
+    // report order after the byte ones, so a program using both is refused on
+    // `db-open` first, which is the name that actually explains the problem.
+    Restricted {
+        sym: crate::dbkv::DB_SET,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbkv::DB_GET_RAW,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbkv::DB_DEL,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbkv::DB_KEYS,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbkv::DB_COUNT,
+        refused_by: &[Backend::Transpilers],
+    },
 ];
 
 /// The first use of any of `syms` anywhere in `forms`, as a byte offset.

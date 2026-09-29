@@ -43,17 +43,43 @@ const HOSTS: &[ainl_transpile::Target] = &[
     ainl_transpile::Target::Ruby,
 ];
 
-/// The five builtins, with a program that calls each. Kept as a table so the
-/// refusal test and the AOT-supports test below are driven by the same list and
-/// cannot drift apart — a builtin added to one and forgotten in the other would
-/// leave it untested on exactly one backend.
+/// The nine builtins, with a program that calls each.
+///
+/// The refusal test and the AOT-supports test below are driven by this same
+/// list, so they cannot drift apart — a builtin added to one and forgotten in
+/// the other would leave it untested on exactly one backend, which is the one
+/// place a backend's coverage silently shrinks.
+///
+/// All nine are expected to be **accepted** by the AOT backend. Asserting that
+/// is what keeps a blanket "storage is too hard for a compiled binary" rule
+/// from sweeping the AOT backend in by accident: every refusal test could keep
+/// passing while the backend that actually ships the binary lost the feature.
 const CALLS: &[(&str, &str)] = &[
     ("db-open", r#"(db-open "d.ainl-db")"#),
     ("db-put", r#"(db-put 1 "k" "v")"#),
     ("db-get", r#"(db-get 1 "k")"#),
     ("db-flush", "(db-flush 1)"),
     ("db-close", "(db-close 1)"),
+    // The value layer (Tier 4 card 2).
+    ("db-set", r#"(db-set 1 "k" 2)"#),
+    ("db-get-raw", r#"(db-get-raw 1 "k")"#),
+    ("db-del", r#"(db-del 1 "k")"#),
+    ("db-keys", "(db-keys 1)"),
+    ("db-count", "(db-count 1)"),
 ];
+
+/// The call program for `sym`, from the table above.
+///
+/// A helper because the two tests that use `CALLS` must agree on which program
+/// goes with which name; a lookup that fell back to a default would let a name
+/// be listed and never actually exercised.
+fn program_for(sym: &str) -> &'static str {
+    CALLS
+        .iter()
+        .find(|(name, _)| *name == sym)
+        .map(|(_, src)| *src)
+        .unwrap_or_else(|| panic!("{sym} is in a name list but has no fixture program"))
+}
 
 fn transpile_err(src: &str, target: ainl_transpile::Target) -> String {
     let forms = parse(src).expect("the fixture itself must parse");
@@ -150,7 +176,7 @@ fn a_program_using_several_is_refused_once_and_cleanly() {
 
 // --- the AOT backend does not refuse ---------------------------------------
 
-/// The counterweight to everything above. The AOT C backend implements all five
+/// The counterweight to everything above. The AOT C backend implements all nine
 /// builtins, so codegen must accept them — if a future change to the shared
 /// backend-restriction table swept `db-*` in with the transpiler set, this is
 /// the test that catches it, and it is the only place it would be caught.
@@ -163,13 +189,44 @@ fn aot_accepts_every_storage_builtin() {
     }
 }
 
+/// Every name in the two modules' own lists has a fixture above.
+///
+/// This is the drift guard for the table: a builtin added to `db.rs` or
+/// `dbkv.rs` and not to `CALLS` would be refused by the transpilers (the
+/// scanner reads the module lists) and accepted by AOT (codegen reads
+/// `BUILTIN_IDS`) while *no test in this file exercised it*. Comparing the
+/// lists to the table is what turns that into a failure here.
+#[test]
+fn every_db_name_in_the_modules_has_a_fixture() {
+    for &sym in ainl_core::db::DB_BUILTINS
+        .iter()
+        .chain(ainl_core::dbkv::KV_BUILTINS.iter())
+    {
+        program_for(sym);
+    }
+    // Five byte-layer names plus five value-layer names, with `db-get` in both
+    // lists and one fixture for it. So ten fixtures for ten distinct names, and
+    // the AOT-accepts test above proves each one is really reached.
+    assert_eq!(CALLS.len(), 10, "update CALLS when a db-* builtin is added");
+}
+
 /// And the whole surface at once, so a *combination* is not what breaks it.
+///
+/// Both layers in one program, and every id asserted. `db-get` is here with
+/// id 69 — the id the byte layer shipped — because the value layer takes that
+/// one name over rather than getting an id of its own, and the other four value
+/// builtins are the ids appended after it.
 #[test]
 fn aot_accepts_a_complete_storage_program() {
     let src = r#"(do (def h (db-open "d.ainl-db"))
             (db-put h "k" "v")
+            (db-set h "n" 1)
             (db-flush h)
             (db-get h "k")
+            (db-get-raw h "k")
+            (db-del h "n")
+            (db-keys h)
+            (db-count h)
             (db-close h))"#;
     let forms = parse(src).expect("parses");
     let c = ainl_cc::generate(&forms).expect("AOT must support the full program");
@@ -186,6 +243,11 @@ fn aot_accepts_a_complete_storage_program() {
         ("db-get", "69"),
         ("db-flush", "70"),
         ("db-close", "71"),
+        ("db-set", "72"),
+        ("db-get-raw", "73"),
+        ("db-del", "74"),
+        ("db-keys", "75"),
+        ("db-count", "76"),
     ] {
         assert!(
             c.contains(&format!("v_builtin({id})")),

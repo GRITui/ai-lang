@@ -89,23 +89,27 @@ pub fn transpile(target: Target, forms: &[Node], src: &str) -> Result<String> {
         // "interpreter-only" for `db-open` would be a lie in both directions:
         // `ainl compile` runs it, and the message used to point at `--to
         // python` even for `--to ruby`.
-        let (what, because) = match sym {
-            ainl_core::db::DB_OPEN
-            | ainl_core::db::DB_PUT
-            | ainl_core::db::DB_GET
-            | ainl_core::db::DB_FLUSH
-            | ainl_core::db::DB_CLOSE => (
+        //
+        // The `db-*` arm is driven off the modules' own name lists rather than a
+        // literal list of names, so a builtin added to either layer without
+        // being added here falls into the "interpreter-only" arm — which fails
+        // the refusal test in db_refusal.rs, and so cannot land quietly.
+        let is_db = ainl_core::db::DB_BUILTINS.contains(&sym)
+            || ainl_core::dbkv::KV_BUILTINS.contains(&sym);
+        let (what, because) = if is_db {
+            (
                 "transpiler-only",
                 "this backend emits one source file for one host language, and a host \
                  file API has no append-only log, no per-record checksum, and no \
                  crash-tail recovery — a program that ran here would read a different \
                  file than the one the interpreter wrote",
-            ),
-            _ => (
+            )
+        } else {
+            (
                 "interpreter-only",
                 "this backend emits one source file for one host language, which has no \
                  phase that can resolve modules or speak AINL's HTTP semantics",
-            ),
+            )
         };
         return Err(ainl_core::Error::runtime(format!(
             "ainl transpile --to {}: `{sym}` is {what} (found at byte {at}) — {because}. \

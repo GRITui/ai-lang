@@ -211,7 +211,7 @@ impl Db {
     /// Truncates a torn tail, so the returned handle always sits on a record
     /// boundary — which is what makes the second `open` of a recovered file
     /// produce the same answer as the first.
-    fn open(path: &str) -> Result<Db> {
+    pub(crate) fn open(path: &str) -> Result<Db> {
         // `truncate(false)` is the *default* and is written out because the
         // alternative reading of `create(true)` is "create a fresh empty
         // database", which is exactly the bug that would destroy the log this
@@ -294,7 +294,7 @@ impl Db {
     }
 
     /// Append one record and index it.
-    fn put(&mut self, key: &str, value: &str) -> Result<()> {
+    pub(crate) fn put(&mut self, key: &str, value: &str) -> Result<()> {
         let key_b = key.as_bytes();
         let val_b = value.as_bytes();
         let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + key_b.len() + val_b.len());
@@ -311,8 +311,21 @@ impl Db {
     }
 
     /// The latest value for `key`, or `None` if the log has no such key.
-    fn get(&self, key: &str) -> Option<&str> {
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.index.get(key).map(|s| s.as_str())
+    }
+
+    /// Every key in the index, in the index's own (undefined) order.
+    ///
+    /// Callers that hand the list to a program **must** sort it: the index is a
+    /// `HashMap` here and a chained hash table in the C port, and neither has a
+    /// defined order, so the two engines would return the same keys in
+    /// different sequences. Sorting is the caller's decision because only the
+    /// caller knows whether a stable or an unstable sort is wanted and what
+    /// comparator the contract demands — see `dbkv::db_keys`, which sorts by
+    /// byte value for exactly this reason.
+    pub fn keys(&self) -> Vec<String> {
+        self.index.keys().cloned().collect()
     }
 
     /// Force the log to disk: the process's buffer, then the device.
@@ -348,7 +361,12 @@ fn db_err(who: &str, verb: &str, path: &str) -> Error {
 /// `f` returns a `Result` so a handle borrow and an operation result stay one
 /// value to the caller: a `db-put` that fails on the write and a `db-put` on a
 /// closed handle are the same shape of failure, and the caller has one `?`.
-fn with_db<T>(n: i64, who: &str, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+///
+/// `pub(crate)` because the value layer in [`crate::dbkv`] resolves handles
+/// through this same table. It must be the *same* table: two registries would
+/// hand out overlapping handle numbers for two different databases, and a
+/// program could write to the wrong file with no error anywhere.
+pub(crate) fn with_db<T>(n: i64, who: &str, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
     let db = OPEN
         .with(|c| {
             let slots = c.borrow();
@@ -443,8 +461,13 @@ pub fn install(env: &Env) {
     b!(DB_OPEN, db_open);
     b!(DB_CLOSE, db_close);
     b!(DB_PUT, db_put);
-    b!(DB_GET, db_get);
     b!(DB_FLUSH, db_flush);
+    // `DB_GET` is deliberately NOT bound here. The value layer binds that name
+    // to its own reader (see [`crate::dbkv`]), and binding it here would be
+    // overwritten a moment later — so the byte layer's reader is installed as
+    // `db-get-raw` by `dbkv::install` instead. Keeping one binding per name is
+    // what stops "which `db-get` did this program get?" from being a question
+    // about install order.
 }
 
 fn db_open(args: &[Value]) -> Result<Value> {
@@ -527,22 +550,6 @@ fn db_put(args: &[Value]) -> Result<Value> {
     let value = as_str_arg(value, DB_PUT, "value")?;
     with_db(h, DB_PUT, |db| db.put(key, value))?;
     Ok(Value::Nil)
-}
-
-fn db_get(args: &[Value]) -> Result<Value> {
-    let [h, key] = args else {
-        return Err(Error::runtime(format!(
-            "{DB_GET} expects ({DB_GET} handle key)"
-        )));
-    };
-    let h = as_handle(h, DB_GET)?;
-    let key = as_str_arg(key, DB_GET, "key")?;
-    // An absent key is `nil`, not an error: that is the answer `get` gives for
-    // a missing map key, and it makes `db-get` a total function.
-    match with_db(h, DB_GET, |db| Ok(db.get(key).map(str::to_string)))? {
-        Some(s) => Ok(Value::str(s)),
-        None => Ok(Value::Nil),
-    }
 }
 
 fn db_flush(args: &[Value]) -> Result<Value> {

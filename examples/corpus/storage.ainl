@@ -1,6 +1,6 @@
 ; @example   storage
 ; @summary   A durable key/value store: write, overwrite, reopen, read back.
-; @teaches   db-open, db-put, db-get, db-flush, db-close, handles, append-only
+; @teaches   db-open, db-put, db-get-raw, db-flush, db-close, handles, append-only
 ; @scope     aot
 ; @expect    reopened visits: 2
 ; @run       ainl run examples/corpus/storage.ainl
@@ -29,17 +29,19 @@
 (def h (db-open db))
 
 ; ---- put, and read back what was just written ---------------------------
-; A `db-get` on a key that was never written is `nil`, not an error, so a probe
-; needs no `try`. That is worth seeing early: it makes `db-get` a total function.
+; A `db-get-raw` on a key that was never written is `nil`, not an error, so a probe
+; needs no `try`. That is worth seeing early: it makes `db-get-raw` a total
+; function. (The value-level reader, `db-get`, is a different builtin and can
+; error — see SYNTAX.md §3l.)
 (do
   (db-put h "visits" "1")
-  (print "visits:" (db-get h "visits"))
-  (print "absent:" (db-get h "never-written")))
+  (print "visits:" (db-get-raw h "visits"))
+  (print "absent:" (db-get-raw h "never-written")))
 
 ; ---- overwrite, and see the last write win -------------------------------
 (do
   (db-put h "visits" "2")
-  (print "after overwrite:" (db-get h "visits")))
+  (print "after overwrite:" (db-get-raw h "visits")))
 
 ; ---- several keys, and an awkward one -----------------------------------
 ; Keys and values are strings, and the framing is length-prefixed, so a key with
@@ -49,8 +51,8 @@
   (db-put h "last seen" "2026-09-29")
   (db-put h "note" "multi
 line value")
-  (print "owner:" (db-get h "owner"))
-  (print "last seen:" (db-get h "last seen")))
+  (print "owner:" (db-get-raw h "owner"))
+  (print "last seen:" (db-get-raw h "last seen")))
 
 ; ---- flush is the durability barrier -------------------------------------
 ; `db-put` hands the record to the OS; `db-flush` fsyncs it, so after this the
@@ -67,8 +69,8 @@ line value")
 (db-close h)
 
 (def h2 (db-open db))
-(print "reopened visits:" (db-get h2 "visits"))
-(print "reopened owner:" (db-get h2 "owner"))
+(print "reopened visits:" (db-get-raw h2 "visits"))
+(print "reopened owner:" (db-get-raw h2 "owner"))
 (db-close h2)
 
 ; ---- a handle can be wrong, and says so ---------------------------------
@@ -81,7 +83,7 @@ line value")
   (def h3 (db-open db))
   (db-close h3)
   (try
-    (db-get h3 "visits")
+    (db-get-raw h3 "visits")
     (catch (e) (print "stale handle:" e))))
 
 ; ---- clean up -----------------------------------------------------------

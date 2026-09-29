@@ -200,14 +200,14 @@ const SCENARIO: &str = r#"
 (db-put h "beta" "two")
 (db-put h "alpha" "ONE")
 (db-put h "uni" "héllo 日本")
-(print "alpha:" (db-get h "alpha"))
-(print "beta:" (db-get h "beta"))
-(print "uni:" (db-get h "uni"))
-(print "missing:" (db-get h "missing"))
+(print "alpha:" (db-get-raw  h "alpha"))
+(print "beta:" (db-get-raw  h "beta"))
+(print "uni:" (db-get-raw  h "uni"))
+(print "missing:" (db-get-raw  h "missing"))
 (db-flush h)
 (db-close h)
 (def h2 (db-open "d.ainl-db"))
-(print "reopened:" (db-get h2 "alpha") (db-get h2 "beta") (db-get h2 "uni"))
+(print "reopened:" (db-get-raw  h2 "alpha") (db-get-raw  h2 "beta") (db-get-raw  h2 "uni"))
 (db-close h2)
 "#;
 
@@ -260,7 +260,7 @@ fn the_c_port_writes_the_same_bytes_as_the_interpreter() {
     let cross = format!(
         r#"
 (def h (db-open "{}"))
-(print "from-interp:" (db-get h "alpha") (db-get h "uni"))
+(print "from-interp:" (db-get-raw  h "alpha") (db-get-raw  h "uni"))
 (db-put h "from-aot" "added")
 (db-close h)
 "#,
@@ -273,7 +273,7 @@ fn the_c_port_writes_the_same_bytes_as_the_interpreter() {
     let read_back = format!(
         r#"
 (def h (db-open "{}"))
-(print "from-aot:" (db-get h "from-aot"))
+(print "from-aot:" (db-get-raw  h "from-aot"))
 (db-close h)
 "#,
         aot_dir.db()
@@ -376,7 +376,7 @@ fn a_killed_process_leaves_a_log_the_next_open_can_recover() {
     let program = format!(
         r#"
 (def h (db-open "{}"))
-(print "value:" (db-get h "k"))
+(print "value:" (db-get-raw  h "k"))
 (db-close h)
 "#,
         s.db()
@@ -418,7 +418,7 @@ fn a_stale_handle_is_refused_by_the_compiled_binary() {
         r#"
 (def h (db-open "d.ainl-db"))
 (db-close h)
-(db-get h "k")
+(db-get-raw  h "k")
 "#,
         "stale",
     );
@@ -428,7 +428,10 @@ fn a_stale_handle_is_refused_by_the_compiled_binary() {
         .expect("run");
     assert!(!out.status.success(), "a stale handle must not succeed");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("db-get: handle 1 is not open"), "got: {err}");
+    assert!(
+        err.contains("db-get-raw: handle 1 is not open"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -486,8 +489,8 @@ fn a_torn_tail_is_repaired_by_the_compiled_binary() {
         &format!(
             r#"
 (def h (db-open "{}"))
-(print "kept:" (db-get h "a"))
-(print "gone:" (db-get h "ab"))
+(print "kept:" (db-get-raw  h "a"))
+(print "gone:" (db-get-raw  h "ab"))
 (db-close h)
 "#,
             s.db()
@@ -555,7 +558,7 @@ fn the_c_crc_matches_the_published_zlib_test_vector() {
         &format!(
             r#"
 (def h (db-open "{}"))
-(print (db-get h "123456789"))
+(print (db-get-raw  h "123456789"))
 (db-close h)
 "#,
             s.db()
@@ -625,8 +628,8 @@ fn a_record_holding_a_nul_is_dropped_by_the_c_port_too() {
         &format!(
             r#"
 (def h (db-open "{}"))
-(print (db-get h "ok"))
-(print (db-get h "k"))
+(print (db-get-raw  h "ok"))
+(print (db-get-raw  h "k"))
 (db-close h)
 "#,
             s.db()

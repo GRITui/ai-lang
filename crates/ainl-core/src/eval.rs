@@ -948,6 +948,13 @@ fn install_stdlib(env: &Env) {
     // refuse it, because a host file object has no append-only-log semantics and
     // no way to reproduce the recovery. See db.rs and docs/SYNTAX.md §3k.
     crate::db::install(env);
+    // The value layer on top of it (Tier 4 card 2): `db-set`/`db-del`/
+    // `db-keys`/`db-count`, plus the value-level `db-get` that `db::install`
+    // already bound. Both layers share one handle table, so the order of these
+    // two calls cannot matter to a program — but `dbkv` is installed second so
+    // the byte layer's `db-get` is the one in the environment before the value
+    // layer could ever have rebound it. See dbkv.rs and docs/SYNTAX.md §3l.
+    crate::dbkv::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------

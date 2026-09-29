@@ -1332,7 +1332,7 @@ Write floats whose value is not whole where the output is compared across
 backends — the transpiler test suites are written this way on purpose, so JS can
 be diffed byte-for-byte against the interpreter with no exemptions at all.
 
-## 3k. Storage: `db-open` / `db-put` / `db-get` / `db-flush` / `db-close`
+## 3k. Storage: `db-open` / `db-put` / `db-get-raw` / `db-flush` / `db-close`
 
 Five builtins, a whole durable store, and no dependency:
 
@@ -1341,13 +1341,17 @@ Five builtins, a whole durable store, and no dependency:
 (db-put h "todo" "buy milk")
 (db-put h "todo" "buy oat milk")   ; overwrites, does not erase
 (db-flush h)
-(print (db-get h "todo"))          ; buy oat milk
-(print (db-get h "absent"))        ; nil
+(print (db-get-raw h "todo"))          ; buy oat milk
+(print (db-get-raw h "absent"))        ; nil
 (db-close h)
 ```
 
 Keys and values are **strings**. `db-open` returns a **handle** — an ordinary
-int — and `db-get` returns the latest value for a key or `nil`.
+int — and `db-get-raw` returns the latest stored text for a key or `nil`.
+
+This section's reader is called `db-get-raw` because §3l takes the name
+`db-get` for the value-level read. Everything else here is unchanged, and a
+program written against §3k needs exactly one edit: `db-get` → `db-get-raw`.
 
 ### The rules
 
@@ -1355,7 +1359,7 @@ int — and `db-get` returns the latest value for a key or `nil`.
   is not.
 - **`db-put handle key value` → nil.** Appends a record. An existing key is
   *not* rewritten in place: the new value is appended and the last write wins.
-- **`db-get handle key` → str or nil.** Never fails for an open handle. A
+- **`db-get-raw handle key` → str or nil.** Never fails for an open handle. A
   missing key is `nil`, so a caller can probe without a `try`.
 - **`db-flush handle` → nil.** `fsync`: the data is on the device, not in a
   buffer.
@@ -1366,7 +1370,7 @@ int — and `db-get` returns the latest value for a key or `nil`.
 - Handles are **1-based, lowest free slot first**, and the number comes back
   after a close.
 - A handle that is not open — stale, closed, zero, negative, or never issued —
-  is refused as `db-get: handle 7 is not open`.
+  is refused as `db-get-raw: handle 7 is not open`.
 
 ### Why an append-only log
 
@@ -1493,6 +1497,179 @@ Both tests are in `crates/ainl-cc/tests/db_crash.rs`, and both were confirmed to
 polynomial to `0xEDB88321` fails the CRC test, and dropping the NUL check makes
 the C port return `"a"` where Rust returns `nil`. A test never seen failing is
 not known to work.
+
+## 3l. Key-value storage: `db-set` / `db-get` / `db-get-raw` / `db-del` / `db-keys` / `db-count`
+
+A **value** store on top of §3k's byte store. Five more builtins, and a program
+can now remember a number, a list or a boolean between runs:
+
+```ainl
+(def h (db-open "settings.ainl-db"))
+(db-set h "theme" "dark")                 ; a string
+(db-set h "columns" 80)                   ; a number
+(db-set h "recent" (list "a.ainl" "b.ainl"))  ; a list
+(db-set h "onboarded" true)               ; a boolean
+(db-flush h)
+(db-close h)
+
+(def h (db-open "settings.ainl-db"))      ; a new process, same file
+(print (db-get h "theme"))                ; dark
+(print (db-get h "columns"))              ; 80
+(print (db-get h "missing"))              ; nil
+(db-del h "theme")
+(print (db-count h))                      ; 3
+(print (db-keys h))                       ; ("columns" "onboarded" "recent")
+(db-close h)
+```
+
+### The two layers, and the one name they share
+
+§3k stores **bytes**: `db-put` takes a string. This section stores **values**:
+`db-set` takes any AINL value. They are the same file, the same log, the same
+checksums, the same handle table — this layer is a second way to read and write
+the storage §3k already opened.
+
+One name belongs to both, and it is worth being precise about which one you get:
+
+| you write | reads | returns |
+|---|---|---|
+| `db-put` | bytes | — |
+| `db-get-raw` | bytes | the stored text, exactly |
+| `db-set` | values | — |
+| `db-get` | values | the AINL value, decoded |
+
+`db-get` is the **value** read. §3k's byte-level read kept its behaviour and
+moved to **`db-get-raw`**, which is its exact former self: same argument checks,
+same `nil` for a missing key, and it reports its errors under its own name
+(`db-get-raw: handle 7 is not open`). If you are porting a §3k program, that is
+the one-word change.
+
+### The rules
+
+- **`db-set handle key value` → nil.** Stores any value JSON-encoded. A value
+  JSON cannot represent — a function, a symbol, a non-finite float, a map with a
+  non-string key — is refused with **the JSON writer's own message**, e.g.
+  `json-serialize: cannot serialize a fn`. That is the same answer
+  `json-serialize` gives, on every backend, because it is the same code.
+- **`db-get handle key` → the value, or nil.** `nil` for a key that was never
+  written *and* for one that was deleted — the two are the same answer by
+  design, and `db-keys` is how you tell them apart.
+- **`db-get-raw handle key` → str or nil.** The stored text with no decoding,
+  including a delete's tombstone. This is how you see the bytes.
+- **`db-del handle key` → true or false.** `true` if the key was live, `false`
+  if it was not. Deleting an absent key is not an error, so
+  `(if (db-del h k) ...)` is safe to run twice.
+- **`db-keys handle` → a list of the live keys, sorted.** Sorted by byte value,
+  the same order `list-dir` uses.
+- **`db-count handle` → an int.** How many keys are **live** — a deleted key is
+  already out of the count.
+- Last write wins, exactly as in §3k: `db-set` on an existing key appends a new
+  record, and a `db-set` after a `db-del` brings the key back.
+
+### What a value is stored as
+
+JSON, through the **existing** `json-serialize` / `json-parse` machinery. There
+is no new format: the JSON text rides inside §3k's record envelope, so a file
+written by this layer is a §3k file, and `(db-get-raw h "theme")` on the value
+`"dark"` returns the eight characters `"dark"` — quotes included, because that
+is what JSON says a string is.
+
+Every value type round-trips exactly, **including the int/float distinction**:
+
+```ainl
+(db-set h "i" 1)     (db-get h "i")     ; 1    — an int
+(db-set h "f" 1.0)   (db-get h "f")     ; 1.0  — still a float
+```
+
+### Why deletion is a log record
+
+An append-only log cannot remove a record, so `db-del` **appends a tombstone**
+and the replay applies records in order: a tombstone drops the key from the
+index, and a later `db-set` for that key adds it back.
+
+That is not a shortcut. It is what makes a delete survive a crash exactly the
+way a write does — the recovery path is the *same* replay, not a second mechanism
+that has to be kept in agreement with the first. The cost is the cost §3k already
+documents: **the file grows.** A key written five times and deleted once leaves
+six records. Compaction is a later tier's problem, and pretending otherwise
+would mean a second write path.
+
+### The sharp edge: `db-put` text is not a value
+
+The two layers share a file, so a key can be written as bytes and read as a
+value. If the bytes happen to be valid JSON, you get the value they spell:
+
+```ainl
+(db-put h "k" "42")
+(db-get h "k")            ; 42 — an int, because "42" is a JSON number
+```
+
+If they are not, you get an **error**, not a bare `nil`:
+
+```ainl
+(db-put h "note" "buy milk")
+(db-get h "note")
+; runtime error: db-get: 'note' holds text that is not an AINL value (buy milk);
+;   store it with db-set rather than db-put
+```
+
+`nil` would be the wrong answer twice over: it is indistinguishable from a
+missing key, and it leaves a program that mixed the layers with no way to find
+out which of the two went wrong. The message names the text and the fix, and
+`(db-get-raw h "note")` returns `buy milk` — which is what you want if you meant
+the bytes all along.
+
+### The rules that exist only because two ports have to agree
+
+As in §3k, some rules are not about the language but about keeping
+`runtime.c` and the Rust engine from drifting apart.
+
+**`db-keys` is sorted, and that is a parity requirement, not a nicety.** The two
+engines index keys differently — a `HashMap` in Rust, a chained hash table in C —
+and neither has a defined iteration order. Returning the index in its natural
+order would print *the same keys in a different sequence* on each backend, which
+is the one thing byte-identical output forbids.
+
+**A key written twice occupies two entries in the C index and one in the Rust
+one.** The C index chains rather than replacing, so `db-keys` and `db-count`
+there deduplicate by testing whether an entry is the newest for its key. Skipping
+that made the C port list an overwritten key twice and count it twice while the
+interpreter listed it once — found by the parity test, and it is exactly the kind
+of bug that a single-backend test cannot see.
+
+**The value layer calls the C runtime's own JSON writer.** A `db-set` refusal
+and a `json-serialize` refusal are the same string on both engines not because
+the text was copied but because both sides call one writer.
+
+### Backend scope: the interpreter, the VM, and the AOT C binary
+
+`db-set`, `db-get`, `db-get-raw`, `db-del`, `db-keys` and `db-count` work in
+**three** backends — the interpreter, the bytecode VM, and the compiled AOT
+binary, whose C runtime carries a hand-port of this layer.
+
+The **Python / JavaScript / Ruby transpilers refuse** all nine `db-*` names,
+with `transpiler-only`:
+
+```
+$ ainl transpile --to python kv.ainl
+runtime error: ainl transpile --to python: `db-set` is transpiler-only
+  (found at byte 34) — this backend emits one source file for one host language,
+  and a host file API has no append-only log, no per-record checksum, and no
+  crash-tail recovery — a program that ran here would read a different file than
+  the one the interpreter wrote. Run the program with `ainl run` instead, or
+  `ainl compile` for the AOT C binary.
+```
+
+The label is **transpiler-only**, not interpreter-only, because `ainl compile`
+runs these programs perfectly well. §3k explains the reasoning at length; the
+refusal is the same contract, on the same terms.
+
+**The round-trip claim is scoped to those three backends, deliberately.** JSON
+has one number type and AINL has two. On a JavaScript target an AINL int would
+come back as `1.0`, so the int/float guarantee above does not survive there.
+Since `db-*` is refused by the transpilers outright, that divergence is
+documented rather than papered over — the same way `json_parity.rs` pins its own
+JS exception explicitly instead of quietly filtering the comparison.
 
 ## 4. Canonical examples
 

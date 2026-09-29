@@ -127,7 +127,7 @@ fn write_read_close_reopen_keeps_the_data() {
              (db-put h "beta" "two")
              (db-close h))"#,
         r#"(do (def h (db-open "{db}"))
-             (def r (list (db-get h "alpha") (db-get h "beta") (db-get h "absent")))
+             (def r (list (db-get-raw h "alpha") (db-get-raw h "beta") (db-get-raw h "absent")))
              (db-close h)
              r)"#,
     );
@@ -148,7 +148,7 @@ fn a_put_returns_nil_and_a_get_returns_the_value() {
              (db-flush h)
              (db-close h))"#,
         r#"(do (def h (db-open "{db}"))
-             (def r (list (db-get h "k") (db-get h "absent")))
+             (def r (list (db-get-raw h "k") (db-get-raw h "absent")))
              (db-close h)
              r)"#,
     );
@@ -201,7 +201,7 @@ fn the_last_write_wins_and_the_log_still_holds_both_records() {
              (db-put h "k" "first")
              (db-put h "k" "second")
              (db-close h))"#,
-        r#"(db-get (db-open "{db}") "k")"#,
+        r#"(db-get-raw (db-open "{db}") "k")"#,
     );
     assert_eq!(value, "second");
     assert_eq!(
@@ -250,7 +250,7 @@ fn a_key_with_awkward_bytes_round_trips() {
     }
     let mut gets = String::new();
     for (k, v) in &pairs {
-        gets.push_str(&format!("(test {:?} (db-get h {:?}) {:?})", k, k, v));
+        gets.push_str(&format!("(test {:?} (db-get-raw h {:?}) {:?})", k, k, v));
     }
     // `(test name expr expected)` fails the run on a mismatch, so a wrong read
     // back is a failure with the key and the two values named — better than an
@@ -293,7 +293,7 @@ fn a_torn_tail_is_dropped_and_the_file_is_repaired() {
     s.put_raw("t.ainl-db", &raw);
 
     let v = run_str(&format!(
-        r#"(do (def h (db-open "{p}")) (list (db-get h "a") (db-get h "b") (db-get h "parti")))"#
+        r#"(do (def h (db-open "{p}")) (list (db-get-raw h "a") (db-get-raw h "b") (db-get-raw h "parti")))"#
     ))
     .expect("open must recover, not fail");
     assert_eq!(
@@ -315,7 +315,7 @@ fn a_torn_tail_is_dropped_and_the_file_is_repaired() {
     // recovery that only ignored the tail would pass the assertions above and
     // then lose the appended record on the next write.
     let v2 = run_str(&format!(
-        r#"(do (def h (db-open "{p}")) (list (db-get h "a") (db-get h "b")))"#
+        r#"(do (def h (db-open "{p}")) (list (db-get-raw h "a") (db-get-raw h "b")))"#
     ))
     .expect("the second open must succeed");
     assert_eq!(v2.to_string(), "(\"1\" \"2\")");
@@ -340,7 +340,7 @@ fn a_flipped_byte_in_a_record_is_caught_by_the_checksum() {
     s.put_raw("c.ainl-db", &raw);
 
     let v = run_str(&format!(
-        r#"(do (def h (db-open "{p}")) (list (db-get h "a") (db-get h "b")))"#
+        r#"(do (def h (db-open "{p}")) (list (db-get-raw h "a") (db-get-raw h "b")))"#
     ))
     .expect("open must recover");
     assert_eq!(
@@ -367,7 +367,7 @@ fn a_corrupt_length_field_does_not_make_the_engine_trust_it() {
     let rec = raw.len() - (12 + 2);
     raw[rec..rec + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     s.put_raw("h.ainl-db", &raw);
-    let v = run_str(&format!(r#"(db-get (db-open "{p}") "a")"#)).expect("open must recover");
+    let v = run_str(&format!(r#"(db-get-raw (db-open "{p}") "a")"#)).expect("open must recover");
     assert_eq!(v, Value::Nil, "the record is rejected, not believed");
 }
 
@@ -423,7 +423,10 @@ fn an_arity_error_names_the_form_the_caller_should_have_written() {
             "(db-put 1 \"k\" \"v\" \"x\")",
             "db-put expects (db-put handle key value)",
         ),
-        ("(db-get 1)", "db-get expects (db-get handle key)"),
+        (
+            "(db-get-raw 1)",
+            "db-get-raw expects (db-get-raw handle key)",
+        ),
         ("(db-flush)", "db-flush expects (db-flush handle)"),
         ("(db-close)", "db-close expects (db-close handle)"),
     ] {
@@ -438,12 +441,15 @@ fn a_type_error_names_the_operand_and_its_type() {
         ("(db-open 1)", "db-open expects a str path, got int"),
         ("(db-put 1 2 3)", "db-put expects a str key, got int"),
         ("(db-put 1 \"k\" 2)", "db-put expects a str value, got int"),
-        ("(db-get 1 2)", "db-get expects a str key, got int"),
+        ("(db-get-raw 1 2)", "db-get-raw expects a str key, got int"),
         (
             "(db-put \"x\" \"k\" \"v\")",
             "db-put expects a db handle, got str",
         ),
-        ("(db-get nil \"k\")", "db-get expects a db handle, got nil"),
+        (
+            "(db-get-raw nil \"k\")",
+            "db-get-raw expects a db handle, got nil",
+        ),
     ] {
         let e = run_str(src).expect_err("must refuse");
         assert_eq!(e.message(), want, "for `{src}`");
@@ -454,7 +460,7 @@ fn a_type_error_names_the_operand_and_its_type() {
 fn a_handle_that_is_not_open_is_refused_by_number() {
     for (src, who) in [
         ("(db-put 7 \"k\" \"v\")", "db-put"),
-        ("(db-get 7 \"k\")", "db-get"),
+        ("(db-get-raw 7 \"k\")", "db-get-raw"),
         ("(db-flush 7)", "db-flush"),
         ("(db-close 7)", "db-close"),
     ] {
@@ -468,10 +474,10 @@ fn a_handle_that_is_not_open_is_refused_by_number() {
     // Zero and a negative number are "not open" too, not a slot off the front
     // of the table.
     for n in [0, -1] {
-        let e = run_str(&format!("(db-get {n} \"k\")")).expect_err("must refuse");
+        let e = run_str(&format!("(db-get-raw {n} \"k\")")).expect_err("must refuse");
         assert_eq!(
             e.message(),
-            format!("db-get: handle {n} is not open"),
+            format!("db-get-raw: handle {n} is not open"),
             "handle {n} must be refused the same way, not read out of bounds"
         );
     }

@@ -405,6 +405,56 @@ jobs:
       - name: Documented storage semantics
         run: ./scripts/check-docs-db.sh
 
+      # And for §3l (the key-value layer). Its claims are the ones a JSON codec
+      # cannot be assumed to have: a tombstone delete that has to clear db-get,
+      # db-keys AND db-count at once, keys sorted in byte order, an int that must
+      # not come back as 1.0, and `db-put` text that is an error rather than a
+      # nil when it is read back through the value layer. The last of those is
+      # the one a filtered comparison would hide, so it is asserted exactly.
+      - name: Documented key-value semantics
+        run: ./scripts/check-docs-kv.sh
+
+  kv-aot:
+    name: "key-value (3-backend parity + cross-process persistence)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-kv-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - run: cargo build --release
+
+      # The same program, the interpreter and a *compiled* binary, diffed byte
+      # for byte on stdout AND stderr. This job exists because the value layer
+      # in `runtime.c` is a hand-port, not a binding — there is no FFI in this
+      # project — so "the engine is shared, so it works everywhere for free" is
+      # true for the two evaluators and false here, and the only way to know is
+      # to compile and compare.
+      #
+      # The same job also runs three *separate* compiled processes, because
+      # "the value survived" is a claim about a file and a same-process reopen
+      # cannot make it: an index that never reached the disk passes every
+      # in-process test.
+      - name: "Key-value parity: interpreter vs compiled AOT"
+        run: cargo test -p ainl-cc --test db_kv_aot -- --nocapture
+
+      # The refusal matrix, asserted in both directions: all ten `db-*` names
+      # refused by python/js/ruby with the symbol named, and accepted by AOT.
+      # The second half is the one a blanket rule would break while every
+      # refusal test kept passing.
+      - name: "db-* refusal matrix (transpilers refuse, AOT accepts)"
+        run: ./scripts/check-refusal-kv.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest
