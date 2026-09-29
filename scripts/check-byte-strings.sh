@@ -48,12 +48,16 @@ if command -v cc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
   ccbin=$(command -v cc >/dev/null 2>&1 && echo cc || echo clang)
   "$BIN" compile "$PROG" -o "$tmp/prog" --keep-c "$tmp/prog.c" >/dev/null || { echo "FAIL aot: compile"; fail=1; }
   if [ -f "$tmp/prog.c" ]; then
+    # -lm: fmod (float formatting) and sqrt/floor live in libm, not libc, so a
+    # Linux link needs it and macOS tolerates it. Matches the flag set in
+    # crates/ainl-cc/tests/aot_stdlib.rs and the musl job in ci.yml.
+    #
     # No -std flag, deliberately: the runtime uses strdup/lstat/nanosleep, which
     # are POSIX rather than C11, and -std=c11 (which implies -std=__STRICT_ANSI__)
     # hides their declarations — so the implicit-int return breaks the link on
     # Linux while macOS's default keeps it working. This matches the flag set
     # scripts/check-aot.sh and crates/ainl-cc/tests/aot_stdlib.rs already use.
-    "$ccbin" -O2 -o "$tmp/prog.bin" "$tmp/prog.c" 2>"$tmp/cc.log" || {
+    "$ccbin" -O2 -o "$tmp/prog.bin" "$tmp/prog.c" -lm 2>"$tmp/cc.log" || {
       echo "FAIL aot: cc"; sed 's/^/    /' "$tmp/cc.log"; fail=1; }
     if [ -x "$tmp/prog.bin" ]; then
       out=$("$tmp/prog.bin" 2>&1); rc=$?
