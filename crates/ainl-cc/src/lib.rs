@@ -149,6 +149,20 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("db-select", 79),
     ("db-delete-row", 80),
     ("db-all-rows", 81),
+    // Tier 4 query layer. The ids continue the series, and the `enum` in
+    // runtime.c is extended in exactly this order — `aot_stdlib.rs` checks both
+    // directions, so a name added to one list and not the other fails there
+    // rather than silently renumbering every id after it.
+    //
+    // These two are the only storage builtins the transpilers refuse, and that
+    // is a decision about *implementation*, not about SQL: each is a query
+    // parser in the host runtime, and a transpiler that emitted a call to one
+    // would be emitting a call to a C function the target language does not
+    // have. The interpreter and this runtime both have the parser, so both say
+    // yes, and `db-query-count` exists so that the commonest aggregate is not
+    // one of the things the refusal has to cover.
+    ("db-query", 82),
+    ("db-query-count", 83),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

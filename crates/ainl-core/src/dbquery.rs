@@ -568,9 +568,12 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
                     text.push(bump!() as char);
                 }
             }
-            // `1abc`, `1.2.3` and `1e9` are one mistake, not two, and the
-            // position that names it is the start of the number — where the
-            // reader is already looking.
+            // `1abc`, `1.2.3` and `1e9` are one mistake, not two. The position
+            // is the **offending character**, because that is the character the
+            // message names: in `1abc` it is the `a`, one column right of the
+            // `1`. It is a position and not the start of the number, and the C
+            // port checks the same thing — the two were once a column apart
+            // because the comment here said "start" and the code said "next".
             if i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
                 return Err(sql_error(
                     who,

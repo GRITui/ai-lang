@@ -167,6 +167,11 @@ enum {
    * binary. The table layer rebinds no existing name, so unlike the value layer
    * there is no ordering constraint to reason about. */
   B_DB_CREATE_TABLE, B_DB_INSERT, B_DB_SELECT, B_DB_DELETE_ROW, B_DB_ALL_ROWS,
+  /* The query layer. Also appended in BUILTIN_IDS order, and also rebinding no
+   * existing name — `db-query` and `db-query-count` are new words, and the
+   * refusal to call them a language construct is why the transpilers say no to
+   * them while the interpreter and the AOT runtime both say yes. */
+  B_DB_QUERY, B_DB_QUERY_COUNT,
   B_COUNT
 };
 
@@ -4726,6 +4731,1766 @@ static Value builtin_db_delete_row(Value *args, int nargs) {
   return v_bool(existed);
 }
 
+/* ---- the query layer (dbq_*) ------------------------------------------- */
+
+/* A hand-port of ainl-core/src/dbquery.rs, read side by side with it.
+ *
+ * There is no FFI in this project, so this is a second implementation of one
+ * specification and not a binding — deliberately, because the runtime ships as
+ * a single C file the generated code is linked against, and because the point
+ * of the exercise is that two engines written separately still agree.
+ *
+ * That agreement is the thing to preserve, and it is why every diagnostic
+ * below is spelled the same as the Rust one: `dbq_aot.rs` asserts the error
+ * strings equal, so a divergence is a program whose stderr depends on which
+ * backend compiled it. It is also why the two unsupported-keyword tables, the
+ * subset sentence and the transposition repair are duplicated rather than
+ * generated — there is no build step that could hold them together, so a test
+ * does. The rules the two share, in one sentence each:
+ *
+ *   - columns are 1-based positions, and column 1 is the primary key;
+ *   - `WHERE` applies, then `ORDER BY` on the full row, then `LIMIT`;
+ *   - the sort is stable over primary-key order, so `DESC` does not reverse
+ *     an all-tie set;
+ *   - `=` and `!=` never order, so comparing across types is a false answer
+ *     rather than an error, and `<`/`>` against an unorderable value is an
+ *     error naming both types;
+ *   - a clause that is recognised but out of scope is refused by name, and a
+ *     near miss of a legal word is offered as the fix. */
+
+#define DBQ_WHO_MAX 32
+
+/* The grammar, quoted in every "not supported in v1" message. One string, so
+ * the message cannot disagree with the parser about what is supported. Must
+ * match SUBSET in dbquery.rs byte for byte. */
+#define DBQ_SUBSET                                                            \
+  "SELECT <* | col, ...> FROM <table> [WHERE <col> <op> <value> "               \
+  "[AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]"
+
+typedef enum { DBQ_EQ, DBQ_NE, DBQ_LT, DBQ_LE, DBQ_GT, DBQ_GE } DbqOp;
+
+typedef enum {
+  DBQ_T_WORD,
+  DBQ_T_INT,
+  DBQ_T_FLOAT,
+  DBQ_T_STR,
+  DBQ_T_STAR,
+  DBQ_T_COMMA,
+  DBQ_T_OP,
+  DBQ_T_LPAREN,
+  DBQ_T_RPAREN,
+  DBQ_T_END
+} DbqTokKind;
+
+typedef struct {
+  DbqTokKind kind;
+  /* A borrowed slice of the query for WORD/STR, or a number. Nothing here
+   * outlives the query text, which the builtin holds for the whole call, so no
+   * token owns anything and there is no free path to get wrong. */
+  const char *text;
+  int text_len;
+  long long i;
+  double f;
+  DbqOp op;
+  unsigned line, col;
+} DbqTok;
+
+typedef struct {
+  int idx; /* 0-based; the language is 1-based and the conversion is in one place */
+  unsigned line, col;
+} DbqCol;
+
+typedef struct {
+  DbqCol left;
+  DbqOp op;
+  Value right;
+} DbqCmp;
+
+typedef enum { DBQ_CMP, DBQ_AND, DBQ_OR } DbqCondKind;
+
+typedef struct DbqCond {
+  DbqCondKind kind;
+  DbqCmp cmp;
+  struct DbqCond *a, *b;
+} DbqCond;
+
+/* A parsed query. The projections are a fixed vector because the count is
+ * bounded by the query text and a program that wants a million columns is not
+ * a program this layer can help; the bound is named so the refusal is a
+ * sentence rather than a malloc failure. */
+#define DBQ_MAX_COLS 64
+
+typedef struct {
+  int star;              /* SELECT * */
+  int ncols;             /* else, the projection */
+  DbqCol cols[DBQ_MAX_COLS];
+  char *table; /* malloc'd; freed by dbq_query_free */
+  DbqCond *filter; /* malloc'd tree, or NULL */
+  int has_order;
+  DbqCol order_col;
+  int order_desc;
+  long long limit; /* < 0 when absent */
+} DbqQuery;
+
+static void dbq_cond_free(DbqCond *c) {
+  if (!c)
+    return;
+  dbq_cond_free(c->a);
+  dbq_cond_free(c->b);
+  free(c);
+}
+
+/* Keywords v1 recognises and refuses, with the words that could legally follow
+ * each one here. The second half is what makes the refusal useful: a word that
+ * close-matches something legal is a typo with a fix, and only a word that
+ * matches nothing legal is an out-of-scope construct. Mirrors UNSUPPORTED in
+ * dbquery.rs — the two lists are asserted to have the same first column by
+ * dbq_aot.rs, so a keyword added to one and not the other fails there. */
+typedef struct {
+  const char *kw;
+  const char *next[8]; /* NULL-terminated */
+} DbqKw;
+
+static const DbqKw DBQ_UNSUPPORTED[] = {
+    {"JOIN", {"ON", "USING", "WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
+    {"INNER", {"JOIN", "ON", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"LEFT", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"RIGHT", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"FULL", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"OUTER", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"CROSS", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"ON", {"WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
+    {"USING", {"WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
+    {"GROUP", {"BY", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"HAVING", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"DISTINCT", {"FROM", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"UNION", {"SELECT", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"INTERSECT", {"SELECT", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"EXCEPT", {"SELECT", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"CASE", {"WHEN", "THEN", "ELSE", "END", "FROM", "WHERE", "LIMIT", NULL}},
+    {"WHEN", {"THEN", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"THEN", {"WHEN", "ELSE", "END", "WHERE", "LIMIT", NULL}},
+    {"ELSE", {"END", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"IN", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"LIKE", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"BETWEEN", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"IS", {"NULL", "NOT", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"NOT", {"WHERE", "IN", "LIKE", "BETWEEN", "NULL", "ORDER", "LIMIT", NULL}},
+    {"EXISTS", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"OFFSET", {"ORDER", "WHERE", "LIMIT", NULL}},
+    {"AS", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"PRIMARY", {"KEY", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"KEY", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"CREATE", {"TABLE", "INDEX", "FROM", "WHERE", "LIMIT", NULL}},
+    {"TABLE", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"DROP", {"TABLE", "INDEX", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"ALTER", {"TABLE", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"ADD", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"INSERT", {"INTO", "VALUES", "FROM", "WHERE", "LIMIT", NULL}},
+    {"INTO", {"VALUES", "FROM", "WHERE", "LIMIT", NULL}},
+    {"VALUES", {"FROM", "WHERE", "LIMIT", NULL}},
+    {"UPDATE", {"SET", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"DELETE", {"FROM", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"CAST", {"AS", "FROM", "WHERE", "LIMIT", NULL}},
+    {"NULLS", {"FIRST", "LAST", "WHERE", "ORDER", "LIMIT", NULL}},
+    {"FIRST", {"WHERE", "ORDER", "LIMIT", NULL}},
+    {"LAST", {"WHERE", "ORDER", "LIMIT", NULL}},
+};
+
+/* The aggregates, refused with the name of the builtin that does the job. The
+ * second field is that builtin, or "" when there is no equivalent. Mirrors
+ * AGGREGATES in dbquery.rs. */
+static const struct {
+  const char *kw;
+  const char *fix;
+} DBQ_AGGREGATES[] = {
+    {"COUNT", "db-query-count"},
+    {"SUM", ""},
+    {"AVG", ""},
+    {"MIN", ""},
+    {"MAX", ""},
+};
+
+/* The words the subset does accept. A "did you mean" is only useful if the
+ * reader can type the suggestion and have it accepted. Mirrors LEGAL_WORDS. */
+static const char *DBQ_LEGAL[] = {"SELECT", "FROM", "WHERE", "ORDER", "BY",
+                                   "LIMIT",  "ASC",   "DESC",  "AND",   "OR",
+                                   "true",   "false", "nil",   "null",  NULL};
+
+/* A query error, built in one place. The four parts are in this order because a
+ * reader who takes only the first sentence still knows the rule they broke.
+ * The AOT runtime prints this whole string on stderr with no wrapper, so it
+ * must be byte-identical to the Rust `sql_error`. */
+static void dbq_error(const char *who, const char *sql, const DbqTok *at,
+                      const char *detail, const char *suggestion) {
+  if (suggestion)
+    set_err("%s: at line %u, col %u: %s in the query \"%s\" \xe2\x80\x94 did you "
+            "mean '%s'?",
+            who, at->line, at->col, detail, sql, suggestion);
+  else
+    set_err("%s: at line %u, col %u: %s in the query \"%s\"", who, at->line,
+            at->col, detail, sql);
+}
+
+/* The "not supported in v1" form: the refusal plus the subset sentence. */
+static void dbq_unsupported(const char *who, const char *sql, const DbqTok *at,
+                            const char *what) {
+  char detail[1024];
+  snprintf(detail, sizeof(detail),
+           "%s is not supported in v1; the supported subset is: %s", what,
+           DBQ_SUBSET);
+  dbq_error(who, sql, at, detail, NULL);
+}
+
+/* Uppercase one byte, for the case-insensitive comparisons. AINL keywords are
+ * ASCII, so a byte above 'z' is left alone rather than folded — `dbq_fold` is
+ * not a Unicode case map and must not be used on display text. */
+static char dbq_fold(char c) {
+  return (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+}
+
+/* The rolling-buffer width for the suggestion distance. Every candidate set
+ * holds SQL keywords, all well under this; a longer one is skipped by
+ * `dbq_close_match` rather than silently truncated. */
+#define DBQ_CMP_BUF 32
+
+/* Case-insensitive Levenshtein distance over two buffers of known length,
+ * both shorter than DBQ_CMP_BUF. Two rows rather than a full table: the row
+ * above is the only one the current cell reads, and this is the memory the
+ * suggestion path is allowed to cost on an error path. */
+static int dbq_levenshtein(const char *a, const char *b, int n, int m) {
+  int prev[DBQ_CMP_BUF], cur[DBQ_CMP_BUF];
+  int r, c;
+  if (n > m)
+    return dbq_levenshtein(b, a, m, n);
+  for (c = 0; c <= m; c++)
+    prev[c] = c;
+  for (r = 1; r <= n; r++) {
+    cur[0] = r;
+    for (c = 1; c <= m; c++) {
+      int cost = dbq_fold(a[r - 1]) != dbq_fold(b[c - 1]);
+      int best = prev[c] + 1;
+      if (cur[c - 1] + 1 < best)
+        best = cur[c - 1] + 1;
+      if (prev[c - 1] + cost < best)
+        best = prev[c - 1] + cost;
+      cur[c] = best;
+    }
+    for (c = 0; c <= m; c++)
+      prev[c] = cur[c];
+  }
+  return prev[m];
+}
+
+static int dbq_streq_ci(const char *a, const char *b, int alen, int blen) {
+  int i;
+  if (alen != blen)
+    return 0;
+  for (i = 0; i < alen; i++)
+    if (dbq_fold(a[i]) != dbq_fold(b[i]))
+      return 0;
+  return 1;
+}
+
+static int dbq_is_word_char(unsigned char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
+}
+
+static int dbq_is_digit(unsigned char c) { return c >= '0' && c <= '9'; }
+
+static int dbq_is_space(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0C || c == 0x0B;
+}
+
+/* Is `w` (len `wl`) `want` with one pair of adjacent characters swapped?
+ *
+ * The one edit plain Levenshtein cannot see, and the same check dbquery.rs
+ * makes: `close_match` caps at one edit for a short word, and a transposition
+ * scores two, so `FORM` would otherwise get no "did you mean 'FROM'?".
+ * Deliberately duplicated rather than shared — there is no FFI here, and the
+ * suggestion machinery in this runtime is a different function. */
+static int dbq_is_transposition(const char *w, int wl, const char *want) {
+  int i, n = wl, d0 = -1, d1 = -1;
+  if (n != (int)strlen(want) || n < 2)
+    return 0;
+  for (i = 0; i < n; i++) {
+    if (dbq_fold(w[i]) == dbq_fold(want[i]))
+      continue;
+    if (d0 < 0)
+      d0 = i;
+    else if (d1 < 0)
+      d1 = i;
+    else
+      return 0;
+  }
+  if (d0 < 0 || d1 < 0)
+    return 0;
+  return dbq_fold(w[d0]) == dbq_fold(want[d1]) &&
+         dbq_fold(w[d1]) == dbq_fold(want[d0]);
+}
+
+/* The closest of `cands` to `w`, or NULL. Mirrors `close_match` in
+ * suggest.rs: case-insensitive, bounded Levenshtein, a candidate must contain an
+ * alphanumeric character, exact matches are skipped, and ties are broken by the
+ * longer shared prefix and then alphabetically — a total order, so the answer
+ * cannot depend on the order of `cands`.
+ *
+ * **Candidates of any length are compared.** A first version of this only
+ * compared equal lengths, on the theory that a mistyped keyword keeps its
+ * length. It does not: `WHER` for `WHERE` is one deletion, and the length
+ * restriction made the function answer "nothing close" — so `WHER` produced a
+ * bare `unexpected 'WHER'` where the interpreter said "did you mean 'WHERE'?" or
+ * "'WHEN'". A reader who mistypes one character has usually also dropped one,
+ * and both are one edit.
+ *
+ * Because the lengths now differ, the rolling buffer is sized for the longest
+ * candidate and a row longer than that is skipped rather than read past. */
+static const char *dbq_close_match(const char *w, int wl,
+                                   const char *const *cands) {
+  const char *best = NULL;
+  double allow;
+  int best_d = 0, best_pref = 0, c;
+  if (wl < 3 || wl >= DBQ_CMP_BUF)
+    return NULL;
+  allow = wl * 0.34;
+  if (allow < 1.0)
+    allow = 1.0;
+  for (c = 0; cands[c]; c++) {
+    const char *cand = cands[c];
+    int cl = (int)strlen(cand), d, i, pref = 0, alnum = 0;
+    if (cl >= DBQ_CMP_BUF)
+      continue;
+    for (i = 0; i < cl; i++) {
+      unsigned char ch = (unsigned char)cand[i];
+      if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') ||
+          (ch >= 'A' && ch <= 'Z'))
+        alnum = 1;
+    }
+    if (!alnum)
+      continue;
+    if (dbq_streq_ci(w, cand, wl, cl))
+      continue; /* an exact match is not advice */
+    d = dbq_levenshtein(w, cand, wl, cl);
+    if ((double)d > allow)
+      continue;
+    for (i = 0; i < wl && i < cl; i++)
+      if (dbq_fold(w[i]) != dbq_fold(cand[i]))
+        break;
+    pref = i;
+    if (!best || d < best_d || (d == best_d && pref > best_pref) ||
+        (d == best_d && pref == best_pref && strcmp(cand, best) < 0)) {
+      best = cand;
+      best_d = d;
+      best_pref = pref;
+    }
+  }
+  return best;
+}
+
+/* The "not supported in v1" decision, for a bare word in a keyword position.
+ * Mirrors `P::refuse_unsupported`. Returns 0 with g_err set.
+ *
+ * Every use of `t->text` below is `%.*s` with `t->text_len`, never `%s`. A
+ * token's text is a **borrowed slice** of the query, not a C string, and `%s`
+ * runs to the next NUL — which for `WHER 1=1` is the end of the whole query, so
+ * the message read `unexpected 'WHER 1=1'` and pointed at a token that does not
+ * exist. The other half of the fix is the type below: a slice is a struct, and
+ * a struct cannot be passed to `%s` by accident. */
+static int dbq_refuse_unsupported(const char *who, const char *sql,
+                                  const DbqTok *t) {
+  char up[64], detail[1024];
+  const char *fix;
+  size_t i;
+  int n = t->text_len;
+  if (n <= 0 || n >= (int)sizeof(up)) {
+    dbq_error(who, sql, t, "unexpected token", NULL);
+    return 0;
+  }
+  for (i = 0; i < (size_t)n; i++) {
+    char c = t->text[i];
+    up[i] = (char)((c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c);
+  }
+  up[n] = 0;
+
+  for (i = 0; i < sizeof(DBQ_AGGREGATES) / sizeof(DBQ_AGGREGATES[0]); i++) {
+    if (strcmp(up, DBQ_AGGREGATES[i].kw) == 0) {
+      if (DBQ_AGGREGATES[i].fix[0] == 0)
+        snprintf(detail, sizeof(detail),
+                 "%s is not supported in v1; the supported subset is: %s \xe2\x80\x94 "
+                 "%s is an aggregate, and v1 has no aggregate expressions",
+                 up, DBQ_SUBSET, up);
+      else
+        snprintf(detail, sizeof(detail),
+                 "%s is not supported in v1; the supported subset is: %s \xe2\x80\x94 "
+                 "use (%s handle \"SELECT \xe2\x80\xa6\") to count matching rows",
+                 up, DBQ_SUBSET, DBQ_AGGREGATES[i].fix);
+      dbq_error(who, sql, t, detail, NULL);
+      return 0;
+    }
+  }
+
+  for (i = 0; i < sizeof(DBQ_UNSUPPORTED) / sizeof(DBQ_UNSUPPORTED[0]); i++) {
+    if (strcmp(up, DBQ_UNSUPPORTED[i].kw) == 0) {
+      fix = dbq_close_match(t->text, t->text_len, DBQ_UNSUPPORTED[i].next);
+      if (fix) {
+        snprintf(detail, sizeof(detail), "'%s' is not supported in v1", up);
+        dbq_error(who, sql, t, detail, fix);
+        return 0;
+      }
+      snprintf(detail, sizeof(detail), "'%s'", up);
+      dbq_unsupported(who, sql, t, detail);
+      return 0;
+    }
+  }
+
+  /* An unknown word. A near miss of an out-of-scope keyword is named as such,
+   * and a near miss of a legal one is offered as the fix. Suggesting a keyword
+   * without saying it is out of scope sends the reader in a circle. */
+  {
+    const char *refused[128];
+    size_t rn = 0;
+    for (i = 0; i < sizeof(DBQ_UNSUPPORTED) / sizeof(DBQ_UNSUPPORTED[0]); i++)
+      refused[rn++] = DBQ_UNSUPPORTED[i].kw;
+    for (i = 0; i < sizeof(DBQ_AGGREGATES) / sizeof(DBQ_AGGREGATES[0]); i++)
+      refused[rn++] = DBQ_AGGREGATES[i].kw;
+    refused[rn] = NULL;
+    fix = dbq_close_match(t->text, t->text_len, refused);
+    if (fix) {
+      snprintf(detail, sizeof(detail),
+               "'%.*s' is not supported in v1; the supported subset is: %s "
+               "\xe2\x80\x94 did you mean '%s'?",
+               t->text_len, t->text, DBQ_SUBSET, fix);
+      dbq_error(who, sql, t, detail, NULL);
+      return 0;
+    }
+    fix = dbq_close_match(t->text, t->text_len, DBQ_LEGAL);
+    if (fix) {
+      snprintf(detail, sizeof(detail), "unexpected '%.*s'", t->text_len, t->text);
+      dbq_error(who, sql, t, detail, fix);
+      return 0;
+    }
+  }
+  snprintf(detail, sizeof(detail), "unexpected '%.*s'", t->text_len, t->text);
+  dbq_error(who, sql, t, detail, NULL);
+  return 0;
+}
+
+/* ---- the tokenizer ----------------------------------------------------- */
+
+/* Bytes scanned, not characters, but the COLUMN counter advances one per
+ * character so the position a reader is given is the position they can count.
+ * The only place this is observably wrong is inside a multi-byte word, and
+ * `dbq_utf8_len` below keeps it right there. */
+static size_t dbq_utf8_len(unsigned char c) {
+  if (c < 0x80)
+    return 1;
+  if ((c & 0xE0) == 0xC0)
+    return 2;
+  if ((c & 0xF0) == 0xE0)
+    return 3;
+  if ((c & 0xF8) == 0xF0)
+    return 4;
+  return 1;
+}
+
+/* The tokens, in one malloc'd array the caller frees. `Tok::End` is always the
+ * last element and is never consumed, so the parser can look ahead forever
+ * without a bounds check.
+ *
+ * Position is the token's **start**, not where the scanner happens to be when
+ * the token is finished. Getting that wrong is invisible for a one-character
+ * token and off by the token's whole length for a word — so `FORM` at column
+ * 10 was reported at column 14, and every such message pointed past the
+ * mistake at the character after it. Hence the explicit line/col argument. */
+static DbqTok *dbq_tokenize(const char *who, const char *sql, int *out_n) {
+  size_t cap = 32, n = 0, i = 0, len = strlen(sql);
+  DbqTok *toks = (DbqTok *)malloc(cap * sizeof(DbqTok));
+  unsigned line = 1, col = 1;
+  if (!toks) {
+    set_err("%s: out of memory", who);
+    return NULL;
+  }
+#define DBQ_PUSH(k, tl, tc)                                                    \
+  do {                                                                         \
+    if (n == cap) {                                                            \
+      DbqTok *grown =                                                          \
+          (DbqTok *)realloc(toks, cap * 2 * sizeof(DbqTok));                  \
+      if (!grown) {                                                            \
+        free(toks);                                                            \
+        set_err("%s: out of memory", who);                                     \
+        return NULL;                                                           \
+      }                                                                        \
+      toks = grown;                                                            \
+      cap *= 2;                                                                \
+    }                                                                          \
+    toks[n].kind = (k);                                                        \
+    toks[n].text = NULL;                                                       \
+    toks[n].text_len = 0;                                                      \
+    toks[n].i = 0;                                                             \
+    toks[n].f = 0.0;                                                           \
+    toks[n].op = DBQ_EQ;                                                       \
+    toks[n].line = (tl);                                                       \
+    toks[n].col = (tc);                                                        \
+    n++;                                                                       \
+  } while (0)
+
+  while (i < len) {
+    unsigned char c = (unsigned char)sql[i];
+    unsigned sl = line, sc = col;
+
+    if (dbq_is_space(c)) {
+      i++;
+      col++;
+      continue;
+    }
+
+    /* Operators, the two-character ones first: `<=` must not lex as `<` `=`. */
+    if ((c == '!' || c == '<' || c == '>') && i + 1 < len && sql[i + 1] == '=') {
+      DBQ_PUSH(DBQ_T_OP, sl, sc);
+      toks[n - 1].op = (c == '!')   ? DBQ_NE
+                       : (c == '<') ? DBQ_LE
+                                    : DBQ_GE;
+      i += 2;
+      col += 2;
+      continue;
+    }
+    if (c == '=' || c == '<' || c == '>') {
+      DBQ_PUSH(DBQ_T_OP, sl, sc);
+      toks[n - 1].op = (c == '=')   ? DBQ_EQ
+                       : (c == '<') ? DBQ_LT
+                                    : DBQ_GT;
+      i++;
+      col++;
+      continue;
+    }
+    if (c == '*') {
+      DBQ_PUSH(DBQ_T_STAR, sl, sc);
+      i++;
+      col++;
+      continue;
+    }
+    if (c == ',') {
+      DBQ_PUSH(DBQ_T_COMMA, sl, sc);
+      i++;
+      col++;
+      continue;
+    }
+    if (c == '(') {
+      DBQ_PUSH(DBQ_T_LPAREN, sl, sc);
+      i++;
+      col++;
+      continue;
+    }
+    if (c == ')') {
+      DBQ_PUSH(DBQ_T_RPAREN, sl, sc);
+      i++;
+      col++;
+      continue;
+    }
+
+    /* A quoted string, either quote style, with no escapes — the AINL lexer
+     * has already processed the escapes in the text this receives. */
+    if (c == '\'' || c == '"') {
+      char quote = (char)c;
+      size_t start;
+      i++;
+      col++;
+      start = i;
+      while (i < len && sql[i] != quote) {
+        if (sql[i] == '\n') {
+          line++;
+          col = 1;
+        } else {
+          col++;
+        }
+        i++;
+      }
+      if (i >= len) {
+        DbqTok at = {DBQ_T_END, NULL, 0, 0, 0.0, DBQ_EQ, sl, sc};
+        char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "a string literal opened with %c was never closed", quote);
+        free(toks);
+        dbq_error(who, sql, &at, detail, NULL);
+        return NULL;
+      }
+      DBQ_PUSH(DBQ_T_STR, sl, sc);
+      toks[n - 1].text = sql + start;
+      toks[n - 1].text_len = (int)(i - start);
+      i++; /* the closing quote */
+      col++;
+      continue;
+    }
+
+    /* A number: an integer, or a decimal with a fraction. A leading `-` only
+     * when a digit follows, so `a-1` is still two tokens. */
+    if (dbq_is_digit(c) ||
+        (c == '-' && i + 1 < len && dbq_is_digit((unsigned char)sql[i + 1]))) {
+      size_t start = i;
+      int is_float = 0;
+      char buf[64];
+      size_t ndig;
+      if (c == '-')
+        i++;
+      while (i < len && dbq_is_digit((unsigned char)sql[i])) {
+        i++;
+        col++;
+      }
+      if (i < len && sql[i] == '.' && i + 1 < len &&
+          dbq_is_digit((unsigned char)sql[i + 1])) {
+        is_float = 1;
+        i++;
+        col++;
+        while (i < len && dbq_is_digit((unsigned char)sql[i])) {
+          i++;
+          col++;
+        }
+      }
+      /* `1abc`, `1.2.3` and `1e9` are one mistake. The position is the *running*
+       * `col` — that is, the offending character itself, which is what the
+       * message names — not `sl`/`sc` at the start of the number. The comment
+       * here used to claim the opposite, and the C port was written to match the
+       * comment, so both engines pointed one column to the left of the `a`. */
+      if (i < len && (dbq_is_word_char((unsigned char)sql[i]) || sql[i] == '.')) {
+        DbqTok at = {DBQ_T_END, NULL, 0, 0, 0.0, DBQ_EQ, line, col};
+        char detail[256];
+        char bad[2] = {sql[i], 0};
+        snprintf(detail, sizeof(detail),
+                 "a number cannot be followed by '%s'", bad);
+        free(toks);
+        dbq_error(who, sql, &at, detail, NULL);
+        return NULL;
+      }
+      ndig = i - start;
+      if (ndig >= sizeof(buf)) {
+        DbqTok at = {DBQ_T_END, NULL, 0, 0, 0.0, DBQ_EQ, sl, sc};
+        char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "the number is too long to read (at most %d digits)",
+                 (int)sizeof(buf) - 1);
+        free(toks);
+        dbq_error(who, sql, &at, detail, NULL);
+        return NULL;
+      }
+      memcpy(buf, sql + start, ndig);
+      buf[ndig] = 0;
+      DBQ_PUSH(is_float ? DBQ_T_FLOAT : DBQ_T_INT, sl, sc);
+      toks[n - 1].text = sql + start;
+      toks[n - 1].text_len = (int)ndig;
+      if (is_float) {
+        toks[n - 1].f = strtod(buf, NULL);
+      } else {
+        char *endp = NULL;
+        long long v = strtoll(buf, &endp, 10);
+        if (!endp || *endp) {
+          DbqTok at = {DBQ_T_END, NULL, 0, 0, 0.0, DBQ_EQ, sl, sc};
+          char detail[256];
+          snprintf(detail, sizeof(detail),
+                   "the integer %s does not fit in a 64-bit signed integer", buf);
+          free(toks);
+          dbq_error(who, sql, &at, detail, NULL);
+          return NULL;
+        }
+        toks[n - 1].i = v;
+      }
+      continue;
+    }
+
+    /* A bare word. A word is a keyword or a name depending on where it
+     * appears, so nothing is classified here. */
+    if (dbq_is_word_char(c)) {
+      size_t start = i;
+      while (i < len && dbq_is_word_char((unsigned char)sql[i])) {
+        i += dbq_utf8_len((unsigned char)sql[i]);
+        col++;
+      }
+      DBQ_PUSH(DBQ_T_WORD, sl, sc);
+      toks[n - 1].text = sql + start;
+      toks[n - 1].text_len = (int)(i - start);
+      continue;
+    }
+
+    {
+      DbqTok at = {DBQ_T_END, NULL, 0, 0, 0.0, DBQ_EQ, sl, sc};
+      char detail[256];
+      char bad[2] = {(char)c, 0};
+      snprintf(detail, sizeof(detail),
+               "'%s' is not part of the query language", bad);
+      free(toks);
+      dbq_error(who, sql, &at, detail, NULL);
+      return NULL;
+    }
+  }
+#undef DBQ_PUSH
+  /* The sentinel, appended directly: the macro is already undefined. `Tok::End`
+   * is never consumed, so every lookahead in the parser is in bounds. */
+  if (n == cap) {
+    DbqTok *grown = (DbqTok *)realloc(toks, cap * 2 * sizeof(DbqTok));
+    if (!grown) {
+      free(toks);
+      set_err("%s: out of memory", who);
+      return NULL;
+    }
+    toks = grown;
+    cap *= 2;
+  }
+  toks[n].kind = DBQ_T_END;
+  toks[n].text = NULL;
+  toks[n].text_len = 0;
+  toks[n].i = 0;
+  toks[n].f = 0.0;
+  toks[n].op = DBQ_EQ;
+  toks[n].line = line;
+  toks[n].col = col;
+  n++;
+  *out_n = (int)n;
+  return toks;
+}
+
+/* How a token is named inside a message. Caller frees. */
+static char *dbq_describe(const DbqTok *t) {
+  static char buf[256];
+  switch (t->kind) {
+  case DBQ_T_WORD:
+    snprintf(buf, sizeof(buf), "'%.*s'", t->text_len, t->text);
+    break;
+  case DBQ_T_INT:
+    snprintf(buf, sizeof(buf), "%lld", t->i);
+    break;
+  case DBQ_T_FLOAT:
+    snprintf(buf, sizeof(buf), "%g", t->f);
+    break;
+  case DBQ_T_STR:
+    snprintf(buf, sizeof(buf), "'%.*s'", t->text_len, t->text);
+    break;
+  case DBQ_T_STAR:
+    snprintf(buf, sizeof(buf), "'*'");
+    break;
+  case DBQ_T_COMMA:
+    snprintf(buf, sizeof(buf), "','");
+    break;
+  case DBQ_T_OP:
+    snprintf(buf, sizeof(buf), "'%s'",
+             t->op == DBQ_EQ   ? "="
+             : t->op == DBQ_NE ? "!="
+             : t->op == DBQ_LT ? "<"
+             : t->op == DBQ_LE ? "<="
+             : t->op == DBQ_GT ? ">"
+                               : ">=");
+    break;
+  case DBQ_T_LPAREN:
+    snprintf(buf, sizeof(buf), "'('");
+    break;
+  case DBQ_T_RPAREN:
+    snprintf(buf, sizeof(buf), "')'");
+    break;
+  default:
+    snprintf(buf, sizeof(buf), "the end of the query");
+    break;
+  }
+  return buf;
+}
+
+/* ---- the parser -------------------------------------------------------- */
+
+typedef struct {
+  const char *who;
+  const char *sql;
+  DbqTok *toks;
+  int n;
+  int i;
+} DbqP;
+
+static DbqTok *dbq_peek(DbqP *p) {
+  return &p->toks[p->i < p->n - 1 ? p->i : p->n - 1];
+}
+
+/* Consume `word` if it is next, case-insensitively. */
+static int dbq_eat(DbqP *p, const char *word) {
+  DbqTok *t = dbq_peek(p);
+  if (t->kind == DBQ_T_WORD &&
+      dbq_streq_ci(t->text, word, t->text_len, (int)strlen(word))) {
+    p->i++;
+    return 1;
+  }
+  return 0;
+}
+
+/* A keyword position. The transposition check is here rather than only in
+ * `close_match` for the reason documented on `dbq_is_transposition`. */
+static int dbq_keyword(DbqP *p, const char *word) {
+  DbqTok *t = dbq_peek(p);
+  DbqTok copy;
+  if (dbq_eat(p, word))
+    return 1;
+  copy = *t;
+  if (copy.kind == DBQ_T_END) {
+    char detail[1024];
+    snprintf(detail, sizeof(detail),
+             "the query ended, but %s is required; the supported subset is: %s",
+             word, DBQ_SUBSET);
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  if (copy.kind == DBQ_T_WORD &&
+      dbq_is_transposition(copy.text, copy.text_len, word)) {
+    char detail[256];
+    snprintf(detail, sizeof(detail), "unexpected '%.*s'", copy.text_len,
+             copy.text);
+    dbq_error(p->who, p->sql, &copy, detail, word);
+    return 0;
+  }
+  return dbq_refuse_unsupported(p->who, p->sql, &copy);
+}
+
+static int dbq_is_known_keyword(const char *w, int wl) {
+  char up[64];
+  size_t i;
+  if (wl <= 0 || wl >= (int)sizeof(up))
+    return 0;
+  for (i = 0; i < (size_t)wl; i++) {
+    char c = w[i];
+    up[i] = (char)((c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c);
+  }
+  up[wl] = 0;
+  for (i = 0; i < sizeof(DBQ_UNSUPPORTED) / sizeof(DBQ_UNSUPPORTED[0]); i++)
+    if (strcmp(up, DBQ_UNSUPPORTED[i].kw) == 0)
+      return 1;
+  for (i = 0; i < sizeof(DBQ_AGGREGATES) / sizeof(DBQ_AGGREGATES[0]); i++)
+    if (strcmp(up, DBQ_AGGREGATES[i].kw) == 0)
+      return 1;
+  return 0;
+}
+
+/* A column reference: a 1-based position. */
+static int dbq_column(DbqP *p, DbqCol *out) {
+  DbqTok *t = dbq_peek(p);
+  DbqTok copy = *t;
+  if (copy.kind == DBQ_T_INT) {
+    if (copy.i < 1) {
+      char detail[256];
+      snprintf(detail, sizeof(detail),
+               "column %lld does not exist; columns are numbered from 1", copy.i);
+      dbq_error(p->who, p->sql, &copy, detail, NULL);
+      return 0;
+    }
+    out->idx = (int)(copy.i - 1);
+    out->line = copy.line;
+    out->col = copy.col;
+    p->i++;
+    return 1;
+  }
+  if (copy.kind == DBQ_T_WORD) {
+    if (dbq_is_known_keyword(copy.text, copy.text_len))
+      return dbq_refuse_unsupported(p->who, p->sql, &copy);
+    {
+      char detail[512];
+      snprintf(detail, sizeof(detail),
+               "'%.*s' is not a column: a row in this database is a list, so "
+               "columns are numbered from 1 and 1 is the primary key",
+               copy.text_len, copy.text);
+      dbq_error(p->who, p->sql, &copy, detail, NULL);
+    }
+    return 0;
+  }
+  {
+    char detail[512];
+    char *d = dbq_describe(&copy);
+    snprintf(detail, sizeof(detail), "expected a column number, got %s", d);
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+  }
+  return 0;
+}
+
+/* The right-hand side of a comparison: a number, a quoted string, or one of
+ * the four literal words. A bare word that is none of those is a column, and
+ * comparing two columns is not in the subset. */
+static int dbq_literal(DbqP *p, Value *out) {
+  DbqTok copy = *dbq_peek(p);
+  switch (copy.kind) {
+  case DBQ_T_INT:
+    *out = v_int((int64_t)copy.i);
+    p->i++;
+    return 1;
+  case DBQ_T_FLOAT:
+    *out = v_float(copy.f);
+    p->i++;
+    return 1;
+  case DBQ_T_STR: {
+    char *s = (char *)malloc((size_t)copy.text_len + 1);
+    if (!s) {
+      set_err("%s: out of memory", p->who);
+      return 0;
+    }
+    memcpy(s, copy.text, (size_t)copy.text_len);
+    s[copy.text_len] = 0;
+    *out = v_str_take(s);
+    p->i++;
+    return 1;
+  }
+  case DBQ_T_LPAREN: {
+    char detail[256];
+    snprintf(detail, sizeof(detail), "a subquery as a value");
+    dbq_unsupported(p->who, p->sql, &copy, detail);
+    return 0;
+  }
+  case DBQ_T_WORD: {
+    if (dbq_streq_ci(copy.text, "true", copy.text_len, 4)) {
+      *out = v_bool(1);
+      p->i++;
+      return 1;
+    }
+    if (dbq_streq_ci(copy.text, "false", copy.text_len, 5)) {
+      *out = v_bool(0);
+      p->i++;
+      return 1;
+    }
+    if (dbq_streq_ci(copy.text, "nil", copy.text_len, 3) ||
+        dbq_streq_ci(copy.text, "null", copy.text_len, 4)) {
+      *out = v_nil();
+      p->i++;
+      return 1;
+    }
+    if (dbq_is_known_keyword(copy.text, copy.text_len))
+      return dbq_refuse_unsupported(p->who, p->sql, &copy);
+    {
+      char detail[512];
+      snprintf(detail, sizeof(detail),
+               "'%.*s' is not a value: the right-hand side of a comparison is a "
+               "number, a quoted string, true, false or nil, and a column name "
+               "is not accepted here (only a column on the left)",
+               copy.text_len, copy.text);
+      dbq_error(p->who, p->sql, &copy, detail, NULL);
+    }
+    return 0;
+  }
+  default: {
+    char detail[512];
+    char *d = dbq_describe(&copy);
+    snprintf(detail, sizeof(detail),
+             "expected a value \xe2\x80\x94 a number, a quoted string, true, "
+             "false or nil \xe2\x80\x94 got %s",
+             d);
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  }
+}
+
+static int dbq_comparison(DbqP *p, DbqCmp *out) {
+  DbqTok copy;
+  if (!dbq_column(p, &out->left))
+    return 0;
+  copy = *dbq_peek(p);
+  if (copy.kind == DBQ_T_OP) {
+    out->op = copy.op;
+    p->i++;
+  } else if (copy.kind == DBQ_T_WORD) {
+    return dbq_refuse_unsupported(p->who, p->sql, &copy);
+  } else {
+    char detail[512];
+    char *d = dbq_describe(&copy);
+    snprintf(detail, sizeof(detail),
+             "expected one of '=', '!=', '<', '<=', '>', '>=' after the column, "
+             "got %s",
+             d);
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  return dbq_literal(p, &out->right);
+}
+
+static DbqCond *dbq_cond_new(DbqCondKind k) {
+  DbqCond *c = (DbqCond *)calloc(1, sizeof(DbqCond));
+  if (c)
+    c->kind = k;
+  return c;
+}
+
+/* `cond := cmp (AND|OR cmp)*`, with AND binding tighter — SQL's own rule, and
+ * the only one that needs no parentheses, which v1 does not have. */
+static int dbq_condition(DbqP *p, DbqCond **out) {
+  DbqCond *left = dbq_cond_new(DBQ_CMP);
+  if (!left) {
+    set_err("%s: out of memory", p->who);
+    return 0;
+  }
+  if (!dbq_comparison(p, &left->cmp)) {
+    free(left);
+    return 0;
+  }
+  for (;;) {
+    if (dbq_eat(p, "AND")) {
+      DbqCond *right = dbq_cond_new(DBQ_CMP);
+      DbqCond *node;
+      if (!right) {
+        set_err("%s: out of memory", p->who);
+        dbq_cond_free(left);
+        return 0;
+      }
+      if (!dbq_comparison(p, &right->cmp)) {
+        free(right);
+        dbq_cond_free(left);
+        return 0;
+      }
+      node = dbq_cond_new(DBQ_AND);
+      if (!node) {
+        set_err("%s: out of memory", p->who);
+        free(right);
+        dbq_cond_free(left);
+        return 0;
+      }
+      node->a = left;
+      node->b = right;
+      left = node;
+      continue;
+    }
+    if (dbq_eat(p, "OR")) {
+      /* Everything to the right of OR is a full AND-chain, so `a OR b AND c` is
+       * `a OR (b AND c)`. Recursing into `dbq_condition` (rather than a separate
+       * and-chain function) is what gives that: the recursive call consumes AND
+       * to the end of the clause and stops before the next OR. */
+      DbqCond *right, *node;
+      if (!dbq_condition(p, &right)) {
+        dbq_cond_free(left);
+        return 0;
+      }
+      node = dbq_cond_new(DBQ_OR);
+      if (!node) {
+        set_err("%s: out of memory", p->who);
+        dbq_cond_free(left);
+        dbq_cond_free(right);
+        return 0;
+      }
+      node->a = left;
+      node->b = right;
+      /* `*out` is written here as well as in the exit below. Omitting it on this
+       * path left the caller's filter pointer as NULL — the query then ran with
+       * no WHERE at all and returned every row, which is the worst possible
+       * failure for a filter: it looks like an answer. */
+      *out = node;
+      return 1;
+    }
+    *out = left;
+    return 1;
+  }
+}
+
+static void dbq_query_free(DbqQuery *q) {
+  free(q->table);
+  dbq_cond_free(q->filter);
+  q->table = NULL;
+  q->filter = NULL;
+}
+
+/* Parse `sql` into `out`, or set g_err. Caller calls `dbq_query_free`. */
+static int dbq_parse(const char *who, const char *sql, DbqQuery *out) {
+  DbqP p;
+  int n = 0, ncols = 0;
+  DbqTok *toks = dbq_tokenize(who, sql, &n);
+  DbqTok copy;
+
+  memset(out, 0, sizeof(*out));
+  out->limit = -1;
+  if (!toks)
+    return 0;
+  p.who = who;
+  p.sql = sql;
+  p.toks = toks;
+  p.n = n;
+  p.i = 0;
+
+  if (!dbq_keyword(&p, "SELECT"))
+    goto fail;
+
+  /* The projection. */
+  if (dbq_peek(&p)->kind == DBQ_T_STAR) {
+    out->star = 1;
+    p.i++;
+  } else {
+    DbqCol c;
+    /* A query that is only `SELECT` has no projection, and "expected a column
+     * number, got the end of the query" would send a model looking for a typo
+     * that is not there — the missing word is FROM. */
+    if (dbq_peek(&p)->kind == DBQ_T_END) {
+      char detail[1024];
+      snprintf(detail, sizeof(detail),
+               "the query ended, but FROM is required; the supported subset is: %s",
+               DBQ_SUBSET);
+      copy = *dbq_peek(&p);
+      dbq_error(who, sql, &copy, detail, NULL);
+      goto fail;
+    }
+    if (!dbq_column(&p, &c))
+      goto fail;
+    out->cols[ncols++] = c;
+    while (dbq_peek(&p)->kind == DBQ_T_COMMA) {
+      p.i++;
+      if (!dbq_column(&p, &c))
+        goto fail;
+      if (ncols >= DBQ_MAX_COLS) {
+        char detail[256];
+        copy = *dbq_peek(&p);
+        snprintf(detail, sizeof(detail),
+                 "a query can select at most %d columns in v1", DBQ_MAX_COLS);
+        dbq_error(who, sql, &copy, detail, NULL);
+        goto fail;
+      }
+      out->cols[ncols++] = c;
+    }
+    out->ncols = ncols;
+  }
+
+  if (!dbq_keyword(&p, "FROM"))
+    goto fail;
+
+  /* The table name, taken literally: no keyword check, so a table called
+   * `order` or `key` is selectable. */
+  copy = *dbq_peek(&p);
+  if (copy.kind == DBQ_T_WORD || copy.kind == DBQ_T_STR) {
+    out->table = (char *)malloc((size_t)copy.text_len + 1);
+    if (!out->table) {
+      set_err("%s: out of memory", who);
+      goto fail;
+    }
+    memcpy(out->table, copy.text, (size_t)copy.text_len);
+    out->table[copy.text_len] = 0;
+    p.i++;
+  } else if (copy.kind == DBQ_T_LPAREN) {
+    dbq_unsupported(who, sql, &copy,
+                    "a subquery or a parenthesised table (a join) in FROM");
+    goto fail;
+  } else {
+    char detail[512];
+    char *d = dbq_describe(&copy);
+    snprintf(detail, sizeof(detail), "expected a table name after FROM, got %s",
+             d);
+    dbq_error(who, sql, &copy, detail, NULL);
+    goto fail;
+  }
+
+  /* The clauses, in the order SQL requires them. The order is enforced, not
+   * documented: the first version of this loop accepted any order, so
+   * `LIMIT 1 ORDER BY 2` applied the limit before the sort it was written
+   * after. */
+  for (;;) {
+    copy = *dbq_peek(&p);
+    if (copy.kind == DBQ_T_END)
+      break;
+
+    if (dbq_eat(&p, "WHERE")) {
+      if (out->has_order || out->limit >= 0) {
+        char detail[512];
+        char *d = dbq_describe(&copy);
+        snprintf(detail, sizeof(detail),
+                 "WHERE comes before ORDER BY and LIMIT in a query, so %s was "
+                 "written too late",
+                 d);
+        dbq_error(who, sql, &copy, detail, NULL);
+        goto fail;
+      }
+      if (out->filter) {
+        dbq_error(who, sql, &copy, "a query can have only one WHERE clause",
+                  NULL);
+        goto fail;
+      }
+      if (!dbq_condition(&p, &out->filter))
+        goto fail;
+      continue;
+    }
+    if (dbq_eat(&p, "ORDER")) {
+      if (out->limit >= 0) {
+        char detail[512];
+        char *d = dbq_describe(&copy);
+        snprintf(detail, sizeof(detail),
+                 "ORDER BY comes before LIMIT in a query, so %s was written too "
+                 "late",
+                 d);
+        dbq_error(who, sql, &copy, detail, NULL);
+        goto fail;
+      }
+      if (out->has_order) {
+        dbq_error(who, sql, &copy, "a query can have only one ORDER BY clause",
+                  NULL);
+        goto fail;
+      }
+      /* `ORDER 2` is a missing `BY`, and "unexpected 2" sends the reader
+       * looking for a bad number rather than a missing word. */
+      if (!dbq_eat(&p, "BY")) {
+        DbqTok inner = *dbq_peek(&p);
+        if (inner.kind == DBQ_T_INT || inner.kind == DBQ_T_STAR ||
+            inner.kind == DBQ_T_WORD) {
+          char detail[512];
+          char *d = dbq_describe(&inner);
+          snprintf(detail, sizeof(detail), "ORDER must be followed by BY; got %s",
+                   d);
+          dbq_error(who, sql, &inner, detail, "BY");
+          goto fail;
+        }
+        if (!dbq_refuse_unsupported(who, sql, &inner))
+          goto fail;
+      }
+      if (!dbq_column(&p, &out->order_col))
+        goto fail;
+      out->order_desc = dbq_eat(&p, "DESC");
+      if (!out->order_desc)
+        dbq_eat(&p, "ASC");
+      out->has_order = 1;
+      continue;
+    }
+    if (dbq_eat(&p, "LIMIT")) {
+      if (out->limit >= 0) {
+        dbq_error(who, sql, &copy, "a query can have only one LIMIT clause",
+                  NULL);
+        goto fail;
+      }
+      copy = *dbq_peek(&p);
+      if (copy.kind == DBQ_T_INT && copy.i >= 0) {
+        out->limit = copy.i;
+        p.i++;
+      } else if (copy.kind == DBQ_T_INT) {
+        char detail[256];
+        snprintf(detail, sizeof(detail),
+                 "LIMIT %lld is negative; a limit is a count of rows", copy.i);
+        dbq_error(who, sql, &copy, detail, NULL);
+        goto fail;
+      } else {
+        char detail[512];
+        char *d = dbq_describe(&copy);
+        snprintf(detail, sizeof(detail), "expected a row count after LIMIT, got %s",
+                 d);
+        dbq_error(who, sql, &copy, detail, NULL);
+        goto fail;
+      }
+      continue;
+    }
+    if (!dbq_refuse_unsupported(who, sql, &copy))
+      goto fail;
+  }
+
+  free(toks);
+  return 1;
+
+fail:
+  free(toks);
+  dbq_query_free(out);
+  return 0;
+}
+
+/* ---- evaluation -------------------------------------------------------- */
+
+/* The order of two values, for the four ordering operators and for ORDER BY.
+ *
+ * The rules are the language's own (see `collections::default_compare`), because
+ * a query that ordered differently from `sort` would be a second comparison in
+ * the language. Numbers compare across int and float; strings compare by
+ * **bytes**, so `memcmp` here is the same total order the Rust `compare_bytes`
+ * gives and the two engines agree without a collation table; booleans order
+ * false < true; nil orders equal to itself and nothing else.
+ *
+ * On failure the reason is written into `why` in the *Rust* form — including
+ * the `db-query: ` prefix and both type names — so the message a caller wraps
+ * reads identically on both engines. That is the whole point of `why` being a
+ * buffer the caller supplies rather than a `const char *` this file owns: the
+ * two implementations cannot drift without the AOT test noticing.
+ *
+ * Returns -1/0/1, or 2 for "not comparable". */
+static int dbq_order_of(Value *a, Value *b, char *why, size_t whyn) {
+  int a_num = (a->tag == V_INT || a->tag == V_FLOAT);
+  int b_num = (b->tag == V_INT || b->tag == V_FLOAT);
+  if (a_num && b_num) {
+    double x = as_f64(a), y = as_f64(b);
+    if (x != x || y != y) { /* NaN */
+      snprintf(why, whyn, "db-query: cannot order NaN");
+      return 2;
+    }
+    return x < y ? -1 : (x > y ? 1 : 0);
+  }
+  if (a->tag == V_STR && b->tag == V_STR) {
+    size_t n = (size_t)(a->u.s->len < b->u.s->len ? a->u.s->len : b->u.s->len);
+    int r = memcmp(a->u.s->data, b->u.s->data, n);
+    if (r != 0)
+      return r < 0 ? -1 : 1;
+    if (a->u.s->len == b->u.s->len)
+      return 0;
+    return a->u.s->len < b->u.s->len ? -1 : 1;
+  }
+  if (a->tag == V_BOOL && b->tag == V_BOOL)
+    return a->u.b - b->u.b;
+  if (a->tag == V_NIL && b->tag == V_NIL)
+    return 0;
+  snprintf(why, whyn, "db-query: cannot order a %s and a %s", type_name(a),
+           type_name(b));
+  return 2;
+}
+
+/* Element at `idx` of a list, or nil. Mirrors `ConsCell::nth` and the
+ * out-of-range-is-nil convention, so a projection and a WHERE see the same
+ * thing on both engines. */
+static Value *dbq_nth(ConsCell *cell, int idx) {
+  ConsCell *cur = cell;
+  int i = 0;
+  while (cur && cur->len > 0) {
+    if (i == idx)
+      return &cur->head;
+    cur = cur->tail;
+    i++;
+  }
+  return NULL;
+}
+
+static int dbq_eval_cmp(const char *who, DbqCmp *c, ConsCell *row) {
+  Value left = v_nil(), right = c->right;
+  char why[256];
+  int ord;
+  Value *found = dbq_nth(row, c->left.idx);
+  if (found) {
+    left = *found;
+    v_ref(&left);
+  }
+  ord = dbq_order_of(&left, &right, why, sizeof(why));
+  v_unref(&left);
+  if (ord == 2) {
+    /* `=` and `!=` do not order: `(= "a" 1)` is a false answer, not a type
+     * error, because that is what `=` already does everywhere else. */
+    if (c->op == DBQ_EQ || c->op == DBQ_NE) {
+      Value *lv = dbq_nth(row, c->left.idx);
+      int eq = lv ? values_eq(lv, &right) : values_eq(&left, &right);
+      return c->op == DBQ_NE ? !eq : eq;
+    }
+    set_err("%s: at line %u, col %u: WHERE column %d is a %s and the value "
+            "compared with it is a %s \xe2\x80\x94 a column that is compared "
+            "with <, <=, > or >= has to hold one type in every row (%s)",
+            who, c->left.line, c->left.col, c->left.idx + 1, type_name(&left),
+            type_name(&right), why);
+    return -1;
+  }
+  switch (c->op) {
+  case DBQ_EQ:
+    return ord == 0;
+  case DBQ_NE:
+    return ord != 0;
+  case DBQ_LT:
+    return ord < 0;
+  case DBQ_LE:
+    return ord <= 0;
+  case DBQ_GT:
+    return ord > 0;
+  default:
+    return ord >= 0;
+  }
+}
+
+static int dbq_eval_cond(const char *who, DbqCond *c, ConsCell *row) {
+  switch (c->kind) {
+  case DBQ_CMP:
+    return dbq_eval_cmp(who, &c->cmp, row);
+  case DBQ_AND: {
+    int a = dbq_eval_cond(who, c->a, row);
+    if (a < 0)
+      return -1;
+    if (!a)
+      return 0;
+    return dbq_eval_cond(who, c->b, row);
+  }
+  default: {
+    int a = dbq_eval_cond(who, c->a, row);
+    if (a < 0)
+      return -1;
+    if (a)
+      return 1;
+    return dbq_eval_cond(who, c->b, row);
+  }
+  }
+}
+
+/* Bottom-up stable merge, mirroring `sort_merge` and the Rust `merge_by`.
+ *
+ * All three are written the same way rather than one delegating to another,
+ * because the property that matters is **stability**: equal keys must keep
+ * primary-key order, or an ORDER BY on a duplicated value would answer
+ * differently on two engines that both pass every equality test. A host
+ * `qsort` is not an option for the same reason the runtime's `sort` does not
+ * use one. */
+static int dbq_merge_by(const char *who, Value *items, int n, int order_idx,
+                        int desc, unsigned sort_line, unsigned sort_col) {
+  Value *tmp = NULL;
+  int width, start;
+  if (n < 2)
+    return 1;
+  tmp = (Value *)malloc(sizeof(Value) * (size_t)n);
+  if (!tmp) {
+    set_err("%s: out of memory", who);
+    return 0;
+  }
+  for (width = 1; width < n; width *= 2) {
+    for (start = 0; start < n; start += 2 * width) {
+      int mid = start + width < n ? start + width : n;
+      int end = start + 2 * width < n ? start + 2 * width : n;
+      int l = start, r = mid, k = start;
+      while (l < mid && r < end) {
+        Value *av = dbq_nth(items[l].u.l, order_idx);
+        Value *bv = dbq_nth(items[r].u.l, order_idx);
+        Value an = v_nil(), bn = v_nil();
+        char why[256];
+        int ord;
+        if (av) {
+          an = *av;
+          v_ref(&an);
+        }
+        if (bv) {
+          bn = *bv;
+          v_ref(&bn);
+        }
+        ord = dbq_order_of(&an, &bn, why, sizeof(why));
+        if (ord == 2) {
+          /* Unorderable in the sort itself. A column that holds *different
+           * types in different rows* is the one failure the per-row shape
+           * check in `dbq_execute` cannot see, and it has to be an error here
+           * rather than a silent tie — a silent tie would leave the two rows in
+           * B-tree order, which reads as a successful sort. */
+          set_err("%s: at line %u, col %u: ORDER BY column %d is a %s and "
+                  "cannot be ordered (%s)",
+                  who, sort_line, sort_col, order_idx + 1, type_name(&an), why);
+          v_unref(&an);
+          v_unref(&bn);
+          free(tmp);
+          return 0;
+        }
+        v_unref(&an);
+        v_unref(&bn);
+        /* `ord <= 0` takes from the left on ties — the stability rule. */
+        if (desc)
+          ord = -ord;
+        if (ord <= 0)
+          tmp[k++] = items[l++];
+        else
+          tmp[k++] = items[r++];
+      }
+      while (l < mid)
+        tmp[k++] = items[l++];
+      while (r < end)
+        tmp[k++] = items[r++];
+    }
+    for (start = 0; start < n; start++)
+      items[start] = tmp[start];
+  }
+  free(tmp);
+  return 1;
+}
+
+/* The rows a query produces: a list of lists. `want_count` skips building the
+ * rows and answers with the number only, which is what `db-query-count` needs
+ * and is why it can be cheaper on a large table for no extra code path. */
+/* Collects rows for the scan half of `dbq_execute`. A private copy of
+ * `DbtCollect` rather than a reuse of that struct with `dbt_collect_cb`: the
+ * shared callback cannot report a decode failure with a message naming
+ * *this* builtin, and a row that is not readable is a refusal whose text has to
+ * say which query hit it. The Rust side decodes each row itself for the same
+ * reason. */
+struct DbqCollect {
+  Value *items;
+  int n;
+  int cap;
+  int failed;
+  int oom;
+};
+
+static void dbq_collect_push(struct DbqCollect *c, const char *val) {
+  if (c->n >= c->cap) {
+    Value *grown;
+    c->cap = c->cap ? c->cap * 2 : 16;
+    grown = (Value *)realloc(c->items, sizeof(Value) * (size_t)c->cap);
+    if (!grown) {
+      c->oom = 1;
+      return;
+    }
+    c->items = grown;
+  }
+  if (!dbkv_decode(val, &c->items[c->n]))
+    c->failed = 1;
+  else
+    c->n++;
+}
+
+static void dbq_collect_cb(const char *key, const char *val, void *ctx) {
+  struct DbqCollect *c = (struct DbqCollect *)ctx;
+  (void)key;
+  if (strcmp(val, AINL_DB_TOMBSTONE) == 0)
+    return; /* a deleted row is not a row */
+  dbq_collect_push(c, val);
+}
+
+static Value dbq_execute(Db *db, const char *who, const char *sql, int want_count) {
+  DbqQuery q;
+  DbtSet *s;
+  DbtTable *t;
+  Value *rows = NULL;
+  int nrows = 0, i;
+  Value out = v_nil();
+
+  if (!dbq_parse(who, sql, &q))
+    return v_nil();
+
+  s = db_tables(db);
+  t = s ? dbt_set_find(s, q.table) : NULL;
+  if (!t) {
+    set_err("%s: no table named '%s' in this database", who, q.table);
+    dbq_query_free(&q);
+    return v_nil();
+  }
+
+  /* The rows to consider: one point lookup, or the tree's own walk — the
+   * latter already in primary-key order, which is what makes the sort below
+   * stable *and* what makes an unordered query's output deterministic. */
+  if (q.filter && q.filter->kind == DBQ_CMP && q.filter->cmp.left.idx == 0 &&
+      q.filter->cmp.op == DBQ_EQ &&
+      q.filter->cmp.right.tag != V_LIST && q.filter->cmp.right.tag != V_MAP) {
+    /* The one shape that reads a single key: `WHERE 1 = <scalar>`. Column 1
+     * is the primary key, so this is the B-tree lookup `db-select` does, and
+     * the key text is byte-identical to the one `db-insert` stored because both
+     * go through `dbt_key_json`. Everything else walks. */
+    char *key = dbt_key_json(&q.filter->cmp.right, who);
+    const char *val;
+    if (!key) {
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    val = dbt_get(t->tree->root, key);
+    if (val && strcmp(val, AINL_DB_TOMBSTONE) != 0) {
+      struct DbqCollect c = {NULL, 0, 0, 0, 0};
+      dbq_collect_push(&c, val);
+      if (c.oom) {
+        set_err("%s: out of memory", who);
+      } else if (c.failed) {
+        set_err("%s: the row for key %s in '%s' is not readable; it was not "
+                "written by db-insert",
+                who, key, q.table);
+      } else {
+        rows = c.items;
+        nrows = c.n;
+      }
+    }
+    free(key);
+  } else {
+    struct DbqCollect c = {NULL, 0, 0, 0, 0};
+    dbt_walk(t->tree->root, dbq_collect_cb, &c);
+    if (c.oom) {
+      free(c.items);
+      set_err("%s: out of memory", who);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    if (c.failed) {
+      for (i = 0; i < c.n; i++)
+        v_unref(&c.items[i]);
+      free(c.items);
+      set_err("%s: a row of '%s' is not readable; it was not written by "
+              "db-insert",
+              who, q.table);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    rows = c.items;
+    nrows = c.n;
+  }
+
+  if (g_err) {
+    for (i = 0; i < nrows; i++)
+      v_unref(&rows[i]);
+    free(rows);
+    dbq_query_free(&q);
+    return v_nil();
+  }
+
+  /* The filter, in one pass that compacts in place.
+   *
+   * One pass, not "count then compact": a two-pass version evaluates every
+   * comparison twice, so a WHERE whose value is unorderable in the *last* row
+   * would report an error the first pass missed, and the double evaluation is a
+   * second thing to keep in step with the Rust side. Compacting as we go also
+   * means the ORDER BY shape check below sees only rows the filter kept —
+   * which is what the Rust `full` vector is, and why the one-row case there
+   * needed its own pass. */
+  if (q.filter) {
+    int w = 0;
+    for (i = 0; i < nrows; i++) {
+      int r = dbq_eval_cond(who, q.filter, rows[i].u.l);
+      if (r < 0) {
+        int j;
+        for (j = w; j < nrows; j++)
+          v_unref(&rows[j]);
+        free(rows);
+        dbq_query_free(&q);
+        return v_nil();
+      }
+      if (r) {
+        rows[w++] = rows[i];
+      } else {
+        v_unref(&rows[i]);
+      }
+    }
+    nrows = w;
+  }
+
+  /* Every row must have the ORDER BY column, checked before the sort.
+   *
+   * A comparator alone cannot catch a column out of range on *every* row: nil
+   * orders equal to nil, so the sort would "succeed" and return primary-key
+   * order. It also cannot catch it when the filter left one row, because a
+   * merge of one element never calls a comparator — which is why this is a
+   * separate pass over `rows` and not a rule inside the comparator. */
+  if (q.has_order) {
+    for (i = 0; i < nrows; i++) {
+      if (!dbq_nth(rows[i].u.l, q.order_col.idx)) {
+        set_err("%s: at line %u, col %u: ORDER BY column %d is nil in every row "
+                "of '%s' \xe2\x80\x94 a row in this database is a list, and no "
+                "row here is that long",
+                who, q.order_col.line, q.order_col.col, q.order_col.idx + 1,
+                q.table);
+        for (i = 0; i < nrows; i++)
+          v_unref(&rows[i]);
+        free(rows);
+        dbq_query_free(&q);
+        return v_nil();
+      }
+    }
+    if (nrows > 1 &&
+        !dbq_merge_by(who, rows, nrows, q.order_col.idx, q.order_desc,
+                       q.order_col.line, q.order_col.col)) {
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+  }
+
+  if (q.limit >= 0 && q.limit < nrows) {
+    for (i = (int)q.limit; i < nrows; i++)
+      v_unref(&rows[i]);
+    nrows = (int)q.limit;
+  }
+
+  if (want_count) {
+    for (i = 0; i < nrows; i++)
+      v_unref(&rows[i]);
+    free(rows);
+    out = v_int(nrows);
+    dbq_query_free(&q);
+    return out;
+  }
+
+  if (q.star) {
+    /* `v_list_from_array` takes ownership of the refs in the array, so `rows`
+     * is handed over rather than released afterwards. */
+    out = v_list_from_array(rows, nrows);
+    free(rows);
+    dbq_query_free(&q);
+    return out;
+  }
+
+  /* The projection, into one flat array of `nrows * ncols` values, then a list
+   * per row. Flat because `v_list_from_array` is the only list builder and it
+   * takes a contiguous slice — so each row's cells must sit side by side, and
+   * a per-row array would mean hand-rolling the cons chain the runtime already
+   * has. Each cell is ref'd here and consumed by the builder that reads it, so
+   * exactly one reference per cell exists at every point. */
+  {
+    int total = nrows * q.ncols;
+    Value *flat = (Value *)malloc(sizeof(Value) * (size_t)(total ? total : 1));
+    int j = 0, k;
+    if (!flat) {
+      set_err("%s: out of memory", who);
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    for (i = 0; i < nrows; i++) {
+      for (k = 0; k < q.ncols; k++) {
+        Value *cell = dbq_nth(rows[i].u.l, q.cols[k].idx);
+        /* Out of range is nil, the convention `nth` already has. A projection
+         * is expected to inherit it; an ORDER BY on the same column is a claim
+         * about the table's shape and is an error, and the two are checked in
+         * different places on purpose. */
+        if (cell) {
+          flat[j] = *cell;
+          v_ref(&flat[j]);
+        } else {
+          flat[j] = v_nil();
+        }
+        j++;
+      }
+    }
+    out = v_list_empty();
+    for (i = nrows - 1; i >= 0; i--) {
+      Value row = v_list_from_array(flat + i * q.ncols, q.ncols);
+      ConsCell *cell = cons_cell_new(row, out.u.l);
+      Value next;
+      next.tag = V_LIST;
+      next.u.l = cell;
+      out = next;
+    }
+    free(flat);
+  }
+  free(rows);
+  dbq_query_free(&q);
+  return out;
+}
+
+/* (db-query handle "SELECT ...") -> the matching rows, projected. */
+static Value builtin_db_query(Value *args, int nargs) {
+  int64_t h;
+  const char *sql;
+  Db *db;
+  Value out;
+  if (nargs != 2) {
+    set_err("db-query expects (db-query handle \"SELECT ...\")");
+    return v_nil();
+  }
+  h = as_handle_arg(&args[0], "db-query");
+  if (!h)
+    return v_nil();
+  sql = as_str_named(&args[1], "db-query", "str query");
+  if (!sql)
+    return v_nil();
+  db = db_lookup(h, "db-query");
+  if (!db)
+    return v_nil();
+  out = dbq_execute(db, "db-query", sql, 0);
+  if (g_err)
+    return v_nil();
+  return out;
+}
+
+/* (db-query-count handle "SELECT ...") -> how many rows match, after LIMIT. */
+static Value builtin_db_query_count(Value *args, int nargs) {
+  int64_t h;
+  const char *sql;
+  Db *db;
+  Value out;
+  if (nargs != 2) {
+    set_err("db-query-count expects (db-query-count handle \"SELECT ...\")");
+    return v_nil();
+  }
+  h = as_handle_arg(&args[0], "db-query-count");
+  if (!h)
+    return v_nil();
+  sql = as_str_named(&args[1], "db-query-count", "str query");
+  if (!sql)
+    return v_nil();
+  db = db_lookup(h, "db-query-count");
+  if (!db)
+    return v_nil();
+  out = dbq_execute(db, "db-query-count", sql, 1);
+  if (g_err)
+    return v_nil();
+  return out;
+}
+
 
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
@@ -4912,6 +6677,10 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_db_delete_row(args, nargs);
     case B_DB_ALL_ROWS:
       return builtin_db_all_rows(args, nargs);
+    case B_DB_QUERY:
+      return builtin_db_query(args, nargs);
+    case B_DB_QUERY_COUNT:
+      return builtin_db_query_count(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
