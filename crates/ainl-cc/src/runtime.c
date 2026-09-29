@@ -3157,6 +3157,21 @@ static Db *db_lookup(int64_t h, const char *who) {
 }
 
 /* A handle operand, reported under the builtin's own name. */
+/* `as_str_arg`, but naming what was expected — the table layer's messages have
+ * to be byte-identical to the interpreter's, and ainl-core/src/dbtab.rs says
+ * "expects a str table name" where the bare helper says "expects a str".
+ *
+ * Added rather than changing `as_str_arg` because the bare form is what every
+ * earlier builtin uses, and db_kv_aot.rs documents that those two messages
+ * already differ between the engines; making them agree too is a different card.
+ * This one is only used by the table layer, which is written to agree exactly. */
+static const char *as_str_named(Value *v, const char *who, const char *what) {
+  if (v->tag == V_STR)
+    return v->u.s->data;
+  set_err("%s expects a str %s, got %s", who, what, type_name(v));
+  return NULL;
+}
+
 static int64_t as_handle_arg(Value *v, const char *who) {
   if (v->tag == V_INT)
     return v->u.i;
@@ -3928,7 +3943,8 @@ static DbtNode *dbt_insert_into(Db *db, DbtNode *n, const char *key, const char 
     DbtNode *right = dbt_insert_into(db, n->kids[i], key, val, &ck, &cv);
     if (!right)
       return NULL;
-    /* The child grew a sibling, so this node gains a key and a child. */
+    /* The promoted separator belongs to the child, which is about to become
+     * someone else's child, so this node takes its own copy. */
     char *k2 = strdup(ck), *v2 = strdup(cv);
     if (!k2 || !v2) {
       free(k2);
@@ -3936,21 +3952,16 @@ static DbtNode *dbt_insert_into(Db *db, DbtNode *n, const char *key, const char 
       set_err("db: out of memory");
       return NULL;
     }
-    for (int s = n->nkeys; s > i; s--) {
-      n->keys[s] = n->keys[s - 1];
-      n->vals[s] = n->vals[s - 1];
-    }
-    char **nk = realloc(n->keys, sizeof(char *) * (size_t)(n->nkeys + 1));
-    char **nv = realloc(n->vals, sizeof(char *) * (size_t)(n->nkeys + 1));
-    if (!nk || !nv) {
-      set_err("db: out of memory");
+    /* The child grew a sibling, so this node gains a key and a child. Same
+     * helper as the leaf path, and for the same reason: it reallocates before
+     * shifting. The interior path had its own copy of that loop, shifting first,
+     * which corrupted the root's separator array on the 17th insert — the first
+     * one to descend past a split root — and made a row that was in the tree
+     * unfindable. Two copies of this loop is exactly the kind of duplication
+     * that lets one copy be wrong; there is now one. */
+    dbt_insert_at(n, i, k2, v2);
+    if (g_err)
       return NULL;
-    }
-    n->keys = nk;
-    n->vals = nv;
-    n->keys[i] = k2;
-    n->vals[i] = v2;
-    n->nkeys++;
     dbt_node_insert_kid(n, i + 1, right);
   }
   if (n->nkeys > DBT_MAX_KEYS) {
@@ -3968,7 +3979,14 @@ static DbtNode *dbt_insert_into(Db *db, DbtNode *n, const char *key, const char 
 /* The value for `key`, or NULL. The stored pointer belongs to the tree and is
  * valid until the next insert or remove on it. */
 static const char *dbt_get(const DbtNode *n, const char *key) {
-  for (const DbtNode *cur = n; cur; cur = NULL) {
+  /* A `while`, not a `for`: this is the descent. The first version used
+   * `for (cur = n; cur; cur = NULL)` and moved the cursor inside the body, which
+   * made the loop test `NULL` *after* the first hop and so stop at depth one.
+   * Every table with 15 keys or fewer is a single leaf, and every table of 16 to
+   * 31 is two levels, so it passed every small test and failed on the first
+   * lookup that had to go past the root — a `db-delete-row` of an existing row
+   * returning false because the key was one level down. */
+  for (const DbtNode *cur = n; cur;) {
     int i = dbt_search(cur, key);
     if (i < cur->nkeys && strcmp(cur->keys[i], key) == 0)
       return cur->vals[i];
@@ -4331,36 +4349,93 @@ static DbtSet *dbt_set_rebuild(Db *db) {
     set_err("db: out of memory");
     return NULL;
   }
+  /* The index chain holds *every* record for a key, not just the newest — the
+   * KV layer relies on that, because `db-get` walks the chain and takes the
+   * first match. So the chain is in file order, newest first, and a table row
+   * that was inserted and then deleted appears twice: the live row, then the
+   * tombstone. Replaying both as plain inserts resurrects the deleted row,
+   * which is what the first version of this function did.
+   *
+   * The fix is "first sighting wins": for each row key, apply only the newest
+   * record and ignore the rest. That is exactly the rule `db-get` applies, and
+   * applying it here is what makes a table's rebuild agree with the byte
+   * layer's own idea of a key's current value.
+   *
+   * `seen` is an open-addressed set keyed by `db_hash`, sized from the record
+   * count. It has to be a hash set and not a list: a linear scan would make
+   * reopening an n-row table O(n^2) in string comparisons, which is the whole
+   * cost the B-tree exists to avoid paying. The table holds borrowed pointers
+   * into the index, so it allocates once and frees once. */
+  size_t cap = 16;
+  while (cap < (size_t)db->nkeys * 2 + 2)
+    cap *= 2;
+  char **seen = calloc(cap, sizeof(char *));
+  if (!seen) {
+    set_err("db: out of memory");
+    return s;
+  }
+  size_t seen_count = 0;
+  int overflowed = 0;
+
   for (int b = 0; b < DB_BUCKETS; b++) {
     for (DbEntry *e = db->buckets[b]; e; e = e->next) {
       char *table = dbt_row_table(e->key);
       if (!table)
         continue;
-      if (strcmp(e->val, AINL_DB_TOMBSTONE) == 0) {
-        /* Deleted: the table still exists, the row does not. */
-        dbt_set_create(s, table);
-        free(table);
-        continue;
-      }
       DbtTable *t = dbt_set_create(s, table);
       if (!t) {
         free(table);
-        return s;
+        break;
       }
       /* The key is the part of the log key after the table name, which
        * `dbt_row_table` already skipped past; recompute it rather than trust a
        * second parse to agree. */
       char *rk = dbt_row_key(table, "");
-      if (rk) {
-        size_t skip = strlen(rk);
-        const char *keyjson = e->key + skip;
-        if (strcmp(keyjson, DBT_MARKER_KEY) != 0)
+      if (!rk) {
+        free(table);
+        break;
+      }
+      const char *keyjson = e->key + strlen(rk);
+      free(rk);
+
+      /* Has this row key already been applied? Open addressing with linear
+       * probing; a NULL slot is empty, so the table never has to be cleared. */
+      size_t slot = db_hash(e->key) & (cap - 1);
+      int dup = 0;
+      while (seen[slot]) {
+        if (strcmp(seen[slot], e->key) == 0) {
+          dup = 1;
+          break;
+        }
+        slot = (slot + 1) & (cap - 1);
+      }
+      if (dup) {
+        free(table);
+        continue;
+      }
+      /* The table is sized at 2x the record count, so it cannot fill. Guarded
+       * anyway: if it ever did, the worst case is a wrong answer, so it is
+       * reported rather than allowed. */
+      if (seen_count * 2 >= cap) {
+        overflowed = 1;
+        free(table);
+        break;
+      }
+      seen[slot] = e->key;
+      seen_count++;
+
+      if (strcmp(keyjson, DBT_MARKER_KEY) != 0) {
+        if (strcmp(e->val, AINL_DB_TOMBSTONE) == 0)
+          dbt_remove(t->tree, keyjson);
+        else
           dbt_insert(t->tree, keyjson, e->val);
-        free(rk);
       }
       free(table);
     }
   }
+  free(seen);
+  if (overflowed)
+    set_err("db: too many records to index in one database");
   return s;
 }
 
@@ -4430,7 +4505,7 @@ static Value builtin_db_create_table(Value *args, int nargs) {
   int64_t h = as_handle_arg(&args[0], "db-create-table");
   if (!h)
     return v_nil();
-  const char *name = as_str_arg(&args[1], "db-create-table");
+  const char *name = as_str_named(&args[1], "db-create-table", "table name");
   if (!name)
     return v_nil();
   Db *db = db_lookup(h, "db-create-table");
@@ -4460,7 +4535,7 @@ static Value builtin_db_insert(Value *args, int nargs) {
   int64_t h = as_handle_arg(&args[0], "db-insert");
   if (!h)
     return v_nil();
-  const char *table = as_str_arg(&args[1], "db-insert");
+  const char *table = as_str_named(&args[1], "db-insert", "table name");
   if (!table)
     return v_nil();
   Db *db = db_lookup(h, "db-insert");
@@ -4539,7 +4614,7 @@ static Value builtin_db_all_rows(Value *args, int nargs) {
   int64_t h = as_handle_arg(&args[0], "db-all-rows");
   if (!h)
     return v_nil();
-  const char *table = as_str_arg(&args[1], "db-all-rows");
+  const char *table = as_str_named(&args[1], "db-all-rows", "table name");
   if (!table)
     return v_nil();
   Db *db = db_lookup(h, "db-all-rows");
@@ -4576,7 +4651,7 @@ static Value builtin_db_select(Value *args, int nargs) {
   int64_t h = as_handle_arg(&args[0], "db-select");
   if (!h)
     return v_nil();
-  const char *table = as_str_arg(&args[1], "db-select");
+  const char *table = as_str_named(&args[1], "db-select", "table name");
   if (!table)
     return v_nil();
   Db *db = db_lookup(h, "db-select");
@@ -4618,7 +4693,7 @@ static Value builtin_db_delete_row(Value *args, int nargs) {
   int64_t h = as_handle_arg(&args[0], "db-delete-row");
   if (!h)
     return v_nil();
-  const char *table = as_str_arg(&args[1], "db-delete-row");
+  const char *table = as_str_named(&args[1], "db-delete-row", "table name");
   if (!table)
     return v_nil();
   Db *db = db_lookup(h, "db-delete-row");

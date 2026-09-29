@@ -222,12 +222,18 @@ fn every_primary_key_type_agrees_across_engines() {
 
 /// A row is an AINL list, so it may hold lists and maps, and it must come back
 /// structurally identical.
+///
+/// The map is built the way the language builds one — `(hash)` then `assoc` —
+/// rather than with a constructor that does not exist. That is worth stating
+/// because the first version of this test used `hash-map`, and the failure it
+/// produced looked like an engine disagreement when it was really both engines
+/// agreeing that the symbol does not exist.
 #[test]
 fn a_row_holding_nested_values_agrees_across_engines() {
     let src = r#"(do
       (def h (db-open "nested.db"))
       (def t (db-create-table h "t"))
-      (db-insert h t (list "a" (list 1 2 3) (hash-map "x" 1)))
+      (db-insert h t (list "a" (list 1 2 3) (assoc (hash) "x" 1)))
       (print (db-select h t "a"))
       (db-close h))"#;
     assert_parity(src, "nested");
@@ -393,10 +399,49 @@ fn every_table_refusal_agrees_across_engines() {
             !i_ok && !c_ok,
             "{what} must be refused by both engines, but interpreter ok={i_ok} compiled ok={c_ok}\nstdout interp: {i_out}\nstdout aot: {c_out}"
         );
+        // The messages cannot be compared byte-for-byte, and the gap is not this
+        // layer's to close. The interpreter wraps a runtime error as
+        // `runtime error: <message> at line L, col C (byte B)`; the AOT runtime
+        // prints `<message>` and a newline, because it has no position to
+        // report. Both facts predate this layer — they hold for §3k's builtins
+        // on the base commit — and closing them means changing the AOT error
+        // path for every builtin, which db_kv_aot.rs documents as a separate
+        // change.
+        //
+        // So the claim asserted here is the one that is new and that a program
+        // can actually rely on: both engines refuse, and both name the same
+        // builtin and say the same thing about the row. This follows the value
+        // layer's `every_value_layer_refusal_is_refused_by_both_backends`,
+        // which asserts containment for the same reason.
+        let i_msg = the_message(&i_err);
+        let c_msg = the_message(&c_err);
+        // With the wrapper removed the two must say the same thing. The AOT
+        // runtime phrases two of the *value* layer's type errors slightly
+        // differently (`db-put expects a str, got int` where the interpreter
+        // says `expects a str key, got int`), which is why this test needs the
+        // normalizer at all. This layer's messages are written to be identical
+        // on both sides, and the assertion is exact — which is what makes a
+        // future divergence in *this* layer's wording visible rather than
+        // absorbed by the tolerance the wrapper requires.
         assert_eq!(
-            i_err, c_err,
+            i_msg, c_msg,
             "{what}: the message differs between the engines\ninterp: {i_err}\naot: {c_err}"
         );
+    }
+}
+
+/// The interpreter's error wrapper, removed: the `runtime error: ` prefix and
+/// the ` at line L, col C (byte B)` suffix, plus the trailing newline both
+/// engines add.
+///
+/// The only thing this deliberately does **not** normalize is the message text
+/// between them — that is the part that has to agree.
+fn the_message(err: &str) -> String {
+    let s = err.trim_end_matches('\n');
+    let s = s.strip_prefix("runtime error: ").unwrap_or(s);
+    match s.find(" at line ") {
+        Some(i) => s[..i].to_string(),
+        None => s.to_string(),
     }
 }
 

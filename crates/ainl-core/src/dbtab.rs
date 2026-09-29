@@ -379,6 +379,16 @@ impl TableSet {
         self.tables.entry(name.to_string()).or_default();
     }
 
+    /// Check that `name` exists, without creating it.
+    ///
+    /// The non-mutating half of [`TableSet::put`], for the caller that has to
+    /// know "no such table" *before* it writes anything. Split out so the
+    /// "refused means no record was written" rule in [`db_insert`] is one call
+    /// rather than an ordering argument someone can reorder.
+    pub fn require(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
+
     fn tree_mut(&mut self, name: &str, who: &str) -> Result<&mut BTree> {
         if !self.tables.contains_key(name) {
             return Err(Error::runtime(format!(
@@ -504,6 +514,20 @@ fn db_insert(args: &[Value]) -> Result<Value> {
     let key = key_json(&row[0], DB_INSERT)?;
     let encoded = encode(&list_value(row), DB_INSERT)?;
     with_db(h, DB_INSERT, |db| {
+        // The table is checked **before** the record is written, not after. The
+        // first version wrote the log record and only then asked the table
+        // whether it existed, so an insert into a missing table refused the
+        // program *and* left a row in the log — a refusal that changes the file
+        // is a bug in its own right, and on the next open the row would be
+        // there with the table the record itself created. The C port checks
+        // first, and this is where the two engines agreed to differ until they
+        // did not.
+        //
+        // Validating everything before writing is the general rule here: a
+        // refused call must leave no trace, or the refusal is not idempotent.
+        if !db.tables().require(table) {
+            return Err(no_table(table, DB_INSERT));
+        }
         db.put(&row_key(table, &key), &encoded)?;
         db.tables().put(table, &key, &encoded)?;
         Ok(())
@@ -1073,6 +1097,48 @@ mod tests {
             "got: {}",
             err.message()
         );
+    }
+
+    /// A refusal must leave the file untouched.
+    ///
+    /// The first version of `db_insert` wrote the log record and only then asked
+    /// the table set whether the table existed, so this case refused the program
+    /// *and* left a row behind — one that the record itself would resurrect as a
+    /// table on the next open. The compiled port checked first, so the two
+    /// engines disagreed about whether the program was refused at all, which is
+    /// how this was found.
+    #[test]
+    fn a_refused_insert_writes_nothing() {
+        let s = Scratch::new("no-write");
+        // Through a real handle, because the ordering bug this guards sits
+        // between the handle lookup, the table check and the append; a test that
+        // built its own `Db` would not exercise that sequence.
+        let handle = crate::db::open_for_test(&s.path());
+        // No `db-create-table`, so there is no table named "nope".
+        let err = db_insert(&[
+            Value::Int(handle),
+            Value::str("nope"),
+            list_value(vec![Value::str("a"), Value::Int(1)]),
+        ])
+        .expect_err("no such table");
+        assert!(
+            err.message().contains("no table named 'nope'"),
+            "got: {}",
+            err.message()
+        );
+        crate::db::with_db(handle, DB_INSERT, |db| {
+            assert!(
+                db.keys().is_empty(),
+                "a refused db-insert must not append a record: {:?}",
+                db.keys()
+            );
+            assert!(
+                db.tables().names().is_empty(),
+                "a refused db-insert must not create the table it named"
+            );
+            Ok(())
+        })
+        .expect("inspect the handle");
     }
 
     /// `nil` is a legal primary key, because `nil` is a legal AINL value and a

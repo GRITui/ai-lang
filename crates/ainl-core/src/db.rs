@@ -539,6 +539,23 @@ fn db_open(args: &[Value]) -> Result<Value> {
     })
 }
 
+/// Open a database and return its handle number, for tests in another module.
+///
+/// Exists because the table layer's tests need a *real* handle — the ordering
+/// bug its `a_refused_insert_writes_nothing` test guards sits between the handle
+/// lookup, the table check and the append, so a test that constructed a `Db`
+/// directly would skip the sequence that broke. `db_open` itself is private to
+/// this module, and widening it to `pub(crate)` would expose a handle-opening
+/// path that bypasses nothing useful; this is `#[cfg(test)]`, so it costs
+/// nothing in a release build.
+#[cfg(test)]
+pub(crate) fn open_for_test(path: &str) -> i64 {
+    match db_open(&[Value::str(path.to_string())]) {
+        Ok(Value::Int(n)) => n,
+        other => panic!("open_for_test({path:?}) did not yield a handle: {other:?}"),
+    }
+}
+
 fn db_close(args: &[Value]) -> Result<Value> {
     let [h] = args else {
         return Err(Error::runtime(format!(
