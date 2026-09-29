@@ -1803,6 +1803,174 @@ not return it.
 `db-*` below — a host file object has no append-only-log semantics, and a B-tree
 over one has no meaning it could keep.
 
+## 3n. Queries: `db-query` / `db-query-count`
+
+A small, deliberately defined SQL subset over §3m's tables:
+
+```ainl
+SELECT <* | col, ...> FROM <table>
+  [WHERE <col> <op> <value> [AND|OR <cond>]]
+  [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+
+op := = | != | < | <= | > | >=
+```
+
+- **`db-query handle query` → a list of the matching rows.**
+- **`db-query-count handle query` → how many rows match, after `LIMIT`.**
+
+```ainl
+(def h (db-open "people.db"))
+(def t (db-create-table h "people"))
+(db-insert h t (list "ada" 36 "math"))
+(db-insert h t (list "bob" 41 "navy"))
+(db-insert h t (list "grace" 45 "navy"))
+
+(print (db-query h "SELECT 1 FROM people WHERE 2 > 40"))
+; (("bob") ("grace"))
+
+(print (db-query h "SELECT 1 FROM people ORDER BY 2 DESC LIMIT 1"))
+; (("grace"))
+
+(print (db-query-count h "SELECT 1 FROM people WHERE 3 = 'navy'"))
+; 2
+```
+
+### Columns are positions, and column 1 is the key
+
+A column reference is a **number**, not a name. `db-create-table` takes a name
+and nothing else, so a row has no column names to refer to; inventing a schema
+here would mean changing a builtin the previous section already shipped. Column
+1 is the primary key, which is exactly what the B-tree indexes.
+
+Using a name says so, rather than leaving a model to guess:
+
+```
+db-query: at line 1, col 28: 'name' is not a column: a row in this database is
+a list, so columns are numbered from 1 and 1 is the primary key in the query
+"SELECT 1 FROM people WHERE name = 1"
+```
+
+### The order the clauses run in
+
+`WHERE` applies, then `ORDER BY`, then `LIMIT`, and the projection happens last.
+`ORDER BY` therefore names a column the projection does not have to include:
+
+```ainl
+(db-query h "SELECT 1 FROM people ORDER BY 2")   ; sort by age, return names
+```
+
+The clause **order is enforced, not documented**. `LIMIT 1 ORDER BY 2` is
+refused, because a query written that way has two possible answers depending on
+which clause the engine applies first, and picking one silently is the failure
+this layer exists to prevent:
+
+```
+db-query: at line 1, col 30: ORDER BY comes before LIMIT in a query, so 'ORDER'
+was written too late in the query "SELECT * FROM people LIMIT 1 ORDER BY 2"
+```
+
+`AND` binds tighter than `OR` — SQL's own rule, and the only one expressible
+without parentheses, which v1 does not have. So `a OR b AND c` is `a OR (b AND c)`.
+
+### `ORDER BY` is stable, and `DESC` reverses the comparison
+
+Not the input. Two rows that compare equal keep primary-key order in **both**
+directions, so `DESC` on a duplicated value does not hand back the rows in
+reverse. Here `"navy"` sorts after `"math"`, and bob and grace both hold it, so
+`DESC` puts the two navy rows first **in primary-key order** and ada last:
+
+```ainl
+(db-query h "SELECT 1 FROM people ORDER BY 3 DESC")
+; (("bob") ("grace") ("ada"))
+```
+
+A sort that reversed ties would answer `(("grace") ("bob") ("ada"))` — which
+looks plausible enough to ship, and which `dbq_aot.rs` asserts against.
+
+The same ordering rule `sort` uses, deliberately: a query that ordered
+differently would be a second comparison in the language. `ORDER BY` on a
+column **no row is that long** is refused by name rather than sorting `nil`s,
+because `nil` orders equal to `nil` and the sort would otherwise "succeed" and
+answer in primary-key order:
+
+```
+db-query: at line 1, col 31: ORDER BY column 9 is nil in every row of 'people' —
+a row in this database is a list, and no row here is that long
+```
+
+A *projection* past the end of a row is `nil` rather than an error. The
+asymmetry is intentional: a projection inherits the out-of-range-is-`nil`
+convention `nth` already has, while `ORDER BY` is a claim about the table's
+shape and a false claim is an error.
+
+### Unsupported SQL is refused by name
+
+A clause this layer does not have is **named**, never ignored — silently
+dropping `GROUP BY` is how a query engine returns a confidently wrong answer.
+The refusal carries the supported subset, so the next query is writeable from it:
+
+```
+db-query: at line 1, col 22: 'GROUP' is not supported in v1; the supported
+subset is: SELECT <* | col, ...> FROM <table> [WHERE <col> <op> <value>
+[AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>] in the query
+"SELECT * FROM people GROUP BY 1"
+```
+
+Joins, `GROUP BY`, `HAVING`, `DISTINCT`, set operations, subqueries, `IN`,
+`LIKE`, `BETWEEN`, `IS`, `EXISTS`, `OFFSET`, `CASE`, aliases, `NULLS FIRST`/`LAST`,
+and every `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER` are all refused this
+way — the last group because the query layer is **read-only**: §3m's log has one
+writer and one row encoding, and a second write path would break both claims.
+
+Aggregates are refused with the builtin that does the job where there is one:
+
+```
+db-query: at line 1, col 8: COUNT is not supported in v1; the supported subset
+is: ... — use (db-query-count handle "SELECT …") to count matching rows
+```
+
+A near miss gets a suggestion, and a **transposed** pair counts as a near miss —
+`FORM` for `FROM` is two substitutions and one transposition, and plain edit
+distance only sees the first kind:
+
+```
+db-query: at line 1, col 10: unexpected 'FORM' in the query "SELECT 1 FORM people"
+— did you mean 'FROM'?
+```
+
+### `db-query-count`, and what a `WHERE` can compare
+
+`db-query-count` runs the identical parse, filter, sort and `LIMIT`, and answers
+with the number instead of building the rows. `LIMIT` is applied before the
+count, so `SELECT … LIMIT 5` counts at most five.
+
+The left side of a comparison is a column; the right is a **value** — a number,
+a quoted string, `true`, `false`, `nil` or `null`. `=` and `!=` never order, so
+comparing across types is a plain false, which is what the language's own `=`
+already does. `<`, `<=`, `>` and `>=` do need two orderable values, and say so
+with both type names rather than returning nothing:
+
+```
+db-query: at line 1, col 28: WHERE column 9 is a nil and the value compared with
+it is a int — a column that is compared with <, <=, > or >= has to hold one type
+in every row (db-query: cannot order a nil and a int)
+```
+
+### Read-only, and refused by the transpilers
+
+Both builtins only read. They are refused by the three transpilers for the same
+reason as the `db-*` below them — the parser is a function in this runtime, and
+a transpiler emitting a call to it would be emitting a call to something the
+target language does not have. The interpreter and the AOT C runtime both have
+it, so both accept.
+
+The C runtime carries a hand-port of the parser, the evaluator and the sort
+(`dbq_*` in `runtime.c`) with the same order, the same refusals and the same
+error text. There is no FFI in this project, so that is a second implementation,
+and `crates/ainl-cc/tests/dbq_aot.rs` runs the same queries and the same
+**refusals** through both engines and asserts identical output. Agreement between
+two implementations that share no code is the evidence; a shared comment is not.
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

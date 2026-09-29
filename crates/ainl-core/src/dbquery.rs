@@ -474,6 +474,19 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
         }};
     }
 
+    // Read one character **without** advancing, for the two paths that name a
+    // character and then return. These exist because `bump!()` in a `format!`
+    // is the obvious way to write them and the obvious way is wrong twice over:
+    // it moves the position a function that is about to die never reads, which
+    // the compiler rightly calls a dead store, and it would make the *message*
+    // depend on the order `format!` evaluates its arguments. The position for
+    // these errors is `line`/`col` as they stand, which is the character.
+    macro_rules! peek {
+        () => {
+            sql[i..].chars().next().expect("i is on a char boundary")
+        };
+    }
+
     while i < b.len() {
         let start_line = line;
         let start_col = col;
@@ -579,7 +592,7 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
                     who,
                     sql,
                     &here(Tok::End, line, col),
-                    format!("a number cannot be followed by '{}'", bump!()),
+                    format!("a number cannot be followed by '{}'", peek!()),
                     None,
                 ));
             }
@@ -632,7 +645,7 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
             who,
             sql,
             &here(Tok::End, start_line, start_col),
-            format!("'{}' is not part of the query language", bump!()),
+            format!("'{}' is not part of the query language", peek!()),
             None,
         ));
     }
@@ -1041,7 +1054,13 @@ impl<'a> P<'a> {
 }
 
 /// Parse a query, or explain what is wrong with it and where.
-pub fn parse(who: &str, sql: &str) -> Result<Query> {
+///
+/// Private, and private on purpose: `Query` is a parser's own shape, and
+/// exposing it would make the *fields* the public API — so a future refactor
+/// could not change how a query is represented without breaking a caller. The
+/// public surface of this module is `execute`, `install`, and the name lists;
+/// everything else is the implementation of the parser and is free to move.
+fn parse(who: &str, sql: &str) -> Result<Query> {
     let toks = tokenize(who, sql)?;
     let mut p = P {
         who,
@@ -1742,7 +1761,11 @@ mod tests {
 
     #[test]
     fn and_binds_tighter_than_or() {
-        let (_s, mut db) = fixture("bool");
+        // No outer fixture: the closure below makes its own per query, because
+        // each one needs a database that is untouched by the last. Sharing one
+        // would make the tests order-dependent, and an order-dependent test in
+        // this file is a test whose failure depends on which assertions the
+        // harness happened to run first.
         let names = |sql: &str, tag: &str| -> Vec<String> {
             let (_, mut db) = fixture(tag);
             q(&mut db, sql)

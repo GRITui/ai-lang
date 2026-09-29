@@ -119,14 +119,51 @@ fn run_bin(bin: &Path, dir: &Path) -> (String, String, bool) {
     )
 }
 
+/// Is `tail` exactly a position suffix — ` at line N, col M`, optionally
+/// followed by ` (byte B)`?
+///
+/// This has to be exact, because a query error contains **two** positions:
+///
+/// ```text
+/// db-query: at line 1, col 22: 'GROUP' is not supported in v1 ... in the query "SELECT * FROM people GROUP BY 1" at line 6, col 10 (byte 161)
+/// ```
+///
+/// The first is inside the query and belongs to the message. The second is the
+/// call site in the AINL source, and only the second is the backend difference
+/// `docs/SYNTAX.md` §5a documents. A looser test — "mentions `col `, ends in
+/// `)`" — is satisfied by the first as well, and would strip the message down to
+/// `db-query:`; then every refusal compares equal and the parity file passes
+/// while checking nothing.
+///
+/// Digits, the exact `, col `, digits, and then nothing but optionally
+/// ` (byte ` digits `)`. The message's own position is followed by `:`, so it
+/// cannot match.
+fn is_position_suffix(tail: &str) -> bool {
+    let Some(rest) = tail.strip_prefix(" at line ") else {
+        return false;
+    };
+    let (rest, byte_part) = match rest.split_once(" (byte ") {
+        Some((r, b)) => {
+            let Some(b) = b.strip_suffix(')') else {
+                return false;
+            };
+            (r, Some(b))
+        }
+        None => (rest, None),
+    };
+    let Some((line, col)) = rest.split_once(", col ") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(line) && digits(col) && byte_part.map(digits).unwrap_or(true)
+}
+
 /// Strip the interpreter's call-site suffix, leaving the message the two
 /// backends must agree on.
 ///
-/// The suffix is ` at line N, col M (byte B)` and is appended *after* the
-/// message, so it is the tail from the last ` at line ` onward. Stripping from
-/// the **last** occurrence rather than the first matters: a query text can
-/// itself contain ` at line ` (it is echoed back in the message), and cutting at
-/// the first one would compare two truncated prefixes and call it agreement.
+/// The compiled binary has no source and so no position to give: on that side
+/// this is a no-op by construction, because the only ` at line ` in a runtime
+/// message is the one inside the query, and `is_position_suffix` rejects it.
 fn without_call_site(err: &str) -> String {
     let head = err
         .strip_prefix("runtime error: ")
@@ -134,21 +171,8 @@ fn without_call_site(err: &str) -> String {
         .trim_end()
         .to_string();
     match head.rfind(" at line ") {
-        Some(at) => {
-            // Only cut if what follows really is the position shape — a message
-            // that merely happens to contain the words is left whole.
-            let tail = &head[at..];
-            let looks_like_a_position = tail
-                .rsplit_once("(byte ")
-                .map(|(_, rest)| rest.ends_with(')'))
-                .unwrap_or(false);
-            if looks_like_a_position {
-                head[..at].to_string()
-            } else {
-                head
-            }
-        }
-        None => head,
+        Some(at) if is_position_suffix(&head[at..]) => head[..at].to_string(),
+        _ => head,
     }
 }
 
@@ -703,6 +727,55 @@ fn the_query_layer_cannot_write() {
             &["not supported in v1"],
         );
     }
+}
+
+/// Re-inserting a primary key replaces the row, and all three backends must
+/// agree on the *new* value.
+///
+/// The C runtime got this right from the start while the Rust B-tree had the
+/// value update behind a `debug_assert!` — stripped in release, so a release
+/// Rust build kept the old row and the two backends disagreed. This is here to
+/// hold the C side to the same gate and to keep the disagreement from coming
+/// back, whichever side it appears on.
+///
+/// The queries run on a live handle in a single program. A close/reopen rebuilds
+/// from the log, where the last-write-wins map has already collapsed the
+/// duplicate, so a reopen-based fixture answers correctly even against a tree
+/// that cannot replace at all — which is exactly how the first version of this
+/// test passed on a broken build.
+///
+/// Both a longer and a shorter re-insert: a replace that copies the new length
+/// without truncating leaves the old tail attached, and a projection past the
+/// new end then reads the old columns instead of `nil`.
+#[test]
+fn a_reinserted_key_is_replaced_on_every_backend() {
+    let src = r#"(do
+      (def h (db-open "t.ainl-db"))
+      (def t (db-create-table h "t"))
+      (db-insert h t (list "a" 1))
+      (db-insert h t (list "a" 10 11 12))
+      (db-insert h t (list "b" 1 2 3))
+      (db-insert h t (list "b" 9))
+      (def longer (db-query h "SELECT * FROM t WHERE 1 = 'a'"))
+      (def shorter (db-query h "SELECT 2, 3 FROM t WHERE 1 = 'b'"))
+      (db-close h)
+      (print (list longer shorter)))"#;
+    // `assert_parity` alone would pass on a build where the *interpreter* is
+    // the broken one, because a disagreement is not visible when both halves of
+    // the comparison are the same interpreter. So the expected values are
+    // asserted here as well, and not left to parity.
+    assert_parity(src, "reinsert");
+    let si = Scratch::new("reinsert-value");
+    let (out, err, ok) = interpret(src, &si.path);
+    assert!(ok, "the interpreter failed: {err}");
+    assert!(
+        out.contains(r#"(("a" 10 11 12))"#),
+        "the query did not see the re-inserted longer row: {out}"
+    );
+    assert!(
+        out.contains("((9 nil))"),
+        "a re-insert did not truncate the old row: {out}"
+    );
 }
 
 /// A query is a string, so a query built at runtime behaves like one written out

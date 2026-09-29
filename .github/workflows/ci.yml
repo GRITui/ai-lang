@@ -431,6 +431,17 @@ jobs:
       - name: Documented key-value semantics
         run: ./scripts/check-docs-kv.sh
 
+      # And for §3n (queries). §3n's claims are the ones an SQL layer cannot be
+      # assumed to have: WHERE applying before ORDER BY, ORDER BY naming a
+      # column the projection drops, a *stable* sort in both directions so DESC
+      # does not reverse ties, nil in a projection but an error in an ORDER BY,
+      # a clause order that is enforced rather than documented, and every
+      # out-of-scope keyword refused *by name* with the supported subset
+      # attached. A dropped GROUP BY is how a query engine answers confidently
+      # and wrongly, and none of that is visible from a host SQL library.
+      - name: Documented query semantics
+        run: ./scripts/check-docs-query.sh
+
   kv-aot:
     name: "key-value (3-backend parity + cross-process persistence)"
     runs-on: ubuntu-latest

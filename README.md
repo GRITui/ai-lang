@@ -179,8 +179,15 @@ AINL's other properties, all measured:
   `transpiler-only` because `ainl compile` genuinely runs them. A host `open()`
   cannot reproduce the log, so the backends that would have to fake it decline
   instead ([docs/SYNTAX.md](docs/SYNTAX.md#3k-storage-db-open--db-put--db-get-raw--db-flush--db-close),
-  [§3l](docs/SYNTAX.md#3l-key-value-storage-db-set--db-get--db-get-raw--db-del--db-keys--db-count)
-  and [§3m](docs/SYNTAX.md#3m-tables-db-create-table--db-insert--db-select--db-delete-row--db-all-rows)).
+  [§3l](docs/SYNTAX.md#3l-key-value-storage-db-set--db-get--db-get-raw--db-del--db-keys--db-count),
+  [§3m](docs/SYNTAX.md#3m-tables-db-create-table--db-insert--db-select--db-delete-row--db-all-rows),
+  and [§3n](docs/SYNTAX.md#3n-queries-db-query--db-query-count)).
+- **A SQL subset over those tables.** `db-query` / `db-query-count`: `SELECT`,
+  `FROM`, `WHERE`, `ORDER BY`, `LIMIT` and a count, with columns as positions and
+  a stable sort. Everything outside that is **refused by name** with the
+  supported subset attached, rather than ignored — silently dropping a
+  `GROUP BY` is how a query engine returns a confidently wrong answer
+  ([docs/SYNTAX.md](docs/SYNTAX.md#3n-queries-db-query--db-query-count)).
 - **A test runner.** `(test name expr expected)` asserts, and `ainl test` runs
   a directory of test files and exits non-zero on any failure — so AINL can
   check its own output, and CI can consume the result with no parsing
