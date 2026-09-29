@@ -342,8 +342,19 @@ impl Compiler {
                 self.compile_expr(cond)?;
                 let jump = self.emit_jump(Instr::JumpIfFalse);
                 self.compile_expr(then)?;
+                // A 2-arg `if` is the 3-arg form with an implicit `nil` else,
+                // so it needs the SAME jump over that trailing `Nil` the
+                // 3-arg case emits. Without it a TRUE condition falls through
+                // and pushes the then-value AND the `Nil`, leaving two values
+                // where the enclosing form expects one: in a `fn`/`let` body
+                // the extra `Nil` survives the form's own `Pop` and shifts
+                // every following form's operand ("cannot call a nil"). A
+                // `while` loop masked it, because its per-iteration pop ate the
+                // surplus.
+                let jump2 = self.emit_jump(Instr::Jump);
                 self.patch_jump(jump, self.body_len());
                 self.emit(Instr::Nil);
+                self.patch_jump(jump2, self.body_len());
             }
             [cond, then, els] => {
                 self.compile_expr(cond)?;
