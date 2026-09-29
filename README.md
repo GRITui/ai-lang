@@ -163,7 +163,7 @@ AINL's other properties, all measured:
 - **AOT to a native binary.** `ainl compile` emits a single self-contained C
   file — the micro-runtime is inlined, so the output links against nothing but
   libc. Needs `cc` to build; **the output needs nothing.**
-- **79 builtins.** 67 are byte-identical on all four backends (the interpreter,
+- **80 builtins.** 68 are byte-identical on all four backends (the interpreter,
   the AOT binary, and the three transpiler targets). Two — `http-get` and
   `http-post` — are **interpreter-only**: the AOT and transpiler backends refuse a
   program that uses them with an explicit `interpreter-only` error rather than

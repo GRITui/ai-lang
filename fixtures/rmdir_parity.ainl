@@ -1,0 +1,142 @@
+; Parity program for `rmdir` — the inverse of `mkdir` (Tier 3 companion card).
+;
+; scripts/check-fs-builtins.sh runs this ONE program through five runners —
+; the interpreter, the AOT C runtime, python3, node and ruby — and diffs their
+; combined stdout AND stderr and their return codes. The interpreter is the
+; normative implementation, so every other backend is compared against its
+; bytes.
+;
+; Every line below is chosen because the five hosts would otherwise answer
+; something different, or because the answer is not obvious:
+;
+;   * The non-empty refusal NAMES an entry. rmdir(2) reports only ENOTEMPTY and
+;     the hosts raise four differently-named errors, so a port that delegated
+;     would produce a different message per backend. AINL names the first entry
+;     in byte order — and the entry is created out of order on purpose, so a
+;     backend that used readdir order instead would name "zzz.txt" and fail the
+;     diff.
+;   * A missing path is an ERROR, not nil, even though `is-dir` answers nil for
+;     the same path. `rmdir` is an action: "delete this" against a typo must not
+;     look like a success.
+;   * A file is an error too, and the file must still be there afterwards.
+;   * `":recursive"` is a real subtree delete, asserted on the filesystem with
+;     `is-dir` and `file-exists` after it, not just on the printed nil.
+;   * Every failure is printed via `try`, so the MESSAGE is on stdout and can be
+;     diffed; an uncaught error would also be compared (the gate captures
+;     stderr) but would stop the program.
+;   * The arity/type errors are printed too. They are the cases where a host's
+;     own exception would escape an AINL `catch` and print a traceback instead.
+;
+; AINL has no argv, so the program uses a fixed relative path under a directory
+; the gate creates. Every runner executes in its own copy of that directory, so
+; no runner can see another's leftovers — which matters twice over here, since
+; the program both creates and *deletes*.
+
+(def BASE "ainl-rmdir-parity")
+
+; ---- the happy paths ------------------------------------------------------
+(mkdir (path-join BASE "empty") ":recursive")
+(print (str "empty ok        " (str (rmdir (path-join BASE "empty")))))
+(print (str "empty gone      " (str (is-dir (path-join BASE "empty")))))
+
+; A directory holding only an empty subdirectory is NOT empty: the refusal must
+; name the subdirectory, and the whole subtree must survive it.
+(mkdir (path-join BASE "outer/inner") ":recursive")
+(print (str "nested refused  " (str (try (rmdir (path-join BASE "outer"))
+                                         (catch (e) (get e "message"))))))
+(print (str "inner survived  " (str (is-dir (path-join BASE "outer/inner")))))
+
+; Recursive, on a tree three deep with files at two levels. The files matter:
+; a delete that removed only the directories would print the same nil.
+(mkdir (path-join BASE "tree/x/y") ":recursive")
+(write-file (path-join BASE "tree/x/y/deep.txt") "deep")
+(write-file (path-join BASE "tree/top.txt") "top")
+(print (str "recursive       " (str (rmdir (path-join BASE "tree") ":recursive"))))
+(print (str "tree gone       " (str (is-dir (path-join BASE "tree")))))
+
+; The empty subdirectory left above is now removable, which is the whole
+; workflow: refuse, empty the inside, then remove.
+(print (str "outer removed   " (str (rmdir (path-join BASE "outer/inner")))))
+(print (str "outer now       " (str (rmdir (path-join BASE "outer")))))
+
+; ---- the shared error messages -------------------------------------------
+;
+; `thunk` is a zero-argument fn, not a `do` block: AINL allows only a single
+; expression in expression position, and the transpilers reject a
+; multi-statement `do` there with a runtime error, so `(do (rmdir ...) "NO
+; ERROR")` would transpile to nothing at all. Calling a one-expression fn is
+; the form every backend agrees on.
+(def show (fn (label thunk)
+  (print (str label
+               (try (thunk)
+                    (catch (e) (str "-> " (get e "message"))))))))
+
+; Created out of byte order on purpose: "zzz.txt" first, then "aaa.txt". AINL
+; names the first entry in *byte* order, so the message must say aaa.txt — and
+; readdir order is undefined, so a backend that used it would be flaky here
+; rather than consistently wrong.
+(mkdir (path-join BASE "full") ":recursive")
+(write-file (path-join BASE "full/zzz.txt") "z")
+(write-file (path-join BASE "full/aaa.txt") "a")
+
+(show "err not empty    " (fn () (rmdir (path-join BASE "full"))))
+(show "err missing      " (fn () (rmdir (path-join BASE "ghost"))))
+(show "err missing rec  " (fn () (rmdir (path-join BASE "ghost") ":recursive")))
+(show "err on a file    " (fn () (rmdir (path-join BASE "full/aaa.txt"))))
+(show "err on a file +/ " (fn () (rmdir (path-join BASE "full/aaa.txt/"))))
+(show "err bad option   " (fn () (rmdir (path-join BASE "full") ":nope")))
+(show "err arity 0      " (fn () (rmdir)))
+(show "err arity 3      " (fn () (rmdir "a" "b" "c")))
+(show "err type         " (fn () (rmdir 5)))
+(show "err opt type     " (fn () (rmdir (path-join BASE "full") 5)))
+
+; ---- the refusals changed nothing ----------------------------------------
+; If a backend had deleted on the way to reporting the error, these two lines
+; would not read "a"/"z". The messages above are the easy half to get right; this
+; is the half that matters.
+(print (str "aaa survived    " (str (read-file (path-join BASE "full/aaa.txt")))))
+(print (str "zzz survived    " (str (read-file (path-join BASE "full/zzz.txt")))))
+
+; ---- a symlink is unlinked, never followed --------------------------------
+; AINL has no symlink builtin, so the gate makes the links before the run; the
+; program then checks what `rmdir` does with them. This is the case the hosts
+; each get differently (shutil.rmtree, fs.rmSync and FileUtils.rm_rf all
+; disagree), so it is the one that would be wrong under a delegation.
+;
+; The gate created `precious/keep.txt` plus two links to it: `tree-link` and
+; `solo-link`. Nothing here mkdirs what the gate made, because `mkdir` refuses
+; an existing path and the refusal would stop the program.
+(def link (path-join BASE "tree-link"))
+(def solo (path-join BASE "solo-link"))
+(def target (path-join BASE "precious"))
+(def holder (path-join BASE "holder"))
+
+; 1. Plain rmdir on a symlink to a directory is the lstat rule from §3h: the
+;    link is not a directory, so this is an error rather than a delete of the
+;    target. `shutil.rmtree`-style ports that follow the link would remove
+;    keep.txt here, which is the outcome every assertion below is guarding.
+(show "err rmdir a link " (fn () (rmdir solo)))
+
+; 2. The link still exists, and its target is intact.
+(print (str "link survived   " (str (file-exists solo))))
+(print (str "target intact   " (str (read-file (path-join target "keep.txt")))))
+
+; 3. Recursive over a tree CONTAINING a link. `rename` moves the link itself —
+;    rename(2) does not follow a symlink — so the link is now inside `holder`,
+;    and the recursive delete must unlink it rather than delete through it.
+(mkdir holder)
+(rename link (path-join holder "link"))
+(write-file (path-join holder "real.txt") "real")
+(show "err tree has 2  " (fn () (rmdir holder)))
+(print (str "holder gone     " (str (rmdir holder ":recursive"))))
+(print (str "target kept     " (str (read-file (path-join target "keep.txt")))))
+(print (str "target entries  " (str (list-dir target))))
+
+; ---- and the cleanup the card exists for ----------------------------------
+; The fs suite used to leave every directory it made behind. This is the
+; program closing that loop: empty the directory and remove it.
+(mkdir (path-join BASE "scaffold") ":recursive")
+(write-file (path-join BASE "scaffold/tmp.txt") "tmp")
+(delete-file (path-join BASE "scaffold/tmp.txt"))
+(print (str "scaffold gone   " (str (rmdir (path-join BASE "scaffold")))))
+(print (str "final layout    " (str (list-dir BASE))))

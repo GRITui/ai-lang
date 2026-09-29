@@ -29,6 +29,11 @@ fail=0
 
 # Every case gets its own scratch directory, because these builtins mutate the
 # filesystem and a suite that shares one tree would be testing its own leftovers.
+#
+# The comparison is on the WHOLE captured output, newlines included, so a case
+# that prints several lines states its expectation with real newlines (`$'...'`).
+# Matching loosely would hide the failure this suite exists to catch: a builtin
+# that printed one line fewer than every other backend.
 want() {
   local label="$1" expected="$2" src="$3"
   local dir="$D/$(echo "$label" | tr -c 'a-zA-Z0-9' '_')"
@@ -40,8 +45,8 @@ want() {
     echo "ok   $label"
   else
     echo "FAIL $label"
-    echo "     want: $expected"
-    echo "     got:  $got"
+    echo "     want: $(printf '%s' "$expected" | tr '\n' '|')"
+    echo "     got:  $(printf '%s' "$got" | tr '\n' '|')"
     fail=1
   fi
 }
@@ -182,6 +187,133 @@ else
   echo "     got:  $got"
   fail=1
 fi
+
+# ---- rmdir: the inverse of mkdir ------------------------------------------
+# Each case is self-contained: `want` gives every case a fresh directory, so a
+# case that needs an existing path has to create it in the same snippet.
+want "an empty directory is removed" "nil" \
+  '(do (mkdir "d") (print (rmdir "d")))'
+want "and it is gone afterwards" "nil" \
+  '(do (mkdir "d") (rmdir "d") (print (is-dir "d")))'
+want "a missing path is an error, not nil" \
+  "runtime error: rmdir: cannot remove 'gone': it does not exist at line 1, col 1 (byte 0)" \
+  '(rmdir "gone")'
+want "and it stays an error with \":recursive\"" \
+  "runtime error: rmdir: cannot remove 'gone': it does not exist at line 1, col 1 (byte 0)" \
+  '(rmdir "gone" ":recursive")'
+want "a file is refused by name" \
+  "rmdir: cannot remove 'f.txt': it is not a directory" \
+  '(do (write-file "f.txt" "A")
+     (try (rmdir "f.txt") (catch (e) (print (get e "message")))))'
+want "and the file survives the refusal" "A" \
+  '(do (write-file "f.txt" "A") (try (rmdir "f.txt") (catch (e) nil))
+     (print (read-file "f.txt")))'
+
+# The refusal NAMES the entry, in byte order — not a count, and not whatever
+# readdir happened to return first. The entries are created out of order on
+# purpose: a backend (or an implementation) that used directory order would say
+# "zzz.txt" here and fail.
+want "a non-empty directory is refused, naming the first entry in byte order" \
+  "rmdir: cannot remove 'd': it is not empty (aaa.txt)" \
+  '(do (mkdir "d") (write-file "d/zzz.txt" "z") (write-file "d/aaa.txt" "a")
+     (try (rmdir "d") (catch (e) (print (get e "message")))))'
+want "and nothing was deleted on the way to the error" $'a\nz' \
+  '(do (mkdir "d") (write-file "d/zzz.txt" "z") (write-file "d/aaa.txt" "a")
+     (try (rmdir "d") (catch (e) nil))
+     (print (read-file "d/aaa.txt"))
+     (print (read-file "d/zzz.txt")))'
+want "a directory holding only an empty subdir is not empty either" \
+  "rmdir: cannot remove 'd': it is not empty (inner)" \
+  '(do (mkdir "d/inner" ":recursive")
+     (try (rmdir "d") (catch (e) (print (get e "message")))))'
+want "and the documented cleanup order works: inner, then d" "nil" \
+  '(do (mkdir "d/inner" ":recursive") (rmdir "d/inner")
+     (print (is-dir "d/inner")) (rmdir "d"))'
+want "an unknown option is named, not ignored" \
+  "runtime error: rmdir: unknown option ':parents' at line 1, col 1 (byte 0)" \
+  '(rmdir "d" ":parents")'
+# The position is the *call site* — the bare symbol at byte 11, which is inside
+# the second argument of the call, not the start of the line.
+want "a bare :recursive is an unbound symbol here too" \
+  "runtime error: unbound symbol ':recursive' at line 1, col 12 (byte 11)" \
+  '(rmdir "d" :recursive)'
+
+# The recursive form is a full subtree delete: the nested directories AND the
+# files are gone, which is the claim. Asserting only the return value would pass
+# for a delete that removed nothing.
+want "\":recursive\" removes the whole subtree" $'nil\nnil\ntrue' \
+  '(do (mkdir "t/x/y" ":recursive")
+     (write-file "t/x/y/f.txt" "deep")
+     (rmdir "t" ":recursive")
+     (print (is-dir "t"))
+     (print (is-dir "t/x"))
+     (print (try (read-file "t/x/y/f.txt") (catch (e) true))))'
+want "the archive-then-delete pattern keeps what it moved out" "keep" \
+  '(do (mkdir "work/a/b" ":recursive") (write-file "work/a/b/f.txt" "keep")
+     (mkdir "keep" ":recursive") (rename "work/a" "keep/a")
+     (rmdir "work" ":recursive")
+     (print (read-file "keep/a/b/f.txt")))'
+
+# The symlink rule. AINL has no `symlink` builtin, so the link is made by the
+# shell before the program runs — the one doc claim a snippet cannot set up for
+# itself, and the one that most needs pinning, because all three hosts'
+# recursive deletes disagree about it.
+ln2="$D/rmdir_links"
+mkdir -p "$ln2/precious"
+printf 'keep' > "$ln2/precious/keep.txt"
+ln -s precious "$ln2/solo"
+printf '(try (rmdir "solo") (catch (e) (print (get e "message"))))\n' > "$ln2/t.ainl"
+got=$(cd "$ln2" && "$OLDPWD/$B" run t.ainl 2>&1)
+if [ "$got" == "rmdir: cannot remove 'solo': it is not a directory" ]; then
+  echo "ok   a symlink to a directory is not a directory (lstat, not stat)"
+else
+  echo "FAIL a symlink to a directory is not a directory (lstat, not stat)"
+  echo "     want: rmdir: cannot remove 'solo': it is not a directory"
+  echo "     got:  $got"
+  fail=1
+fi
+
+# The one that actually destroys data if a backend got it wrong: a recursive
+# delete of a tree CONTAINING a link must unlink the link, not the target's
+# contents. The target is a sibling, reached only through the link.
+mkdir -p "$ln2/tree"
+ln -s ../precious "$ln2/tree/link"
+cat > "$ln2/t.ainl" <<'EOF'
+(rmdir "tree" ":recursive")
+(print (is-dir "tree"))
+(print (read-file "precious/keep.txt"))
+(print (list-dir "precious"))
+EOF
+got=$(cd "$ln2" && "$OLDPWD/$B" run t.ainl 2>&1)
+# Three lines: the tree is gone, the target's file is still readable, and the
+# target still holds exactly the one entry it started with. The last two are
+# what a backend that followed the link would have broken.
+if [ "$got" == $'nil\nkeep\n("keep.txt")' ]; then
+  echo "ok   \":recursive\" unlinks a symlink and leaves its target alone"
+else
+  echo "FAIL \":recursive\" unlinks a symlink and leaves its target alone"
+  echo "     want: nil / keep / (\"keep.txt\")"
+  echo "     got:  $got"
+  fail=1
+fi
+
+# The rmdir error table, in the form the docs show.
+want "rmdir: wrong type" \
+  "runtime error: rmdir expects a str path, got int at line 1, col 1 (byte 0)" \
+  '(rmdir 1)'
+want "rmdir: wrong option type" \
+  "runtime error: rmdir expects a str option, got int at line 1, col 1 (byte 0)" \
+  '(rmdir "a" 1)'
+want "rmdir: arity 0" \
+  "runtime error: rmdir expects (rmdir path) or (rmdir path option) at line 1, col 1 (byte 0)" \
+  '(rmdir)'
+want "rmdir: arity 3" \
+  "runtime error: rmdir expects (rmdir path) or (rmdir path option) at line 1, col 1 (byte 0)" \
+  '(rmdir "a" "b" "c")'
+want "a caught rmdir error is a map with the documented message" \
+  "rmdir: cannot remove 'q': it is not empty (a.txt)" \
+  '(do (mkdir "q") (write-file "q/a.txt" "x")
+     (try (rmdir "q") (catch (e) (print (get e "message")))))'
 
 # ---- error message table ---------------------------------------------------
 # The three headline refusal messages, in the form the docs show. The full text

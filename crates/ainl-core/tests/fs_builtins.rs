@@ -415,6 +415,182 @@ fn file_size_reports_a_missing_path_rather_than_zero() {
     );
 }
 
+// ---- rmdir ----------------------------------------------------------------
+
+#[test]
+fn rmdir_removes_an_empty_directory() {
+    let s = Scratch::new("rmdir-empty");
+    let d = s.join("d");
+    both_fs(
+        "rmdir-empty",
+        |_root| {},
+        |root| {
+            format!(
+                "(str (mkdir \"{root}/d\") \" \" (rmdir \"{root}/d\") \" \" (is-dir \"{root}/d\"))"
+            )
+        },
+        "nil nil nil",
+    );
+    assert!(!Path::new(&d).exists(), "the directory should be gone");
+}
+
+#[test]
+fn rmdir_refuses_a_non_empty_directory_and_names_the_entry() {
+    // The name is the load-bearing part. rmdir(2) says only ENOTEMPTY and the
+    // hosts raise four differently-named errors, so a port that delegated would
+    // produce a different message per backend — or none at all. AINL names the
+    // first entry in byte order instead, which is both identical everywhere and
+    // something the caller can act on.
+    for (label, run) in [
+        ("VM", vm as fn(&str) -> String),
+        ("tree-walk", tree as fn(&str) -> String),
+    ] {
+        let s = Scratch::new(&format!("rmdir-full-{label}"));
+        std::fs::create_dir_all(s.path.join("d")).unwrap();
+        // "aaa.txt" < "zzz.txt" in byte order, so it is the one named even
+        // though "zzz.txt" was created first — readdir order is not defined, so
+        // the test would be flaky if the message used it.
+        std::fs::write(s.path.join("d/zzz.txt"), "z").unwrap();
+        std::fs::write(s.path.join("d/aaa.txt"), "a").unwrap();
+        let out = run(&format!("(rmdir \"{}\")", s.join("d")));
+        assert_eq!(
+            out,
+            format!(
+                "ERR: rmdir: cannot remove '{}': it is not empty (aaa.txt)",
+                s.join("d")
+            ),
+            "{label} rmdir on a non-empty directory"
+        );
+        // The refusal must not have deleted anything.
+        assert!(s.path.join("d/aaa.txt").is_file(), "{label}: file survived");
+        assert!(s.path.join("d/zzz.txt").is_file(), "{label}: file survived");
+    }
+}
+
+#[test]
+fn rmdir_reports_a_missing_path_rather_than_pretending_success() {
+    // An *action*, not a question: is-dir answers nil for this path, but
+    // "delete this" against a typo must not look like it worked.
+    let s = Scratch::new("rmdir-missing");
+    let want = format!(
+        "ERR: rmdir: cannot remove '{}': it does not exist",
+        s.join("ghost")
+    );
+    assert_eq!(vm(&format!("(rmdir \"{}\")", s.join("ghost"))), want);
+    assert_eq!(tree(&format!("(rmdir \"{}\")", s.join("ghost"))), want);
+    // And ":recursive" is not a licence to invent a directory either.
+    let want_r = format!(
+        "ERR: rmdir: cannot remove '{}': it does not exist",
+        s.join("ghost")
+    );
+    assert_eq!(
+        vm(&format!("(rmdir \"{}\" \":recursive\")", s.join("ghost"))),
+        want_r
+    );
+    assert_eq!(
+        tree(&format!("(rmdir \"{}\" \":recursive\")", s.join("ghost"))),
+        want_r
+    );
+}
+
+#[test]
+fn rmdir_refuses_a_file_and_leaves_it_alone() {
+    for (label, run) in [
+        ("VM", vm as fn(&str) -> String),
+        ("tree-walk", tree as fn(&str) -> String),
+    ] {
+        let s = Scratch::new(&format!("rmdir-file-{label}"));
+        std::fs::write(s.path.join("f.txt"), "A").unwrap();
+        let out = run(&format!("(rmdir \"{}\")", s.join("f.txt")));
+        assert_eq!(
+            out,
+            format!(
+                "ERR: rmdir: cannot remove '{}': it is not a directory",
+                s.join("f.txt")
+            ),
+            "{label} rmdir on a file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.path.join("f.txt")).unwrap(),
+            "A",
+            "{label}: the file must survive"
+        );
+    }
+}
+
+#[test]
+fn rmdir_recursive_removes_the_whole_subtree() {
+    for (label, run) in [
+        ("VM", vm as fn(&str) -> String),
+        ("tree-walk", tree as fn(&str) -> String),
+    ] {
+        let s = Scratch::new(&format!("rmdir-rec-{label}"));
+        let root = s.path.to_string_lossy().into_owned();
+        let out = run(&format!(
+            r#"(do
+                (mkdir "{root}/tree/x/y" ":recursive")
+                (write-file "{root}/tree/x/y/deep.txt" "deep")
+                (write-file "{root}/tree/top.txt" "top")
+                (rmdir "{root}/tree" ":recursive"))"#
+        ));
+        assert_eq!(out, "nil", "{label} recursive rmdir");
+        // The claim is on the filesystem, not in the return value: a delete that
+        // removed only the top directory would also return nil.
+        assert!(!s.path.join("tree").exists(), "{label}: subtree gone");
+    }
+}
+
+#[test]
+fn rmdir_recursive_unlinks_a_symlink_instead_of_following_it() {
+    // The worst thing a recursive delete can do. AINL has no symlink builtin, so
+    // the link is made by the test; the point is that every backend's *own*
+    // recursive delete disagrees here (shutil.rmtree refuses a symlinked top
+    // directory but not a link inside the tree, fs.rmSync follows, rm_rf does
+    // not), which is why the rule is explicit rather than delegated.
+    let s = Scratch::new("rmdir-symlink");
+    std::fs::create_dir_all(s.path.join("tree")).unwrap();
+    std::fs::create_dir_all(s.path.join("precious")).unwrap();
+    std::fs::write(s.path.join("precious/keep.txt"), "keep").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(s.path.join("precious"), s.path.join("tree/link")).unwrap();
+
+    let out = vm(&format!("(rmdir \"{}\" \":recursive\")", s.join("tree")));
+    assert_eq!(out, "nil");
+    assert!(!s.path.join("tree").exists(), "the tree itself is gone");
+    assert!(
+        s.path.join("precious/keep.txt").is_file(),
+        "the symlink target must survive: rmdir must unlink the link, not follow it"
+    );
+}
+
+#[test]
+fn rmdir_rejects_an_unknown_option() {
+    let s = Scratch::new("rmdir-opt");
+    let want = "ERR: rmdir: unknown option ':parents'";
+    assert_eq!(
+        vm(&format!("(rmdir \"{}\" \":parents\")", s.join("d"))),
+        want
+    );
+    assert_eq!(
+        tree(&format!("(rmdir \"{}\" \":parents\")", s.join("d"))),
+        want
+    );
+}
+
+#[test]
+fn rmdir_arity_and_type_errors_match_mkdirs_shape() {
+    for src in ["(rmdir)", "(rmdir \"a\" \"b\" \"c\")"] {
+        let want = "ERR: rmdir expects (rmdir path) or (rmdir path option)";
+        assert_eq!(vm(src), want, "VM for {src}");
+        assert_eq!(tree(src), want, "tree-walk for {src}");
+    }
+    both("(rmdir 1)", "ERR: rmdir expects a str path, got int");
+    both(
+        "(rmdir \"d\" 5)",
+        "ERR: rmdir expects a str option, got int",
+    );
+}
+
 // ---- the composed organizer ----------------------------------------------
 
 #[test]

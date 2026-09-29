@@ -215,9 +215,16 @@ impl Rb {
         // `_ainl_tname` renders AINL's type name for a wrong-typed path, so
         // `got int` matches the interpreter rather than `got Integer`; it
         // branches on AHash, so that comes with it.
-        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
-            .iter()
-            .any(|n| self.needed.contains(*n))
+        if [
+            "_mkdir",
+            "_rmdir",
+            "_rename",
+            "_copy",
+            "_is_dir",
+            "_file_size",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
         {
             self.needed.insert("_error");
             self.needed.insert("_fs_probe");
@@ -226,6 +233,13 @@ impl Rb {
             self.needed.insert("_fs_mkdir_p");
             self.needed.insert("_ainl_tname");
             self.needed.insert("AHash");
+        }
+        // `_rmdir`'s `":recursive"` form is the hand-rolled `_fs_rm_tree`,
+        // called by name from inside the helper — same reason as
+        // `_fs_mkdir_p` above, and for the same readability reason. The RUNTIME
+        // table is emitted in declaration order, so it follows `_rmdir`.
+        if self.needed.contains("_rmdir") {
+            self.needed.insert("_fs_rm_tree");
         }
         // Tier 1 JSON. The whole cluster is pulled in by either entry point,
         // because `_ainl_tname` (json-parse's type error and the "keys must be
@@ -545,6 +559,7 @@ impl Rb {
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 // ---- Tier 3 file system ----
                 "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rmdir" => return self.call_builtin("_rmdir", args, Some("_rmdir")),
                 "rename" => return self.call_builtin("_rename", args, Some("_rename")),
                 "copy" => return self.call_builtin("_copy", args, Some("_copy")),
                 "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
@@ -1194,11 +1209,20 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_write_file",
-        "def _write_file(path, content)\n  raise TypeError, 'write-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'write-file expects str content' unless content.is_a?(String)\n  begin\n    File.write(path, content)\n  rescue Errno::EISDIR\n    _error(\"write-file: cannot write '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"write-file: cannot write '#{path}'\")\n  end\nend",
+        // The trailing `nil` is not decoration. Ruby returns the value of its
+        // last expression, and `File.write` returns the number of bytes it
+        // wrote — so without it `(print (write-file "a.txt" "A"))` printed 1 on
+        // ruby and nil on the interpreter, the AOT binary and the python and js
+        // ports. Same reason the error path is a `rescue` and not a trailing
+        // `if`: either way the success path's value is what leaks.
+        "def _write_file(path, content)\n  raise TypeError, 'write-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'write-file expects str content' unless content.is_a?(String)\n  begin\n    File.write(path, content)\n  rescue Errno::EISDIR\n    _error(\"write-file: cannot write '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"write-file: cannot write '#{path}'\")\n  end\n  nil\nend",
     ),
     (
         "_append_file",
-        "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  begin\n    File.open(path, 'a') { |f| f.write(content) }\n  rescue Errno::EISDIR\n    _error(\"append-file: cannot append '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"append-file: cannot append '#{path}'\")\n  end\nend",
+        // The trailing `nil`: `f.write` returns the byte count, and Ruby's
+        // last-expression return would hand it to the AINL program. See the
+        // same note on _write_file.
+        "def _append_file(path, content)\n  raise TypeError, 'append-file expects a str path' unless path.is_a?(String)\n  raise TypeError, 'append-file expects str content' unless content.is_a?(String)\n  begin\n    File.open(path, 'a') { |f| f.write(content) }\n  rescue Errno::EISDIR\n    _error(\"append-file: cannot append '#{path}': it is a directory\")\n  rescue SystemCallError\n    _error(\"append-file: cannot append '#{path}'\")\n  end\n  nil\nend",
     ),
     // ---- Tier 1 file I/O ----
     // The path helpers implement AINL's own rules rather than delegating to
@@ -1268,7 +1292,7 @@ const RUNTIME: &[(&str, &str)] = &[
         // check is what pins the strict rule: a caller that creates a
         // directory and then writes into it needs to know whether *it* created
         // it.
-        "def _mkdir(*args)\n  _error('mkdir expects (mkdir path) or (mkdir path option)') if args.length < 1 || args.length > 2\n  path = args[0]\n  opt = args.length > 1 ? args[1] : nil\n  _error(\"mkdir expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  unless opt.nil?\n    _error(\"mkdir expects a str option, got #{_ainl_tname(opt)}\") unless opt.is_a?(String)\n    _error(\"mkdir: unknown option '#{opt}'\") unless opt == ':recursive'\n  end\n  # File.lstat, not File.exist?: the interpreter's symlink_metadata is an\n  # lstat, and a broken symlink is still a directory entry mkdir must refuse.\n  begin\n    File.lstat(_fs_probe(path))\n    _error(\"mkdir: cannot create '#{path}': it exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    if opt == ':recursive'\n      # The parents only, one component at a time. FileUtils is deliberately\n      # not used: it is a stdlib require, and mkdir -p there returns quietly\n      # on an existing leaf — which the check above has already excluded, so\n      # building the parents here is both stricter and dependency-free.\n      parent = File.dirname(path)\n      unless parent == '.' || File.directory?(parent)\n        begin\n          _fs_mkdir_p(parent)\n        rescue SystemCallError\n          # reported below as the same 'cannot create'\n        end\n      end\n    end\n    Dir.mkdir(path)\n  rescue SystemCallError\n    _error(\"mkdir: cannot create '#{path}'\")\n  end\nend",
+        "def _mkdir(*args)\n  _error('mkdir expects (mkdir path) or (mkdir path option)') if args.length < 1 || args.length > 2\n  path = args[0]\n  opt = args.length > 1 ? args[1] : nil\n  _error(\"mkdir expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  unless opt.nil?\n    _error(\"mkdir expects a str option, got #{_ainl_tname(opt)}\") unless opt.is_a?(String)\n    _error(\"mkdir: unknown option '#{opt}'\") unless opt == ':recursive'\n  end\n  # File.lstat, not File.exist?: the interpreter's symlink_metadata is an\n  # lstat, and a broken symlink is still a directory entry mkdir must refuse.\n  begin\n    File.lstat(_fs_probe(path))\n    _error(\"mkdir: cannot create '#{path}': it exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    if opt == ':recursive'\n      # The parents only, one component at a time. FileUtils is deliberately\n      # not used: it is a stdlib require, and mkdir -p there returns quietly\n      # on an existing leaf — which the check above has already excluded, so\n      # building the parents here is both stricter and dependency-free.\n      parent = File.dirname(path)\n      unless parent == '.' || File.directory?(parent)\n        begin\n          _fs_mkdir_p(parent)\n        rescue SystemCallError\n          # reported below as the same 'cannot create'\n        end\n      end\n    end\n    Dir.mkdir(path)\n  rescue SystemCallError\n    _error(\"mkdir: cannot create '#{path}'\")\n  end\n  # Dir.mkdir returns 0. Ruby's last-expression return would hand that to the\n  # AINL program as the builtin's value, where os.mkdir returns None,\n  # fs.mkdirSync returns undefined and the interpreter returns nil — so\n  # `(print (mkdir \"d\"))` printed 0 on ruby and nil on the other four.\n  # (Found by the void-return probe, not by reading the code: the existing\n  # parity program never *prints* a mkdir result, so the gate could not see it.)\n  nil\nend",
     ),
     (
         // A dependency-free mkdir -p for the one call site above. Kept as its
@@ -1276,6 +1300,37 @@ const RUNTIME: &[(&str, &str)] = &[
         // distinctly so it cannot be confused with the Tier 1 rule set.
         "_fs_mkdir_p",
         "def _fs_mkdir_p(path)\n  parts = path.split('/')\n  cur = path.start_with?('/') ? '/' : ''\n  parts.each do |seg|\n    next if seg.empty?\n    cur = cur.empty? || cur == '/' ? cur + seg : cur + '/' + seg\n    begin\n      Dir.mkdir(cur)\n    rescue SystemCallError\n      raise unless File.directory?(cur)\n    end\n  end\n  true\nend",
+    ),
+    (
+        "_rmdir",
+        // The inverse of _mkdir, and the same explicit-rules rule: Dir.rmdir is
+        // empty-only and raises, while FileUtils.rm_r / rm_rf exist, swallow
+        // errors (rm_rf) and are a stdlib require. None of them may decide
+        // anything. See docs/SYNTAX.md §3h.
+        //
+        // The arity guard is inside the helper for the same reason as _mkdir: a
+        // Ruby ArgumentError is not an _AinlError, so it would escape an AINL
+        // `catch` and print a Ruby backtrace to stderr.
+        //
+        // The empty check is made here rather than read off ENOTEMPTY, because
+        // the message has to NAME the entry that blocked it. The name is the
+        // first in byte order, matching _list_dir: Dir.children returns
+        // filesystem order, which differs per host, so "the first entry" has to
+        // be chosen by a rule every backend can express (`n.b`, the same sort
+        // key _list_dir uses).
+        //
+        // The recursive case is a hand-rolled walk rather than FileUtils.rm_rf:
+        // rm_rf is quiet about a failure it cannot perform, so a partial delete
+        // would look complete. File.lstat here, so a symlink is unlinked and its
+        // target is never followed.
+        "def _rmdir(*args)\n  _error('rmdir expects (rmdir path) or (rmdir path option)') if args.length < 1 || args.length > 2\n  path = args[0]\n  opt = args.length > 1 ? args[1] : nil\n  _error(\"rmdir expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  unless opt.nil?\n    _error(\"rmdir expects a str option, got #{_ainl_tname(opt)}\") unless opt.is_a?(String)\n    _error(\"rmdir: unknown option '#{opt}'\") unless opt == ':recursive'\n  end\n  # File.lstat, not File.directory?: the interpreter's symlink_metadata is an\n  # lstat, so a symlink to a directory is a symlink and is not a directory.\n  p = _fs_probe(path)\n  begin\n    st = File.lstat(p)\n  rescue SystemCallError\n    _error(\"rmdir: cannot remove '#{path}': it does not exist\")\n  end\n  _error(\"rmdir: cannot remove '#{path}': it is not a directory\") if st.symlink? || !st.directory?\n  if opt == ':recursive'\n    _fs_rm_tree(p)\n    return nil\n  end\n  names = Dir.children(p).reject { |n| n == '.' || n == '..' }.sort_by { |n| n.b }\n  _error(\"rmdir: cannot remove '#{path}': it is not empty (#{names[0]})\") unless names.empty?\n  begin\n    Dir.rmdir(p)\n  rescue SystemCallError\n    _error(\"rmdir: cannot remove '#{path}'\")\n  end\n  # Dir.rmdir returns 0, and Ruby's last-expression return would hand that to\n  # the AINL program as the builtin's value — where os.rmdir returns None,\n  # fs.rmdirSync returns undefined and the interpreter returns nil. The parity\n  # gate catches this only where the result is *printed*, which is why every\n  # void builtin here ends in an explicit nil. (Same note on _mkdir below.)\n  nil\nend",
+    ),
+    (
+        // The recursive walk behind _rmdir's ':recursive'. Its own helper for
+        // the same reason _fs_mkdir_p is: it is a loop, and inlining it would
+        // bury the rule that matters (post-order, never through a symlink).
+        "_fs_rm_tree",
+        "def _fs_rm_tree(p)\n  Dir.children(p).each do |n|\n    c = File.join(p, n)\n    st = File.lstat(c)\n    if st.directory? && !st.symlink?\n      _fs_rm_tree(c)\n    else\n      # File.unlink on a symlink removes the link itself, so a target outside\n      # the tree is never touched.\n      File.unlink(c)\n    end\n  end\n  Dir.rmdir(p)\nend",
     ),
     (
         "_rename",
@@ -1289,7 +1344,7 @@ const RUNTIME: &[(&str, &str)] = &[
         // because "different filesystems" and "not writable" need different
         // fixes. Ruby carries it as Errno::EXDEV, whose `Errno` module is
         // built in.
-        "def _rename(*args)\n  _error('rename expects (rename from to)') if args.length != 2\n  src, dst = args\n  _error(\"rename expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"rename expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  begin\n    File.lstat(_fs_probe(src))\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}': it does not exist\")\n  end\n  begin\n    File.lstat(_fs_probe(dst))\n    _error(\"rename: cannot move '#{src}': '#{dst}' exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    File.rename(src, dst)\n  rescue Errno::EXDEV\n    _error(\"rename: cannot move '#{src}' to '#{dst}': different filesystems\")\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}' to '#{dst}'\")\n  end\nend",
+        "def _rename(*args)\n  _error('rename expects (rename from to)') if args.length != 2\n  src, dst = args\n  _error(\"rename expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"rename expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  begin\n    File.lstat(_fs_probe(src))\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}': it does not exist\")\n  end\n  begin\n    File.lstat(_fs_probe(dst))\n    _error(\"rename: cannot move '#{src}': '#{dst}' exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    File.rename(src, dst)\n  rescue Errno::EXDEV\n    _error(\"rename: cannot move '#{src}' to '#{dst}': different filesystems\")\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}' to '#{dst}'\")\n  end\n  # File.rename returns 0, and Ruby's last-expression return would hand that\n  # to the AINL program. See the same note on _write_file.\n  nil\nend",
     ),
     (
         "_copy",
@@ -1298,7 +1353,7 @@ const RUNTIME: &[(&str, &str)] = &[
         // is the stdlib byte copy and truncates an existing destination
         // exactly as write-file does. 'rb'/'wb' so no newline translation can
         // change the bytes.
-        "def _copy(*args)\n  _error('copy expects (copy from to)') if args.length != 2\n  src, dst = args\n  _error(\"copy expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"copy expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  p = _fs_probe(src)\n  begin\n    st = File.lstat(p)\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}': it does not exist\")\n  end\n  _error(\"copy: cannot copy '#{src}': it is a directory\") if st.directory?\n  begin\n    File.open(p, 'rb') do |i|\n      File.open(dst, 'wb') { |o| IO.copy_stream(i, o) }\n    end\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}' to '#{dst}'\")\n  end\nend",
+        "def _copy(*args)\n  _error('copy expects (copy from to)') if args.length != 2\n  src, dst = args\n  _error(\"copy expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"copy expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  p = _fs_probe(src)\n  begin\n    st = File.lstat(p)\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}': it does not exist\")\n  end\n  _error(\"copy: cannot copy '#{src}': it is a directory\") if st.directory?\n  begin\n    File.open(p, 'rb') do |i|\n      File.open(dst, 'wb') { |o| IO.copy_stream(i, o) }\n    end\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}' to '#{dst}'\")\n  end\n  # IO.copy_stream returns the number of bytes copied, and Ruby's\n  # last-expression return would hand it to the AINL program — so a 6-byte\n  # file would make `(print (copy a b))` print 6 on ruby and nil everywhere\n  # else. See the same note on _write_file.\n  nil\nend",
     ),
     (
         "_is_dir",
