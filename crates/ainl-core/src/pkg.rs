@@ -662,7 +662,21 @@ pub mod digest {
         msg.extend_from_slice(&bitlen.to_be_bytes());
 
         let mut w = [0u32; 64];
-        for chunk in msg.chunks_exact(64) {
+        // Fixed 64-byte compression windows.
+        //
+        // The loop is indexed rather than `for chunk in ...chunks_exact(64)`,
+        // because a recent clippy asks for the (still unstable) `as_chunks` on
+        // any fixed-size `chunks_exact` walk, and switching to it would break
+        // the build on the older toolchain the workspace also supports.
+        // Suppressing that lint with `#[allow]` is not an option either:
+        // `unknown_lints` is itself denied under `-D warnings`, so naming a lint
+        // this toolchain has never heard of turns a clean build into a hard
+        // error. Reading `w` by index satisfies both toolchains and is what the
+        // spec describes. The padding above guarantees the length is a whole
+        // multiple of 64, so no window is ever dropped.
+        let mut block = 0usize;
+        while block * 64 < msg.len() {
+            let chunk = &msg[block * 64..block * 64 + 64];
             for i in 0..16 {
                 w[i] = u32::from_be_bytes([
                     chunk[i * 4],
@@ -704,6 +718,7 @@ pub mod digest {
             for (i, v) in [a, b, c, d, e, f, g, hh].iter().enumerate() {
                 h[i] = h[i].wrapping_add(*v);
             }
+            block += 1;
         }
         h.iter().map(|w| format!("{w:08x}")).collect()
     }
