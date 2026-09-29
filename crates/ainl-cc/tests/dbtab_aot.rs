@@ -220,8 +220,7 @@ fn every_primary_key_type_agrees_across_engines() {
     assert_parity(src, "kinds");
 }
 
-/// A row is an AINL list, so it may hold lists and maps, and it must come back
-/// structurally identical.
+/// A row holding nested values must come back structurally identical.
 ///
 /// The map is built the way the language builds one — `(hash)` then `assoc` —
 /// rather than with a constructor that does not exist. That is worth stating
@@ -237,6 +236,156 @@ fn a_row_holding_nested_values_agrees_across_engines() {
       (print (db-select h t "a"))
       (db-close h))"#;
     assert_parity(src, "nested");
+}
+
+// ---- replace on an existing key --------------------------------------------
+
+/// Re-inserting an existing primary key replaces the row, on both engines.
+///
+/// # Why this test had to assert a *value* and not only that the engines agree
+///
+/// This is the one case where `assert_parity` alone is a trap that cannot fail,
+/// and the trap is the reason the bug shipped.
+///
+/// The defect was in `BTree::insert`'s replace path: the update call was
+/// passed as the *argument* of a `debug_assert!`, so it ran in debug and was
+/// stripped in release. Debug: the row was replaced. Release: the row silently
+/// kept its old value. The AOT C port used an unconditional `if` and was right
+/// in both.
+///
+/// Now the substitution. The two failing profiles are `cargo test` (debug) and
+/// `cargo test --release`, and in the debug profile *the interpreter and the
+/// VM are not even a separate implementation* — they are the same Rust behind
+/// two evaluators, so they agree by construction. A parity test compares two
+/// engines; here that comparison can only ever return "identical", and it would
+/// have stayed identical under the bug in every profile where the interpreter
+/// runs. Two engines agreeing that a key missed looks perfectly correct and is
+/// wrong twice.
+///
+/// So the load-bearing assertion is not `i_out == c_out`. It is that the
+/// *second* value came back: the row after a replace must carry the new value,
+/// with the old one nowhere in the output. That is checkable by a single
+/// engine against a written expectation, and it is what a parity test adds on
+/// top — a cross-process AOT run where the newest write is the one on disk.
+#[test]
+fn replacing_an_existing_key_replaces_the_row_on_both_engines() {
+    let si = Scratch::new("replace-interp");
+    let sc = Scratch::new("replace-aot");
+    let src = r#"(do
+      (def h (db-open "replace.db"))
+      (def t (db-create-table h "t"))
+      (db-insert h t (list "k" "first"))
+      (db-insert h t (list "k" "second"))
+      (print (db-select h t "k"))
+      (print (db-all-rows h t))
+      (db-close h))"#;
+
+    let (i_out, i_err, i_ok) = run_interp(src, &si.path);
+    let (bin, _) = build(src, "replace", &sc.path);
+    let (c_out, c_err, c_ok) = run(&bin, &sc.path);
+
+    assert!(i_ok, "the interpreter failed: {i_err}");
+    assert!(c_ok, "the compiled binary failed: {c_err}");
+
+    // The value assertion, on the interpreter. If a replace were dropped the
+    // row would still print, and would still hold exactly one key, so the shape
+    // is unchanged — only the *value* is the evidence.
+    assert!(
+        i_out.contains("second"),
+        "re-inserting an existing primary key must replace the row, but the \
+         interpreter returned the old value:\n{i_out}"
+    );
+    assert!(
+        !i_out.contains("first"),
+        "the replaced value must be gone from the index, not shadowed by it:\n{i_out}"
+    );
+    assert_eq!(
+        i_out.matches("second").count(),
+        2,
+        "the replace must be visible in both db-select and db-all-rows: {i_out}"
+    );
+
+    // The same assertion against the compiled binary, which is a genuinely
+    // separate implementation (no FFI: `runtime.c` hand-ports the tree).
+    assert!(
+        c_out.contains("second") && !c_out.contains("first"),
+        "the compiled binary returned the wrong row after a replace:\n{c_out}"
+    );
+
+    // And the two agree byte for byte on both streams, which is what the layer
+    // promises — asserted after the values, so a parity failure is reported as
+    // a parity failure rather than being the only thing that fires.
+    assert_eq!(i_err, c_err, "stderr differs on the replace program");
+    assert_eq!(i_out, c_out, "stdout differs on the replace program");
+}
+
+/// The replace must also survive a **reopen**, and must be the newest write that
+/// a later process reads — the append-only log replays in order, so this is a
+/// second place the same "replaced row" could have been kept from the old one.
+///
+/// # This test cannot catch a live-index replace bug, and that is not a defect
+///
+/// It is a persistence gate, and its blindness is structural rather than
+/// accidental, which is worth recording because the first version of it looked
+/// like the strongest of the three replace tests and is the weakest.
+///
+/// `Db::put` keeps its own flat `HashMap<String, String>` index beside the log
+/// — `db.rs:339`, `self.index.insert(key, value)` on every write — and that map
+/// is last-write-wins. A reopen calls `TableSet::rebuild` with it, so the map
+/// already holds only the *newest* value for each key before the tree is
+/// built. Every insert `rebuild` performs is therefore an insert into an empty
+/// tree, and the replace branch in `BTree::insert` is never reached at all.
+///
+/// So a dropped replace is invisible here in every backend, and this test was
+/// verified to stay green with the fix reverted. It still earns its place: it
+/// catches a replace that is correct in memory and never *durable* — a value
+/// that never reaches the file, which is a real and separate defect. The
+/// in-process test above is what holds the replace path, and it was checked by
+/// reverting the fix and watching it fail.
+#[test]
+fn a_replaced_row_survives_a_reopen_on_both_engines() {
+    let si = Scratch::new("replace-reopen-i");
+    let sc = Scratch::new("replace-reopen-c");
+    let db = "replace-reopen.db";
+    let write = format!(
+        r#"(do
+      (def h (db-open "{db}"))
+      (def t (db-create-table h "t"))
+      (db-insert h t (list "k" "first"))
+      (db-insert h t (list "k" "second"))
+      (db-close h))"#
+    );
+    let (_, _, ok) = run_interp(&write, &si.path);
+    assert!(ok, "the writing interpreter must succeed");
+
+    let read = format!(
+        r#"(do
+      (def h (db-open "{db}"))
+      (print (db-select h "t" "k"))
+      (print (db-all-rows h "t"))
+      (db-close h))"#
+    );
+    let (i_out, i_err, i_ok) = run_interp(&read, &si.path);
+    let (bin, _) = build(&read, "replace-reopen", &sc.path);
+    std::fs::copy(si.path.join(db), sc.path.join(db)).expect("share the file");
+    let (c_out, c_err, c_ok) = run(&bin, &sc.path);
+
+    assert!(
+        i_ok && c_ok,
+        "the read failed: interp {i_ok}/{i_err}, aot {c_ok}/{c_err}"
+    );
+    assert!(
+        i_out.contains("second") && !i_out.contains("first"),
+        "the replaced value did not survive the reopen:\ninterp: {i_out}"
+    );
+    assert!(
+        c_out.contains("second") && !c_out.contains("first"),
+        "the replaced value did not survive the reopen, read by the binary:\n{c_out}"
+    );
+    assert_eq!(
+        i_out, c_out,
+        "the engines disagree about a replaced row after a reopen"
+    );
 }
 
 // ---- persistence -----------------------------------------------------------
