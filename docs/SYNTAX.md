@@ -364,18 +364,36 @@ and evaluated **once per path**, so a diamond (`a` and `b` both import `c`) runs
 `c` exactly once. A file that imports itself, directly or transitively, is a
 **circular import** error that names the cycle.
 
-### Backend scope: the interpreter only
+### Backend scope: the AOT backend inlines; the transpilers refuse
 
 `import` works with `ainl run` and `ainl repl` — the interpreter/VM **and** the
-tree-walking evaluator behind it, which are held to agreeing on it.
+tree-walking evaluator behind it, which are held to agreeing on it — and with
+`ainl compile` (AOT C).
 
-The **AOT C backend and the three transpilers (Python / JS / Ruby) refuse a
-program containing `import`**, with an `interpreter-only` error naming the
-byte offset. This is deliberate, not an omission: a transpiler emits one source
-file with no module-resolution phase, and `import` is a *keyword* in Python,
-Ruby and JavaScript — an unhandled directive would lower into the host's own
-import machinery and produce a program that builds cleanly and does the wrong
-thing. A program with no `import` is unaffected on every backend.
+**The AOT backend resolves the import graph and inlines it.** A module's code
+is emitted into the program, so the compiled binary reads no source at run time
+and keeps working after its `.ainl` files are deleted. This is what makes a
+package manager safe to add: `ainl pkg` vendors sources into the tree at build
+time, and inlining puts them in the binary. Three rules keep the inlined
+program equivalent to the interpreted one, and each is a hard error rather than
+a silent difference:
+
+- a module is inlined **once**, so a diamond runs one copy of it;
+- two modules defining the same top-level name is an **error** naming the
+  collision — a duplicate inside a *single* module is still ordinary AINL;
+- a missing module, a nested `import`, or a cycle is refused, with the cycle
+  or the candidate paths named.
+
+**The three transpilers (Python / JS / Ruby) still refuse a program containing
+`import`**, with an `interpreter-only` error naming the byte offset. This is
+deliberate, not an omission: a transpiler emits one source file with no
+module-resolution phase, and `import` is a *keyword* in Python, Ruby and
+JavaScript — an unhandled directive would lower into the host's own import
+machinery and produce a program that builds cleanly and does the wrong thing.
+A program with no `import` is unaffected on every backend.
+
+See `ainl pkg` ([§3i](#3i-packages-ainl-pkg)) for how a package name becomes a
+resolvable bare import.
 
 (Scope note: the REPL and `import` are independent. The REPL adds no syntax of
 its own — see §3a.)
@@ -1150,6 +1168,104 @@ implementation. Each runner gets a **fresh scratch tree**, because the program
 creates, moves and deletes files and is not idempotent. (The parity program is a
 *print* program rather than a test file, so it lives in `fixtures/` — `ainl test`
 sweeps `tests/` and would count its output as suite noise.)
+
+## 3i. Packages: `ainl pkg`
+
+Modules (§3b) let one program read files next to itself. Packages let it read
+files that are **declared, pinned, and checked in** — and, because the AOT
+backend inlines imports, let the compiled binary carry them with no source at
+all.
+
+Three files, each with one job:
+
+| file | job |
+|---|---|
+| `ainl.pkg` | what the project **wants** — hand-written, never generated |
+| `.ainl-lock` | the **exact** resolved graph — generated, committed |
+| `.ainl-vendor/` | the package **sources** — generated, committed |
+
+The lockfile and the vendor dir are both committed, so a build resolves the
+same way on a laptop, in CI, and on a machine that has never seen the
+dependency. Nothing is fetched implicitly at build time.
+
+### The manifest
+
+`ainl.pkg` is line-oriented key/value data, with a `[deps]` section:
+
+```
+name: app
+version: 0.1.0
+
+[deps]
+name: greet
+version: 1.2.0
+source: ../greet
+```
+
+A `source` is a **local path** (`./dir`, `../dir`, `/abs`) or
+`git:<url>@<rev>`. An `https://` tarball is **refused** with a message saying
+there is no package registry in this tier — a silent fallback to a local path
+would be a dependency that resolves to the wrong thing.
+
+### The five commands
+
+```
+ainl pkg init [--name <name>]              write ainl.pkg here
+ainl pkg get <name>[@<version>] <source>   add a dep, resolve and vendor it
+ainl pkg install                           vendor everything the manifest declares
+ainl pkg list                              print the resolved graph
+ainl pkg verify                            check .ainl-vendor against .ainl-lock
+```
+
+Every command resolves from the **project root** — the nearest ancestor with an
+`ainl.pkg` — not the working directory, so `ainl pkg verify` means the same
+thing from anywhere in the tree. That is what makes it usable as a CI step that
+does not have to know where it was invoked from.
+
+`init` refuses to overwrite an existing manifest. It is a scaffolding command,
+and a command that silently overwrites work eventually destroys it.
+
+`get` and `install` write the lockfile; **`verify` never does**. That split is
+deliberate: a check that repairs as it checks cannot fail a build, and a build
+that repairs as it builds is not reproducible. `verify` is the CI gate — it
+exits non-zero on any difference, including an edited vendored file (the
+lockfile records a digest per file, not just a file list) and a missing one.
+
+### Importing a package by name
+
+A vendored package is imported by **bare name**, exactly like a module that
+happens to be in the working directory:
+
+```lisp
+(import "greet")        ; -> .ainl-vendor/greet.ainl
+                        ;  or .ainl-vendor/greet/greet.ainl
+```
+
+Ordinary files are searched **first**. A real file always beats a package of
+the same name, so `(import "greet")` cannot silently change meaning because
+someone ran `ainl pkg install`. Only *bare* specifiers consult the vendor dir;
+a path-like specifier means "next to me" and keeps meaning that.
+
+### What is refused
+
+These are errors, not policies chosen by the resolver:
+
+- **a dependency cycle** — the message names the cycle (`a -> b -> a`);
+- **two versions of one package** in a graph. The lockfile resolves to exactly
+  one version per name, and inventing a selection policy is not this tier's
+  job. Two packages that agree on name *and* version are the same package, and
+  the first one read wins.
+- **a version range** like `^1.0.0`. Versions are exact; a range would have to
+  be resolved against something this tier does not have.
+- **a name collision across modules** (§3b) — which the AOT inliner also
+  enforces, since it flattens every module into one namespace.
+
+The root project itself is recorded in the lockfile as `root:` and is **not**
+copied into its own `.ainl-vendor/`.
+
+`scripts/check-pkg.sh` is the gate. It resolves a two-package graph, runs it in
+the interpreter, compiles it, deletes every `.ainl` file, and re-runs the
+binary — which is the only way to prove the inlining rather than assert it.
 
 ## 4. Canonical examples
 

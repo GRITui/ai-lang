@@ -72,7 +72,7 @@
 
 use crate::error::{Error, Result};
 use crate::eval::Env;
-use crate::parser::Node;
+use crate::parser::{Node, Span};
 use crate::value::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -415,6 +415,346 @@ fn line_of(src: &str, at: usize) -> usize {
     src[..at.min(src.len())].matches('\n').count() + 1
 }
 
+// ---------------------------------------------------------------------------
+// Resolution without evaluation
+// ---------------------------------------------------------------------------
+
+/// One module in a resolved graph: its source, its imports, and its body.
+#[derive(Default, Clone)]
+pub struct SourceModule {
+    /// Canonical path — the same cache key [`load`] uses, so a diamond in this
+    /// graph folds to one module exactly as it does there.
+    pub path: PathBuf,
+    /// The specifier the first importer wrote, for messages.
+    pub display: String,
+    /// The module's own forms, imports stripped.
+    pub forms: Vec<Node>,
+    /// Indices into [`Graph::modules`] this module imports, in source order.
+    pub deps: Vec<usize>,
+    /// The `as` aliases this module's own imports declared, keyed by the
+    /// canonical path of the module each alias refers to.
+    ///
+    /// Recorded per module rather than only for the entry, because a *nested*
+    /// module's namespaced import binds a name in that module's scope — and a
+    /// backend that flattens the graph destroys that scope, so the binding has
+    /// to be re-synthesized from the module's own exports.
+    pub aliases: HashMap<PathBuf, (String, String)>,
+}
+
+/// A program's import graph, resolved but **not evaluated**.
+///
+/// This is the half of module resolution a compiler needs. [`load`] evaluates
+/// each module to produce values, which is right for an interpreter that is
+/// about to run and wrong for a backend that wants the *source* of the whole
+/// reachable graph in dependency order. Both walk the same
+/// [`candidates`] / [`cache_key`] machinery, so a program that resolves here
+/// resolves there — a second resolution algorithm would be a second opinion
+/// about which files a program pulls in, and the one that disagreed would be
+/// the one nobody tested.
+pub struct Graph {
+    /// Every reachable module, dependencies before dependents.
+    pub modules: Vec<SourceModule>,
+    /// The entry file's own forms, imports stripped.
+    pub entry: Vec<Node>,
+    /// The `as` aliases the *entry* declared: canonical path -> (alias, the
+    /// specifier as written). A backend that flattens the graph must emit a
+    /// `def` for each of these, because the flattened source binds the alias
+    /// nowhere — the flat form of the same import is satisfied for free by the
+    /// module's own `def`s appearing inline, but the namespace map is a value
+    /// nothing else constructs.
+    pub entry_aliases: HashMap<PathBuf, (String, String)>,
+}
+
+impl Graph {
+    /// The index of the module at `path`, if the graph reached it.
+    pub fn index_of(&self, path: &Path) -> Option<usize> {
+        self.modules.iter().position(|m| m.path == path)
+    }
+
+    /// The whole program as one flat, correctly-ordered form list.
+    ///
+    /// This is the single place the order is decided, because there are three
+    /// separate things that have to line up and getting any of them wrong
+    /// produces a program that *compiles* and then fails:
+    ///
+    /// 1. **a module after everything it imports** — otherwise a module that
+    ///    calls an import at load time reads a name that is not bound yet;
+    /// 2. **a module's alias defs after that module's own forms** — the alias
+    ///    map is built from the export values, so it cannot precede them;
+    /// 3. **every alias def before the body that uses it** — an entry alias
+    ///    precedes the entry's forms, a module's own alias defs precede the
+    ///    module's forms.
+    ///
+    /// Flattening satisfies `(import "m")` for free, because the module's own
+    /// `def`s are now in the same program. It does **not** satisfy `(import "m"
+    /// as ns)`: that binding is a *value* — a map from the module's export
+    /// names to their values — and nothing in the flattened source constructs
+    /// one. Dropping the directive without rebuilding the binding leaves a
+    /// program that compiles and then dies at run time with `unbound symbol
+    /// 'ns'`, which is the worst shape of bug because every static check
+    /// passed.
+    ///
+    /// So each alias is re-expressed in the language itself as
+    /// `(def ns (hash "k1" k1 ...))`, the same map `namespace_map` builds for
+    /// the interpreter. Writing it as AINL rather than as a backend-specific
+    /// data structure is what keeps the two interpreters honest: the value is
+    /// constructed by the same `hash` builtin the program could have written.
+    pub fn flatten(&self) -> Vec<Node> {
+        let mut out = Vec::new();
+        for m in &self.modules {
+            // 1 + 2: this module's defs, then the aliases it declares over the
+            // modules it imported.
+            out.extend(m.forms.iter().cloned());
+            out.extend(self.alias_defs_for(m));
+        }
+        // 3 (for the entry): every module is bound by now, so the entry's
+        // aliases can be built, and they land before the entry's own forms.
+        out.extend(self.alias_defs_over(&self.entry_aliases));
+        out.extend(self.entry.iter().cloned());
+        out
+    }
+
+    /// The `def` forms re-creating `aliases` as namespace maps.
+    fn alias_defs_for(&self, m: &SourceModule) -> Vec<Node> {
+        self.alias_defs_over(&m.aliases)
+    }
+
+    fn alias_defs_over(&self, aliases: &HashMap<PathBuf, (String, String)>) -> Vec<Node> {
+        // A HashMap iterates in arbitrary order, and the emitted program is
+        // compared byte-for-byte by the parity suites — so sort by alias name.
+        // Two aliases for one module differ only by name, so this is also a
+        // stable, source-order-independent answer.
+        let mut keys: Vec<&PathBuf> = aliases.keys().collect();
+        keys.sort();
+        let mut out = Vec::new();
+        for path in keys {
+            let (alias, _) = &aliases[path];
+            let Some(m) = self.modules.iter().find(|m| m.path == *path) else {
+                continue;
+            };
+            let mut hash = vec![Node::Sym("hash".to_string(), Span::default())];
+            for name in top_level_defs(&m.forms) {
+                // `Node::Str` holds the *content*, not a quoted literal — the
+                // parser strips the quotes, and the codegen re-adds them. A
+                // pre-quoted string here would emit `\"name\"` into the C.
+                hash.push(Node::Str(name.clone(), Span::default()));
+                hash.push(Node::Sym(name, Span::default()));
+            }
+            out.push(Node::List(
+                vec![
+                    Node::Sym("def".to_string(), Span::default()),
+                    Node::Sym(alias.clone(), Span::default()),
+                    Node::List(hash, Span::default()),
+                ],
+                Span::default(),
+            ));
+        }
+        out
+    }
+}
+
+/// Resolve a program's imports into a source graph, without evaluating it.
+///
+/// `from_dir` is the entry file's directory. Modules are returned in
+/// dependency order (a module appears after everything it imports), which is
+/// what makes a flat concatenation of their forms a correct program.
+///
+/// Nested imports are refused exactly as [`prepare`] refuses them, and a cycle
+/// is refused with the same message: one idea, one error text.
+///
+/// The entry's `as` aliases are collected into [`Graph::entry_aliases`]
+/// rather than applied, because a backend that flattens the graph has to
+/// *synthesize* the binding: the flat import it corresponds to is already
+/// satisfied by the module's own `def`s appearing inline, but nothing in the
+/// flattened source ever binds the alias name.
+pub fn resolve_graph(forms: &[Node], src: &str, from_dir: &Path) -> Result<Graph> {
+    let mut modules: Vec<SourceModule> = Vec::new();
+    let mut by_key: HashMap<PathBuf, usize> = HashMap::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let entry = strip_imports(forms);
+    // The entry file's own imports, resolved first and in source order. The
+    // entry's aliases are kept aside because the entry is not a module — it has
+    // no slot in `modules` to hang them on.
+    let mut entry_aliases: HashMap<PathBuf, (String, String)> = HashMap::new();
+    for spec in scan(forms, src)? {
+        let idx = resolve_one(&spec, from_dir, &mut modules, &mut by_key, &mut stack)?;
+        if let Some(alias) = &spec.alias {
+            // Keyed by canonical path, so an alias follows the file it was
+            // written for even when a second specifier reaches the same file.
+            entry_aliases.insert(modules[idx].path.clone(), (alias.clone(), spec.raw.clone()));
+        }
+    }
+    Ok(Graph {
+        modules: dependency_order(modules)?,
+        entry,
+        entry_aliases,
+    })
+}
+
+/// Reorder `modules` so every module comes **after** everything it imports.
+///
+/// Resolution cannot produce this order, and the reason is worth stating
+/// because the fix looks like it should be unnecessary. `resolve_one` has to
+/// reserve a module's slot *before* recursing into it — that is what lets a
+/// diamond find the already-claimed index instead of resolving the shared
+/// module twice. But reserving-first means a module is placed where its
+/// resolution *began*, not where it *finished*.
+///
+/// The gap only shows up when a module calls an import at load time. `stats.ainl`
+/// ends with `(def example-counts (word-count (words "...")))`, so it needs
+/// `text`'s `words` to already be bound when the line runs. Resolution put
+/// `stats` at index 0 and `text` at index 1 — a module before its own
+/// dependency — and the flattened program then called `words` while it was
+/// still nil. The interpreter never hit this because it *evaluates* each
+/// module as it finishes, so its order is depth-first by construction; only
+/// the concatenated form, which is what AOT emits, was wrong.
+///
+/// A depth-first post-order walk over the resolved graph is the fix: it visits
+/// a module's dependencies before the module itself, and it is stable, so two
+/// modules with no dependency between them keep the order the source listed
+/// them in. `deps` is remapped rather than recomputed, so the indexes stay
+/// correct in the new numbering.
+fn dependency_order(modules: Vec<SourceModule>) -> Result<Vec<SourceModule>> {
+    // state: 0 = unvisited, 1 = on the current walk (an ancestor), 2 = done.
+    let mut state = vec![0u8; modules.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(modules.len());
+    // Explicit stack of (module, next dependency to visit). Recursing here
+    // instead would put a deep diamond's depth on the Rust stack, and module
+    // count is capped at MAX_MODULES rather than at a few dozen.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for root in 0..modules.len() {
+        if state[root] != 0 {
+            continue;
+        }
+        state[root] = 1;
+        stack.push((root, 0));
+        while let Some(&mut (node, ref mut next)) = stack.last_mut() {
+            if *next < modules[node].deps.len() {
+                let dep = modules[node].deps[*next];
+                *next += 1;
+                match state[dep] {
+                    // Already emitted earlier in this walk: it precedes `node`,
+                    // so the edge is satisfied.
+                    2 => {}
+                    // An ancestor. Unreachable — `resolve_one` refuses a cycle
+                    // before a graph is built — but if it ever happened, the
+                    // flattened form would loop forever, so refuse it here
+                    // rather than emit a program that cannot terminate.
+                    1 => {
+                        return Err(Error::runtime(
+                            "import: circular import — the module graph is not acyclic",
+                        ));
+                    }
+                    _ => {
+                        state[dep] = 1;
+                        stack.push((dep, 0));
+                    }
+                }
+            } else {
+                state[node] = 2;
+                order.push(node);
+                stack.pop();
+            }
+        }
+    }
+    debug_assert_eq!(order.len(), modules.len());
+    // old index -> new index
+    let mut remap = vec![0usize; modules.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        remap[old_idx] = new_idx;
+    }
+    let mut out = vec![SourceModule::default(); modules.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        let m = &modules[old_idx];
+        let mut deps: Vec<usize> = m.deps.iter().map(|d| remap[*d]).collect();
+        deps.sort_unstable();
+        deps.dedup();
+        out[new_idx] = SourceModule {
+            path: m.path.clone(),
+            display: m.display.clone(),
+            forms: m.forms.clone(),
+            // Aliased by canonical path, not by index, so reordering the graph
+            // does not have to remap these — only `deps` is index-based.
+            aliases: m.aliases.clone(),
+            deps,
+        };
+    }
+    Ok(out)
+}
+
+fn resolve_one(
+    spec: &Spec,
+    from_dir: &Path,
+    modules: &mut Vec<SourceModule>,
+    by_key: &mut HashMap<PathBuf, usize>,
+    stack: &mut Vec<PathBuf>,
+) -> Result<usize> {
+    let Some((path, _)) = existing_candidates(&spec.raw, from_dir).into_iter().next() else {
+        return Err(not_found(&spec.raw, from_dir));
+    };
+    let key = cache_key(&path);
+    // The cycle check comes BEFORE the cache check, and that order is the whole
+    // point. A key on the resolution stack is by definition an ancestor of the
+    // module being resolved, so reaching one again is always a cycle. Checking
+    // the cache first would instead return the ancestor's index and treat the
+    // cycle as a diamond — silently, with a well-formed-looking graph whose
+    // `deps` edge points back at a module already emitted above. A diamond is
+    // the same two modules meeting, but reached by *siblings*: the ancestor test
+    // is what tells them apart.
+    if let Some(pos) = stack.iter().position(|p| *p == key) {
+        let cycle: Vec<String> = stack[pos..].iter().map(|p| display_of(p)).collect();
+        return Err(Error::runtime(format!(
+            "import: circular import — {} imports itself ({})",
+            display_of(&key),
+            cycle.join(" -> ")
+        )));
+    }
+    // Safe to consult the cache now: anything already resolved *and* not on
+    // the stack is a sibling, and reusing it is what folds a diamond.
+    if let Some(i) = by_key.get(&key) {
+        return Ok(*i);
+    }
+    if modules.len() >= MAX_MODULES {
+        return Err(Error::runtime(format!(
+            "import: too many modules (max {MAX_MODULES}) — one program may not pull in more than {MAX_MODULES} files"
+        )));
+    }
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| Error::runtime(format!("import: cannot read {}: {e}", path.display())))?;
+    let wrap = |e: Error| Error::runtime(format!("import: {}: {e}", display_of(&path)));
+    let forms = crate::parse(&src).map_err(wrap)?;
+    let specs = scan(&forms, &src).map_err(wrap)?;
+
+    // Reserve this module's slot *before* recursing, so a diamond resolves the
+    // shared module once and a cycle is caught by the stack check above rather
+    // than by a second entry appearing under a different key.
+    let idx = modules.len();
+    modules.push(SourceModule {
+        path: key.clone(),
+        display: spec.raw.clone(),
+        forms: strip_imports(&forms),
+        deps: Vec::new(),
+        aliases: HashMap::new(),
+    });
+    by_key.insert(key.clone(), idx);
+
+    stack.push(key.clone());
+    let mut deps = Vec::new();
+    let mut aliases: HashMap<PathBuf, (String, String)> = HashMap::new();
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    for sub in &specs {
+        let i = resolve_one(sub, &dir, modules, by_key, stack)?;
+        if let Some(alias) = &sub.alias {
+            aliases.insert(modules[i].path.clone(), (alias.clone(), sub.raw.clone()));
+        }
+        deps.push(i);
+    }
+    stack.pop();
+    modules[idx].deps = deps;
+    modules[idx].aliases = aliases;
+    Ok(idx)
+}
+
 /// Every name `def`-bound at the top level of `forms`, in source order.
 ///
 /// Read from the AST rather than from a module's finished environment because
@@ -473,7 +813,41 @@ pub fn candidates(spec: &str, from_dir: &Path) -> Vec<(PathBuf, String)> {
         push(p.to_path_buf(), "working directory".to_string());
         push(from_dir.join(p), importer);
     }
+    // A bare name that is not a file may name a *package*: the vendored copy
+    // under `.ainl-vendor/`. Tried last, so a real file always wins over a
+    // package of the same name — an `import` that a reader can resolve by
+    // looking at the tree should never depend on whether someone ran
+    // `ainl pkg install`.
+    //
+    // The project root is `from_dir` for the entry file and, for a module,
+    // the nearest ancestor holding an `ainl.pkg`. Walking up per import is
+    // cheap and is what makes a vendored package able to import its own
+    // dependency by name from inside `.ainl-vendor/`.
+    if let Some(root) = pkg_root(from_dir) {
+        for cand in crate::pkg::vendor_candidates(spec, &root) {
+            push(
+                cand,
+                format!("package {} in {}", spec, crate::pkg::VENDOR_DIR),
+            );
+        }
+    }
     out
+}
+
+/// The directory that holds `.ainl-vendor/` for a file in `from_dir`.
+///
+/// Walks up to the nearest `ainl.pkg`, so a module deep inside a package
+/// resolves its deps the same way the entry file does. Returns `None` outside
+/// a project, which is the ordinary case for a script run from a temp dir.
+fn pkg_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut dir = Some(from_dir);
+    while let Some(d) = dir {
+        if d.join(crate::pkg::MANIFEST).is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Append [`MODULE_EXT`] unless the path already carries an extension.

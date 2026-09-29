@@ -217,10 +217,12 @@ Two things to know before you write your own:
   for `lib/lib/math.ainl`. A path-like specifier (one containing `/`) resolves
   against the importing file's directory first; a bare name resolves against the
   working directory first.
-- **`import` works in the interpreter only.** `ainl compile` (AOT) and the
-  Python/JS/Ruby transpilers refuse a program containing it, by design — see
-  [SYNTAX.md §3b](SYNTAX.md#3b-modules-import) for why. Keep a program's
-  modules at the interpreter if you want to ship it to a host language.
+- **`import` works in the interpreter and in `ainl compile`; the
+  Python/JS/Ruby transpilers refuse it.** The AOT backend resolves the import
+  graph and **inlines** it, so a compiled binary needs no source at run time —
+  see [SYNTAX.md §3b](SYNTAX.md#3b-modules-import) for why. The transpilers
+  still refuse, by design. Keep a program's modules at the interpreter only if
+  you want to ship it to a host language.
 
 Full rules — exports, collisions, cycles, and error text: [SYNTAX.md §3b](SYNTAX.md#3b-modules-import).
 

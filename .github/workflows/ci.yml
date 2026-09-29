@@ -80,7 +80,7 @@ jobs:
         run: ./scripts/check-transpile.sh
 
   modules:
-    name: modules (import resolves; AOT + transpilers refuse)
+    name: modules (import resolves; AOT inlines; transpilers refuse)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,13 +100,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      # Two halves, and the second is the one that would have caught a real
-      # defect: the multi-file example must run, AND the three backends that
-      # cannot resolve modules must refuse it. `import` is a keyword in Python,
-      # Ruby and JavaScript, so an unhandled directive would transpile to a call
-      # into the host's own import machinery — a program that builds cleanly
-      # and does the wrong thing.
-      - name: Module resolution + backend refusal gate
+      # Two halves that assert OPPOSITE things, because the difference is the
+      # design. The multi-file example must compile to a standalone AOT binary
+      # that still works after its sources are deleted (the backend resolves and
+      # inlines the graph), while the three transpilers must REFUSE it —
+      # `import` is a keyword in Python, Ruby and JavaScript, so an unhandled
+      # directive would lower into the host's own import machinery and produce a
+      # program that builds cleanly and does the wrong thing.
+      - name: Module resolution + AOT inlining + transpiler refusal gate
         run: ./scripts/check-modules.sh
 
       # Every behavioral claim in SYNTAX.md §3b, executed against the real
@@ -116,6 +117,36 @@ jobs:
       # from prose into a test.
       - name: Documented import behavior matches the interpreter
         run: ./scripts/check-docs-import.sh
+
+  packages:
+    name: "packages (ainl pkg: resolve, vendor, verify, standalone AOT)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('crates/**/*.rs', 'crates/**/*.c') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The package gate, and the reason it needs `cc`: the load-bearing
+      # assertion is that a program importing a *vendored* package compiles to a
+      # binary that still runs after every .ainl file is deleted. That is the
+      # whole argument for vendoring — a package manager whose AOT output read
+      # its dependencies off disk would be worse than no package manager.
+      # `cc` is preinstalled on ubuntu runners.
+      - name: Package manager + standalone AOT gate
+        run: ./scripts/check-pkg.sh
 
   try-catch:
     name: try/catch (4-backend parity on the error path)

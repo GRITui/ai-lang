@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Module gate: the multi-file example must run, and the three backends that
-# cannot resolve modules must REFUSE it rather than emit something wrong.
+# Module gate: the multi-file example must run, must COMPILE to a standalone
+# AOT binary, and the three transpilers — which cannot resolve modules — must
+# REFUSE it rather than emit something wrong.
 #
 # The refusal half matters more than it looks. `import` is a keyword in Python,
 # Ruby and JavaScript, so an unhandled `(import "m")` in the transpilers would
 # lower to a call to the host's own import machinery — a program that compiles
-# cleanly and does the wrong thing. The AOT backend would instead fail at
-# runtime with a `scope_lookup` error naming `import`, which reads like a
-# codegen bug. Both are silent-wrong or misleading; refusing is the only honest
-# option, and this script is what keeps that honest.
+# cleanly and does the wrong thing. Refusing is the only honest option there.
+#
+# The AOT backend used to refuse too, and no longer does: it now resolves the
+# graph and INLINES it, because a load-time directive is something a compiler
+# already does, and an inlined program needs no runtime load phase at all. The
+# two halves below assert opposite things on purpose — AOT must succeed and
+# produce a working binary, the transpilers must refuse — because the
+# difference is the whole design.
 #
 # Runs in CI and locally. Exits non-zero on any failure.
 set -uo pipefail
@@ -67,22 +72,47 @@ else
 fi
 
 echo
-echo "== the AOT backend REFUSES a program with imports =="
-# Before this gate existed, `ainl compile` emitted a C program that failed at
-# runtime with `unbound variable: import`.
-if out=$("$BIN" compile "$EX" -o "$D/wc.aot" 2>&1); then
-  echo "FAIL: ainl compile accepted a program with imports"
-  fail=1
-elif ! printf '%s' "$out" | grep -q 'interpreter-only'; then
-  echo "FAIL: refused, but not for the right reason:"
+echo "== the AOT backend INLINES the imports into a standalone binary =="
+# This used to be a refusal. It cannot be one any more without giving up the
+# property the whole tier exists for: a compiled AINL program reads no source
+# at run time. The assertion is therefore the strong one — it compiles, AND the
+# result still works after the sources are deleted, which is the only evidence
+# that inlining happened rather than some runtime lookup being left in.
+#
+# Run in a COPY of the example under $D. Deleting the example in place to prove
+# standalone-ness would leave the repo without its own sample on any failure,
+# and the later transpiler checks need it intact.
+S="$D/standalone-src"
+mkdir -p "$S"
+cp "$EX" "$S/main.ainl"
+mkdir -p "$S/lib"
+cp examples/wordcount/lib/*.ainl "$S/lib/" 2>/dev/null
+if ! out=$("$BIN" compile "$S/main.ainl" -o "$D/wc.aot" 2>&1); then
+  echo "FAIL: ainl compile refused a program with imports:"
   printf '%s\n' "$out" | sed 's/^/    /'
   fail=1
 else
-  echo "ok   refused: $(printf '%s' "$out" | head -1)"
+  echo "ok   compiled the multi-file example -> wc.aot"
+  # Now delete every source in the copy, and run the binary. A wrapper or a
+  # runtime loader would fail here; an inlined one cannot notice.
+  rm -f "$S/main.ainl" "$S"/lib/*.ainl
+  if [ -n "$(find "$S" -name '*.ainl' 2>/dev/null)" ]; then
+    echo "FAIL: an .ainl file survived deletion — the proof would be meaningless"
+    fail=1
+  fi
+  if got=$("$D/wc.aot" 2>&1) && printf '%s' "$got" | grep -q 'words:'; then
+    echo "ok   the binary still works with every .ainl file deleted"
+  else
+    echo "FAIL: standalone binary printed '$got' after its sources were deleted"
+    fail=1
+  fi
 fi
 
 echo
 echo "== each transpiler REFUSES a program with imports =="
+# The opposite of the AOT case, and for a real reason: these emit a single
+# source file with no module-resolution phase, and `import` is a keyword in the
+# host language.
 for target in python js ruby; do
   if out=$("$BIN" transpile "$EX" --to "$target" 2>&1); then
     echo "FAIL: transpile --to $target accepted a program with imports"
