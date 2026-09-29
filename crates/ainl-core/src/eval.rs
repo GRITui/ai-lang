@@ -964,6 +964,13 @@ fn install_stdlib(env: &Env) {
     // order is load-bearing (dbkv *replaces* `db-get`). See dbtab.rs and
     // docs/SYNTAX.md §3m.
     crate::dbtab::install(env);
+    // The query layer (Tier 4 card 4): `db-query` / `db-query-count`, a small
+    // SQL subset over the tables above. It is a **reader**: it parses a query,
+    // runs it against the same B-tree and never appends a record, so it adds no
+    // write path and no new recovery case. It adds two new names and rebinds
+    // none, so like the table layer its position in this list cannot matter to
+    // a program. See dbquery.rs and docs/SYNTAX.md §3n.
+    crate::dbquery::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------

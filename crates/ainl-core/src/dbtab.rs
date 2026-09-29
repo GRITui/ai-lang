@@ -150,7 +150,7 @@ const ROW_PREFIX: &str = "@t:";
 /// An empty key. A row's key is always at least two bytes of JSON (`"a"`, `1`,
 /// `null`), so the empty string is the one key no user row can have — which is
 /// what makes the marker unreachable as a row without a second reserved value.
-const TABLE_MARKER_KEY: &str = "";
+pub const TABLE_MARKER_KEY: &str = "";
 
 /// The log key for `(table, primary_key_json)`.
 ///
@@ -176,7 +176,10 @@ const TABLE_MARKER_KEY: &str = "";
 /// is there, but preceded by its length. That is the right trade: a reader who
 /// cannot parse the key can still use `db-all-rows`, and a reader who can parse
 /// it never gets a wrong answer.
-fn row_key(table: &str, key_json: &str) -> String {
+/// Public because the query layer's tests build a table directly, and a fixture
+/// that spells the prefix format out in a second place is one that keeps
+/// passing after the encoding changes.
+pub fn row_key(table: &str, key_json: &str) -> String {
     format!("{ROW_PREFIX}{}:{table}{key_json}", table.len())
 }
 
@@ -245,7 +248,7 @@ fn table_name(v: &Value, who: &str) -> Result<String> {
 /// key contains, and the length prefix in [`row_key`] makes the encoding
 /// unambiguous regardless. That is a deliberate improvement on the NUL-separated
 /// first design, which had to reject a key the log could not have stored anyway.
-fn key_json(v: &Value, who: &str) -> Result<String> {
+pub fn key_json(v: &Value, who: &str) -> Result<String> {
     match v {
         Value::List(_) | Value::Map(_) => {
             return Err(Error::runtime(format!(
@@ -262,12 +265,16 @@ fn key_json(v: &Value, who: &str) -> Result<String> {
         }
         _ => {}
     }
-    encode(v, who)
+    encode_row(v, who)
 }
 
 /// `json-serialize` as a `String`, with the internal-error guard both layers
 /// share.
-fn encode(v: &Value, who: &str) -> Result<String> {
+///
+/// Public because the query layer stores nothing of its own but still has to
+/// read a row, and a *second* JSON reader here would be a second thing that can
+/// disagree with the first about what a stored row is.
+pub fn encode_row(v: &Value, who: &str) -> Result<String> {
     match json_value::builtin_json_serialize(std::slice::from_ref(v))? {
         Value::Str(s) => Ok(s.as_str().to_string()),
         other => Err(Error::runtime(format!(
@@ -280,7 +287,13 @@ fn encode(v: &Value, who: &str) -> Result<String> {
 /// `json-parse` of stored text, with a message that says where the text came
 /// from rather than repeating the parser's complaint about a byte offset inside
 /// a record the caller never wrote.
-fn decode(text: &str, who: &str, what: &str) -> Result<Value> {
+/// The same reader, for the query layer: `(text, builtin, "<what this text is>")`.
+///
+/// `what` is the caller's phrase, so `db-select` says "the row for key …" and
+/// `db-query` says "a row of 'people'" without either message knowing about the
+/// other. One reader, two callers, and no second place where a stored row can be
+/// turned into a value.
+pub fn decode_row(text: &str, who: &str, what: &str) -> Result<Value> {
     let v = Value::str(text.to_string());
     json_value::builtin_json_parse(std::slice::from_ref(&v)).map_err(|_| {
         Error::runtime(format!(
@@ -512,7 +525,7 @@ fn db_insert(args: &[Value]) -> Result<Value> {
     // The key first: a row whose primary key is unorderable is refused before
     // anything is written, so a bad `db-insert` leaves no record behind.
     let key = key_json(&row[0], DB_INSERT)?;
-    let encoded = encode(&list_value(row), DB_INSERT)?;
+    let encoded = encode_row(&list_value(row), DB_INSERT)?;
     with_db(h, DB_INSERT, |db| {
         // The table is checked **before** the record is written, not after. The
         // first version wrote the log record and only then asked the table
@@ -553,7 +566,7 @@ fn db_select(args: &[Value]) -> Result<Value> {
     let stored = with_db(h, DB_SELECT, |db| db.tables().row(table, &key, DB_SELECT))?;
     match stored {
         None => Ok(Value::Nil),
-        Some(text) => decode(
+        Some(text) => decode_row(
             &text,
             DB_SELECT,
             &format!("the row for key {key} in '{table}'"),
@@ -604,7 +617,7 @@ fn db_all_rows(args: &[Value]) -> Result<Value> {
     let texts = with_db(h, DB_ALL_ROWS, |db| db.tables().rows(table, DB_ALL_ROWS))?;
     let mut rows = Vec::with_capacity(texts.len());
     for t in texts {
-        rows.push(decode(&t, DB_ALL_ROWS, &format!("a row of '{table}'"))?);
+        rows.push(decode_row(&t, DB_ALL_ROWS, &format!("a row of '{table}'"))?);
     }
     Ok(list_value(rows))
 }
@@ -674,7 +687,7 @@ mod tests {
     fn insert(db: &mut Db, table: &str, r: Value) {
         let cols = as_row(&r, DB_INSERT).expect("row");
         let key = key_json(&cols[0], DB_INSERT).expect("key");
-        let encoded = encode(&r, DB_INSERT).expect("encode");
+        let encoded = encode_row(&r, DB_INSERT).expect("encode");
         db.put(&row_key(table, &key), &encoded).expect("put");
         db.tables().put(table, &key, &encoded).expect("tree");
     }
@@ -686,7 +699,7 @@ mod tests {
         let k = key_json(key, DB_SELECT).expect("key");
         match db.tables().row(table, &k, DB_SELECT).expect("row") {
             None => Value::Nil,
-            Some(t) => decode(&t, DB_SELECT, "row").expect("decode"),
+            Some(t) => decode_row(&t, DB_SELECT, "row").expect("decode"),
         }
     }
 
@@ -695,7 +708,7 @@ mod tests {
             .rows(table, DB_ALL_ROWS)
             .expect("rows")
             .iter()
-            .map(|t| decode(t, DB_ALL_ROWS, "row").expect("decode"))
+            .map(|t| decode_row(t, DB_ALL_ROWS, "row").expect("decode"))
             .collect()
     }
 
