@@ -163,18 +163,20 @@ AINL's other properties, all measured:
 - **AOT to a native binary.** `ainl compile` emits a single self-contained C
   file — the micro-runtime is inlined, so the output links against nothing but
   libc. Needs `cc` to build; **the output needs nothing.**
-- **74 builtins.** 67 are byte-identical on all four backends (the interpreter,
+- **79 builtins.** 67 are byte-identical on all four backends (the interpreter,
   the AOT binary, and the three transpiler targets). Two — `http-get` and
   `http-post` — are **interpreter-only**: the AOT and transpiler backends refuse a
   program that uses them with an explicit `interpreter-only` error rather than
   emit something that behaves differently
-  ([docs/SYNTAX.md](docs/SYNTAX.md#3c-http-http-get--http-post)). The last five —
-  `db-open` / `db-put` / `db-get` / `db-flush` / `db-close`, a durable
-  key/value store with an append-only checksummed log that survives a power cut
+  ([docs/SYNTAX.md](docs/SYNTAX.md#3c-http-http-get--http-post)). The last ten —
+  `db-open` / `db-put` / `db-get-raw` / `db-flush` / `db-close`, a durable byte
+  store on an append-only checksummed log that survives a power cut, and
+  `db-set` / `db-get` / `db-del` / `db-keys` / `db-count`, a value store over it
   — run on the interpreter and the AOT binary and are refused by the transpilers,
   which say `transpiler-only` because `ainl compile` genuinely runs them. A host
   `open()` cannot reproduce the log, so the backends that would have to fake it
-  decline instead ([docs/SYNTAX.md](docs/SYNTAX.md#3k-storage-db-open--db-put--db-get--db-flush--db-close)).
+  decline instead ([docs/SYNTAX.md](docs/SYNTAX.md#3k-storage-db-open--db-put--db-get-raw--db-flush--db-close)
+  and [§3l](docs/SYNTAX.md#3l-key-value-storage-db-set--db-get--db-get-raw--db-del--db-keys--db-count)).
 - **A test runner.** `(test name expr expected)` asserts, and `ainl test` runs
   a directory of test files and exits non-zero on any failure — so AINL can
   check its own output, and CI can consume the result with no parsing

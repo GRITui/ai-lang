@@ -128,6 +128,16 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("db-get", 69),
     ("db-flush", 70),
     ("db-close", 71),
+    // Tier 4 key-value layer. `db-get` is deliberately absent: it keeps id 69,
+    // and the dispatch switch sends that id to the value layer's reader. The
+    // ids here must match the B_* enum in runtime.c in exactly this order —
+    // crates/ainl-cc/tests/aot_stdlib.rs checks both directions, and that test
+    // is what stops this list and the enum from drifting apart.
+    ("db-set", 72),
+    ("db-get-raw", 73),
+    ("db-del", 74),
+    ("db-keys", 75),
+    ("db-count", 76),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

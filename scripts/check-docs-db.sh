@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Verify every claim made in docs/SYNTAX.md section 3k (db-open/db-put/db-get/
-# db-flush/db-close) against the real binary.
+# Verify every claim made in docs/SYNTAX.md section 3k (db-open/db-put/
+# db-get-raw/db-flush/db-close) against the real binary.
 #
 # The sibling of check-docs-fs.sh, for the same reason. A storage section is
 # almost entirely about behaviour a host file API does *not* have by default —
@@ -80,8 +80,8 @@ nil" \
 (db-put h "todo" "buy milk")
 (db-put h "todo" "buy oat milk")
 (db-flush h)
-(print (db-get h "todo"))
-(print (db-get h "absent"))
+(print (db-get-raw  h "todo"))
+(print (db-get-raw  h "absent"))
 (db-close h)'
 
 # ---- return values --------------------------------------------------------
@@ -104,7 +104,7 @@ want "an overwrite is visible to a reader" \
       (db-put h "k" "second")
       (db-close h)
       (def h2 (db-open "d.ainl-db"))
-      (print (db-get h2 "k"))
+      (print (db-get-raw  h2 "k"))
       (db-close h2))'
 
 # "the older record is still on disk" is a format claim, so it is checked
@@ -127,7 +127,7 @@ want "an overwrite is visible to a reader" \
 # ---- a missing key is nil, not an error -----------------------------------
 want "a key that was never written is nil" \
   "nil" \
-  '(do (def h (db-open "d.ainl-db")) (print (db-get h "absent")) (db-close h))'
+  '(do (def h (db-open "d.ainl-db")) (print (db-get-raw  h "absent")) (db-close h))'
 
 # ---- handle reuse ---------------------------------------------------------
 want "a closed handle number comes back on the next open" \
@@ -142,23 +142,23 @@ want "a closed handle number comes back on the next open" \
 
 # ---- refusals: the error strings are the contract -------------------------
 want "a stale handle names the number" \
-  "runtime error: db-get: handle 1 is not open at line 1, col 48 (byte 47)" \
-  '(do (def h (db-open "d.ainl-db")) (db-close h) (db-get h "k"))'
+  "runtime error: db-get-raw: handle 1 is not open at line 1, col 48 (byte 47)" \
+  '(do (def h (db-open "d.ainl-db")) (db-close h) (db-get-raw  h "k"))'
 
 # The single-line cases below carry no such dependency: their offset is byte 0,
 # because the call is the whole form.
 
 want "a handle that was never issued is refused the same way" \
-  "runtime error: db-get: handle 7 is not open at line 1, col 1 (byte 0)" \
-  '(db-get 7 "k")'
+  "runtime error: db-get-raw: handle 7 is not open at line 1, col 1 (byte 0)" \
+  '(db-get-raw  7 "k")'
 
 want "handle 0 is refused, not read off the front of the table" \
-  "runtime error: db-get: handle 0 is not open at line 1, col 1 (byte 0)" \
-  '(db-get 0 "k")'
+  "runtime error: db-get-raw: handle 0 is not open at line 1, col 1 (byte 0)" \
+  '(db-get-raw  0 "k")'
 
 want "a negative handle is refused" \
-  "runtime error: db-get: handle -1 is not open at line 1, col 1 (byte 0)" \
-  '(db-get -1 "k")'
+  "runtime error: db-get-raw: handle -1 is not open at line 1, col 1 (byte 0)" \
+  '(db-get-raw  -1 "k")'
 
 # The foreign-file case needs the bad file to exist first, so it cannot go
 # through `want` — which starts from an empty directory.
@@ -180,8 +180,8 @@ want "a negative handle is refused" \
 }
 
 want "an arity error names the form the caller should have written" \
-  "runtime error: db-get expects (db-get handle key) at line 1, col 1 (byte 0)" \
-  '(db-get 1)'
+  "runtime error: db-get-raw expects (db-get-raw handle key) at line 1, col 1 (byte 0)" \
+  '(db-get-raw 1)'
 
 want "a type error names the operand and its type" \
   "runtime error: db-put expects a str value, got int at line 1, col 1 (byte 0)" \
@@ -265,7 +265,7 @@ want "a type error names the operand and its type" \
   # Append a half-written record: a valid fixed header, a short body.
   printf '\005\000\000\000\143\000\000\000\000\000\000\000parti' >> "$dir/d.ainl-db"
   printf '(do (def h (db-open "d.ainl-db"))
-        (print (db-get h "a") (db-get h "b") (db-get h "parti"))
+        (print (db-get-raw  h "a") (db-get-raw  h "b") (db-get-raw  h "parti"))
         (db-close h))\n' > "$dir/r.ainl"
   got=$(cd "$dir" && "$OLDPWD/$B" run r.ainl 2>&1)
   want_out="1 2 nil"

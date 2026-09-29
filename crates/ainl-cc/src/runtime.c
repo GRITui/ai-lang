@@ -155,6 +155,11 @@ enum {
    * implementation is the `db_*` block further down, a hand-port of
    * ainl-core/src/db.rs. */
   B_DB_OPEN, B_DB_PUT, B_DB_GET, B_DB_FLUSH, B_DB_CLOSE,
+  /* Tier 4 key-value layer. Appended last for the same reason. `db-get` is NOT
+   * among them: that id already exists above and the value layer takes over
+   * that one name rather than getting a second id, which is exactly what makes
+   * `db-set`/`db-get` a round-tripping pair in a compiled binary. */
+  B_DB_SET, B_DB_GET_RAW, B_DB_DEL, B_DB_KEYS, B_DB_COUNT,
   B_COUNT
 };
 
@@ -3183,6 +3188,30 @@ static Value builtin_db_open(Value *args, int nargs) {
   return v_int(slot + 1);
 }
 
+/* Append one record to the log and index it. The single write path for the
+ * byte layer, extracted so the value layer appends through exactly the same code
+ * — a second writer would be a second place for the two engines to disagree
+ * about what a record on disk looks like, and the whole parity claim rests on
+ * them writing the same bytes.
+ *
+ * `who` names the calling builtin in a write failure, so a value-layer write
+ * that fails says `db-set: cannot write …` and not `db-put: …`. */
+static int db_append(Db *db, const char *key, const char *val, const char *who) {
+  size_t klen = strlen(key), vlen = strlen(val);
+  unsigned char hdr[AINL_DB_REC_HEADER_LEN];
+  db_wr32(hdr, (uint32_t)klen);
+  db_wr32(hdr + 4, (uint32_t)vlen);
+  db_wr32(hdr + 8, db_crc((const unsigned char *)key, klen, (const unsigned char *)val, vlen));
+  if (fwrite(hdr, 1, sizeof(hdr), db->f) != sizeof(hdr) ||
+      (klen && fwrite(key, 1, klen, db->f) != klen) ||
+      (vlen && fwrite(val, 1, vlen, db->f) != vlen)) {
+    set_err("%s: cannot write '%s'", who, db->path);
+    return 0;
+  }
+  db_index_put(db, key, val);
+  return 1;
+}
+
 /* (db-put handle key value) -> nil. Appends a record to the log. */
 static Value builtin_db_put(Value *args, int nargs) {
   if (nargs != 3) {
@@ -3201,35 +3230,42 @@ static Value builtin_db_put(Value *args, int nargs) {
   Db *db = db_lookup(h, "db-put");
   if (!db)
     return v_nil();
-  size_t klen = strlen(key), vlen = strlen(val);
-  unsigned char hdr[AINL_DB_REC_HEADER_LEN];
-  db_wr32(hdr, (uint32_t)klen);
-  db_wr32(hdr + 4, (uint32_t)vlen);
-  db_wr32(hdr + 8, db_crc((const unsigned char *)key, klen, (const unsigned char *)val, vlen));
-  if (fwrite(hdr, 1, sizeof(hdr), db->f) != sizeof(hdr) ||
-      (klen && fwrite(key, 1, klen, db->f) != klen) ||
-      (vlen && fwrite(val, 1, vlen, db->f) != vlen)) {
-    set_err("db-put: cannot write '%s'", db->path);
-    return v_nil();
-  }
-  db_index_put(db, key, val);
+  db_append(db, key, val, "db-put");
   return v_nil();
 }
 
-/* (db-get handle key) -> str, or nil if absent. The value comes from the
- * in-memory index, so a get never touches the file. */
-static Value builtin_db_get(Value *args, int nargs) {
+/* The key operand of the value-layer builtins.
+ *
+ * Its own helper rather than `as_str_arg` because the *role* has to be in the
+ * message: Rust's `as_key` says "expects a str key" and this has to say the same
+ * word-for-word, or the two engines disagree on stderr for a program that mixes
+ * the layers. The byte layer's `as_str_arg` ("expects a str") is a different
+ * function for a different reason and is left alone.
+ *
+ * Declared up here, with the other `db_*` argument helpers, because
+ * `builtin_db_get_raw` below also uses it. */
+static const char *dbkv_key_arg(Value *v, const char *who);
+
+/* (db-get-raw handle key) -> str, or nil if absent. The value comes from the
+ * in-memory index, so a get never touches the file.
+ *
+ * The **byte layer's** reader, renamed from `db-get` when the value layer took
+ * that name. It returns the stored bytes with no decoding — including a
+ * tombstone, since deciding what a tombstone means is the value layer's job.
+ * Its error messages carry this name, so a stale handle says
+ * "db-get-raw: handle 1 is not open". */
+static Value builtin_db_get_raw(Value *args, int nargs) {
   if (nargs != 2) {
-    set_err("db-get expects (db-get handle key)");
+    set_err("db-get-raw expects (db-get-raw handle key)");
     return v_nil();
   }
-  int64_t h = as_handle_arg(&args[0], "db-get");
+  int64_t h = as_handle_arg(&args[0], "db-get-raw");
   if (!h)
     return v_nil();
-  const char *key = as_str_arg(&args[1], "db-get");
+  const char *key = dbkv_key_arg(&args[1], "db-get-raw");
   if (!key)
     return v_nil();
-  Db *db = db_lookup(h, "db-get");
+  Db *db = db_lookup(h, "db-get-raw");
   if (!db)
     return v_nil();
   const char *val = db_index_get(db, key);
@@ -3289,6 +3325,298 @@ static void db_close_all(void) {
       g_dbs[i] = NULL;
     }
   }
+}
+
+/* ---- Tier 4 key-value layer --------------------------------------------- *
+ *
+ * A hand-port of ainl-core/src/dbkv.rs, and the rules are the same as for the
+ * `db_*` block above: this is an *independent* implementation of the value layer
+ * on top of the same on-disk format, not a binding to the Rust one. There is no
+ * FFI between them, so "the engine is shared" is true for the interpreter and
+ * the VM and is a hand-port here. See ainl-core/src/dbkv.rs for the reasoning
+ * behind each rule; the comments here are only about what C forces.
+ *
+ * The one genuinely free thing is the JSON encoding: builtin_json_serialize and
+ * builtin_json_parse are already in this runtime, so a value is stored by
+ * handing it to the same writer the `json-serialize` builtin uses. That is why
+ * a value refused by `db-set` is refused with the *same message* as
+ * `json-serialize` on both engines — not because the strings were copied, but
+ * because there is only one writer and both call it.
+ */
+
+/* The tombstone that marks a deleted key. Must equal TOMBSTONE in dbkv.rs.
+ *
+ * It cannot collide with a stored value because a value in the log is always
+ * json-serialize's output, and the writer never emits a bare word starting with
+ * '~' — strings are quoted, numbers start with a digit or '-', and the literals
+ * are true/false/null. So `~` is unreachable from the value layer, which is
+ * what lets deletion reuse the byte layer's record instead of needing a second
+ * record type. */
+#define AINL_DB_TOMBSTONE "~"
+
+/* JSON-encode `v`, returning a V_STR the caller owns, or nil with g_err set.
+ *
+ * Uses the runtime's own json writer, so a value `db-set` refuses is refused
+ * with the *same message* `json-serialize` gives — not because the strings were
+ * copied, but because there is one writer and both call it. That is what makes
+ * the refusal identical on this port and on the Rust engine for free. */
+static Value dbkv_encode(Value *v) {
+  Value args[1];
+  args[0] = *v;
+  v_ref(&args[0]);
+  Value out = builtin_json_serialize(args, 1);
+  v_unref(&args[0]);
+  if (g_err)
+    return v_nil();
+  if (out.tag != V_STR) {
+    set_err("db-set: internal: json-serialize returned a non-string");
+    return v_nil();
+  }
+  return out;
+}
+
+/* JSON-decode `text` into a value.
+ *
+ * A failure leaves g_err **clear** and returns a flag of 0, because the
+ * value layer's message is not the parser's: a db-put string is not a parse
+ * error, it is the wrong kind of thing to be reading, and the parser's
+ * "unexpected character at position 7" would point inside text the caller never
+ * wrote. So the caller decides what to say. */
+static int dbkv_decode(const char *text, Value *out) {
+  Value args[1];
+  args[0] = v_str(text);
+  v_ref(&args[0]);
+  Value parsed = builtin_json_parse(args, 1);
+  v_unref(&args[0]);
+  if (g_err) {
+    g_err = 0;
+    g_errmsg[0] = 0;
+    return 0;
+  }
+  *out = parsed;
+  return 1;
+}
+
+/* The key operand of the value-layer builtins.
+ *
+ * Its own helper rather than `as_str_arg` because the *role* has to be in the
+ * message: Rust's `as_key` says "expects a str key" and this has to say the same
+ * word-for-word, or the two engines disagree on stderr for a program that mixes
+ * the layers. The byte layer's `as_str_arg` ("expects a str") is a different
+ * function for a different reason and is left alone. */
+static const char *dbkv_key_arg(Value *v, const char *who) {
+  if (v->tag == V_STR)
+    return v->u.s->data;
+  set_err("%s expects a str key, got %s", who, type_name(v));
+  return NULL;
+}
+
+/* The stored bytes for `key`, or NULL if the key is absent or deleted.
+ *
+ * The returned pointer is owned by the index and is valid until the next
+ * put/del on the same handle, so a caller must copy anything it keeps.
+ *
+ * This is the one place the two engines' indexes genuinely differ, and the
+ * difference matters here. The Rust index is a HashMap, so a key written twice
+ * has ONE entry holding the newest value. This index chains, so the same key
+ * written twice has TWO entries, and db_index_get stops at the first — the
+ * newest — which is why "last write wins" works here too. Iterating it, though,
+ * visits the key once per write. So every enumeration below must **deduplicate**,
+ * or an overwritten key is listed and counted twice while the interpreter lists
+ * it once. */
+static const char *dbkv_lookup(Db *db, const char *key) {
+  const char *val = db_index_get(db, key);
+  if (!val || strcmp(val, AINL_DB_TOMBSTONE) == 0)
+    return NULL;
+  return val;
+}
+
+/* Whether `key` is live, tested against its **newest** entry only.
+ *
+ * A tombstone is usually the newest entry for a deleted key, so this is true
+ * exactly when the key has no tombstone as its latest write. An older value
+ * still sitting further down the chain is history, not the current answer. */
+static int dbkv_is_live(Db *db, const char *key) {
+  return dbkv_lookup(db, key) != NULL;
+}
+
+/* (db-set handle key value) -> nil. The value is JSON-encoded and handed to
+ * the byte layer, so the on-disk format is unchanged from Tier 4 card 1. */
+static Value builtin_db_set(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("db-set expects (db-set handle key value)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-set");
+  if (!h)
+    return v_nil();
+  const char *key = dbkv_key_arg(&args[1], "db-set");
+  if (!key)
+    return v_nil();
+  Db *db = db_lookup(h, "db-set");
+  if (!db)
+    return v_nil();
+  Value encoded = dbkv_encode(&args[2]);
+  if (g_err)
+    return v_nil();
+  db_append(db, key, encoded.u.s->data, "db-set");
+  v_unref(&encoded);
+  return v_nil();
+}
+
+/* (db-get handle key) -> the value, or nil if absent or deleted.
+ *
+ * The value-level read, replacing the byte layer's binding for this name. See
+ * dbkv.rs for the collision and why this side wins. */
+static Value builtin_db_get_kv(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("db-get expects (db-get handle key)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-get");
+  if (!h)
+    return v_nil();
+  const char *key = dbkv_key_arg(&args[1], "db-get");
+  if (!key)
+    return v_nil();
+  Db *db = db_lookup(h, "db-get");
+  if (!db)
+    return v_nil();
+  const char *val = dbkv_lookup(db, key);
+  if (!val)
+    return v_nil();
+  /* Copied before decoding: the decode can reallocate nothing, but the error
+   * path below formats `val` and the index owns it, so a plain pointer is fine
+   * for both uses and copying would be the only way to be sure. */
+  Value decoded;
+  if (!dbkv_decode(val, &decoded)) {
+    set_err("db-get: '%s' holds text that is not an AINL value (%s); store it with "
+            "db-set rather than db-put",
+            key, val);
+    return v_nil();
+  }
+  return decoded;
+}
+
+/* (db-del handle key) -> true if the key was live, false if it was not.
+ *
+ * A tombstone is appended even when the key is already absent, so the log
+ * records the call. Deletion is a log record for the same reason a write is:
+ * it has to survive the process, and replay is the only mechanism that already
+ * knows how to do that. */
+static Value builtin_db_del(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("db-del expects (db-del handle key)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-del");
+  if (!h)
+    return v_nil();
+  const char *key = dbkv_key_arg(&args[1], "db-del");
+  if (!key)
+    return v_nil();
+  Db *db = db_lookup(h, "db-del");
+  if (!db)
+    return v_nil();
+  int existed = dbkv_lookup(db, key) != NULL;
+  /* Through the same append as the byte layer, so a tombstone is a record the
+   * two engines write identically. */
+  db_append(db, key, AINL_DB_TOMBSTONE, "db-del");
+  return existed ? v_bool(1) : v_bool(0);
+}
+
+/* Byte-value order, the same rule list-dir's qsort uses and for the same
+ * reason: db-keys must print the same sequence on every backend, and the two
+ * engines index keys differently with no defined order of their own. */
+static int dbkv_key_cmp(const void *a, const void *b) {
+  const char *const *x = a;
+  const char *const *y = b;
+  return strcmp(*x, *y);
+}
+
+/* (db-keys handle) -> every live key, sorted.
+ *
+ * The index holds every record ever written, so two filters apply here and both
+ * are load-bearing:
+ *
+ *  1. **deduplicate.** Chaining means an overwritten key occupies several
+ *     entries, and the newest is first in its chain — so an entry whose key
+ *     appears *later* in the same chain is an older write and must be skipped.
+ *     Without this an overwritten key is listed and counted twice, which is
+ *     exactly the drift the Rust tests caught in the first version of this port.
+ *  2. **drop tombstones.** `dbkv_lookup` tests the newest entry, so this is
+ *     true only when the key's latest write is not a delete.
+ */
+static Value builtin_db_keys(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("db-keys expects (db-keys handle)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-keys");
+  if (!h)
+    return v_nil();
+  Db *db = db_lookup(h, "db-keys");
+  if (!db)
+    return v_nil();
+  size_t n = 0;
+  for (int b = 0; b < DB_BUCKETS; b++)
+    for (DbEntry *e = db->buckets[b]; e; e = e->next)
+      n++;
+  char **keys = n ? malloc(n * sizeof(char *)) : NULL;
+  Value *items = n ? malloc(n * sizeof(Value)) : NULL;
+  if (n && (!keys || !items)) {
+    free(keys);
+    free(items);
+    set_err("db-keys: out of memory");
+    return v_nil();
+  }
+  size_t i = 0;
+  for (int b = 0; b < DB_BUCKETS; b++) {
+    for (DbEntry *e = db->buckets[b]; e; e = e->next) {
+      /* Newest write for this key? The first match in a chain is the newest, so
+       * a later match is an older record of the same key. */
+      if (db_index_get(db, e->key) != e->val)
+        continue;
+      if (!dbkv_is_live(db, e->key))
+        continue;
+      keys[i++] = e->key;
+    }
+  }
+  n = i;
+  if (n > 1)
+    qsort(keys, n, sizeof(char *), dbkv_key_cmp);
+  for (size_t k = 0; k < n; k++)
+    items[k] = v_str(keys[k]);
+  free(keys);
+  return v_list_from_array(items, (int)n);
+}
+
+/* (db-count handle) -> how many keys are live.
+ *
+ * The same two filters as `db-keys`, and for the same two reasons. Counting
+ * records instead of keys would grow without bound as keys were overwritten —
+ * the same growth the log has — and would answer a question nobody asked. */
+static Value builtin_db_count(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("db-count expects (db-count handle)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-count");
+  if (!h)
+    return v_nil();
+  Db *db = db_lookup(h, "db-count");
+  if (!db)
+    return v_nil();
+  int n = 0;
+  for (int b = 0; b < DB_BUCKETS; b++) {
+    for (DbEntry *e = db->buckets[b]; e; e = e->next) {
+      if (db_index_get(db, e->key) != e->val)
+        continue;
+      if (dbkv_is_live(db, e->key))
+        n++;
+    }
+  }
+  return v_int(n);
 }
 
 /* ---- call dispatch ----------------------------------------------------- */
@@ -3442,11 +3770,29 @@ static Value v_call(Value callee, Value *args, int nargs) {
     case B_DB_PUT:
       return builtin_db_put(args, nargs);
     case B_DB_GET:
-      return builtin_db_get(args, nargs);
+      /* The value-level read, not the byte layer's. This id is shared with
+       * `builtin_db_get` above, and dispatching it to the byte reader is exactly
+       * the bug the value layer exists to fix: `db-set` would store JSON and
+       * `db-get` would hand back the raw text, so a set/get pair would not
+       * round-trip its own argument in a compiled binary while it did in the
+       * interpreter. The byte reader is kept, and reachable, as
+       * `builtin_db_get_raw` — see dbkv.rs. */
+      return builtin_db_get_kv(args, nargs);
     case B_DB_FLUSH:
       return builtin_db_flush(args, nargs);
     case B_DB_CLOSE:
       return builtin_db_close(args, nargs);
+    /* Tier 4 key-value layer */
+    case B_DB_SET:
+      return builtin_db_set(args, nargs);
+    case B_DB_GET_RAW:
+      return builtin_db_get_raw(args, nargs);
+    case B_DB_DEL:
+      return builtin_db_del(args, nargs);
+    case B_DB_KEYS:
+      return builtin_db_keys(args, nargs);
+    case B_DB_COUNT:
+      return builtin_db_count(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -4637,9 +4983,13 @@ static void scope_install_prelude(Scope *env) {
       /* Tier 3 file system */
       {"mkdir", B_MKDIR}, {"rename", B_RENAME}, {"copy", B_COPY},
       {"is-dir", B_IS_DIR}, {"file-size", B_FILE_SIZE},
-      /* Tier 4 storage */
+      /* Tier 4 storage. `db-get` resolves to B_DB_GET, which the dispatch switch
+       * sends to the *value* layer's reader; see the B_DB_GET case in v_call. */
       {"db-open", B_DB_OPEN}, {"db-put", B_DB_PUT}, {"db-get", B_DB_GET},
       {"db-flush", B_DB_FLUSH}, {"db-close", B_DB_CLOSE},
+      /* Tier 4 key-value layer */
+      {"db-set", B_DB_SET}, {"db-get-raw", B_DB_GET_RAW}, {"db-del", B_DB_DEL},
+      {"db-keys", B_DB_KEYS}, {"db-count", B_DB_COUNT},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;
