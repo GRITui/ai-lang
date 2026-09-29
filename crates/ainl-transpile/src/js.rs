@@ -1106,13 +1106,28 @@ const RUNTIME: &[(&str, &str)] = &[
         "function _assoc(h, k, v) {\n  _ahash(\"assoc\", h);\n  const out = _Hash.from(h, p => p.slice());\n  const pair = out.find(p => _eq(p[0], k));\n  if (pair) { pair[1] = v; } else { out.push([k, v]); }\n  return out;\n}",
     ),
     (
+        // `_ahash` first, in all three. `h.some` and `Array.from` are the two
+        // JS calls that accept a non-collection WITHOUT complaining, and they
+        // are silent in opposite directions: `Array.from(5, …)` yields `[]`,
+        // so `(keys 5)` printed `()` and exited 0 on this target alone while the
+        // other four raised — a program that branched on `(len (keys x))` got 0
+        // here and an error there. `h.some` at least raises, but it raises a
+        // host `TypeError` carrying a node stack, which escapes an AINL `catch`
+        // (it is not `_AinlError`) and replaces the message the other four
+        // print. The guard is what makes all three cases one case.
         "_has",
-        "function _has(h, k) { return h.some(p => _eq(p[0], k)); }",
+        "function _has(h, k) { _ahash(\"has\", h); return h.some(p => _eq(p[0], k)); }",
     ),
     // `Array.from` (not `h.map`, which inherits _Hash via Symbol.species) —
     // keys/vals return plain lists, not hashes.
-    ("_keys", "function _keys(h) { return Array.from(h, p => p[0]); }"),
-    ("_vals", "function _vals(h) { return Array.from(h, p => p[1]); }"),
+    (
+        "_keys",
+        "function _keys(h) { _ahash(\"keys\", h); return Array.from(h, p => p[0]); }",
+    ),
+    (
+        "_vals",
+        "function _vals(h) { _ahash(\"vals\", h); return Array.from(h, p => p[1]); }",
+    ),
     (
         // AINL-level errors get their own class rather than a bare `Error`.
         // `catch` binds the message it sees, and a dedicated type also keeps a
