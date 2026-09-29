@@ -195,6 +195,46 @@ jobs:
       - name: Documented collections behavior + 4-backend parity
         run: ./scripts/check-docs-collections.sh
 
+  byte-strings:
+    name: byte strings (substring/char/code/…; byte offsets on 4 backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: byte-strings-${{ hashFiles('Cargo.lock') }}
+          restore-keys: byte-strings-
+
+      - name: Install Python, Node and Ruby
+        # These three are the reason the job exists. The six primitives are the
+        # first where a host's *natural* implementation is wrong: Python's
+        # `str.find` and Ruby's `String#index` return a character offset and
+        # JavaScript's `indexOf` a UTF-16 code-unit offset, so three different
+        # wrong numbers are what a naive port produces. "It ran" is not the
+        # claim; "the bytes matched the interpreter" is.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # One program through five runners — interpreter, AOT C, python3, node,
+      # ruby — diffed byte for byte on stdout AND stderr, including the shared
+      # error messages and a multi-byte UTF-8 string that makes the byte
+      # semantics observable. The AOT half needs `cc`, which is preinstalled on
+      # ubuntu runners.
+      - name: Documented byte-string behavior + 4-backend parity
+        run: ./scripts/check-byte-strings.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest

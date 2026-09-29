@@ -1,0 +1,95 @@
+; Byte-for-byte parity program for the Tier 3 byte-oriented string primitives.
+;
+; Every backend runs this exact file and must produce byte-identical stdout AND
+; the same message body on stderr. Run it through
+; `scripts/check-byte-strings.sh`, which diffs the interpreter (the normative
+; implementation) against the AOT C binary and the Python/JS/Ruby transpiles.
+;
+; The cases are chosen to make byte semantics *observable*: a character-indexed
+; implementation would answer 2 where this says 3, and 1 where this says 2.
+;
+; Error cases go through `try` so one failure does not end the run — the point
+; is to compare the *messages*, so the program has to survive to print them all.
+;
+; The message body of a failed call, or "ok" if it succeeded. `try` is what
+; lets an error case be reported rather than abort the run. A closure is
+; required because AINL evaluates arguments before the call — the error has to
+; happen *inside* the `try`, not while building its argument.
+;
+; Note the body is a single expression: the transpilers cannot lower a
+; multi-statement `do` in expression position (docs/SYNTAX.md §3e).
+(def msg (fn (thunk)
+  (try ((thunk)) (catch (e) (get e "message")))))
+
+; ---- substring: [start, end), end exclusive ----
+(print (substring "abcdef" 0 6))      ; the whole string
+(print (substring "abcdef" 2 4))      ; "cd"
+(print (substring "abcdef" 0 0))      ; "" — an empty slice is not an error
+(print (substring "abcdef" 6 6))      ; "" — the end boundary is legal
+(print (msg (fn () (substring "abcdef" 3 1))))  ; start > end
+(print (msg (fn () (substring "abcdef" -1 3)))) ; negative start
+(print (msg (fn () (substring "abcdef" 0 99)))) ; past the end
+(print (msg (fn () (substring "abcdef" 0 1.5)))) ; a float index is not an int
+
+; ---- the byte offset is not a character offset ----
+; "héllo" is h(1) é(2) l(1) l(1) o(1) = 6 bytes, 5 characters.
+(print (substring "héllo" 1 3))       ; "é" — bytes 1..3, not chars 1..3
+(print (len (substring "héllo" 1 3))) ; 1 — one CHARACTER, which is 2 bytes:
+                                      ; `len` on a str counts characters
+(print (index-of "héllo" "llo"))      ; 3 — byte index, where a char index is 2
+; A slice that would cut a character in half is an error, not a replacement
+; character, in every backend.
+(print (msg (fn () (substring "héllo" 0 2))))  ; end splits a multi-byte character
+(print (substring "héllo" 1 4))       ; "él" — bytes 1,2,3; both ends are
+                                      ; boundaries, so this is perfectly legal
+
+; ---- char: the character starting at a byte offset ----
+(print (char "abc" 0))                ; "a"
+(print (char "abc" 2))                ; "c"
+(print (char "日本" 0))                ; "日" — the whole 3-byte character
+(print (char "日本" 3))                ; "本" — byte 3 is the second character
+(print (msg (fn () (char "日本" 1))))  ; splits a multi-byte character
+(print (msg (fn () (char "abc" 3))))  ; index out of bounds
+(print (msg (fn () (char "abc" -1)))) ; negative index
+
+; ---- code: the raw byte, the escape hatch that needs no boundary ----
+(print (code "A"))                    ; 65
+(print (code "A" 0))                  ; 65
+(print (code "日本" 0))                ; 230 — the lead byte, as an int
+(print (code "日本" 1))                ; 151 — a continuation byte is readable
+(print (code "日本" 2))                ; 165 — the second one too
+(print (code "é"))                    ; 195 — lead byte of a 2-byte sequence
+(print (msg (fn () (code ""))))       ; non-empty string required
+(print (msg (fn () (code "abc" 9))))  ; index out of bounds
+
+; ---- starts-with / ends-with ----
+(print (starts-with "hello" "he"))     ; true
+(print (starts-with "hello" "lo"))     ; false
+(print (starts-with "hello" ""))       ; true — an empty prefix is contained
+(print (ends-with "hello" "lo"))       ; true
+(print (ends-with "hello" "he"))       ; false
+(print (ends-with "hello" ""))         ; true
+(print (starts-with "日本" ""))        ; true
+(print (starts-with "héllo" "h"))      ; true
+; A prefix longer than the string is false, not a bounds error.
+(print (starts-with "ab" "abc"))       ; false
+(print (ends-with "ab" "abc"))         ; false
+
+; ---- index-of: byte index, -1 when absent, 0 for an empty needle ----
+(print (index-of "hello" "llo"))      ; 2
+(print (index-of "hello" "z"))        ; -1
+(print (index-of "hello" ""))         ; 0 — an empty needle is at offset 0
+(print (index-of "" ""))              ; 0
+(print (index-of "" "x"))             ; -1
+(print (index-of "aaaa" "aa"))        ; 0 — the FIRST occurrence
+(print (index-of "banana" "na"))      ; 2
+; A needle that starts mid-character of a multi-byte run is still found, which
+; is only well-defined under byte semantics.
+(print (index-of "日本" "本"))          ; 3
+
+; ---- the composition the e2e tokenizer needed ----
+; The old tokenizer had no substring, so it rewrote every paren to a space and
+; re-split. These primitives are the missing vocabulary.
+(print (substring "x = (1 + 2)" (index-of "x = (1 + 2)" "(") 11))
+(print (ends-with "x = (1 + 2)" ")"))
+(print (code (char "x = (1 + 2)" 4))) ; 40 — the byte value of "("

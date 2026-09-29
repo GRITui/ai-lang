@@ -85,6 +85,34 @@ impl Rb {
             self.needed.insert("AinlError");
             self.needed.insert("AHash");
         }
+        // Tier 3 byte-oriented string primitives. `_ainl_b` rejects a non-String
+        // under the *calling* builtin's name and reports it through
+        // `_ainl_tname`, so every helper here pulls in both.
+        if [
+            "_substring",
+            "_char",
+            "_code",
+            "_starts_with",
+            "_ends_with",
+            "_index_of",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_ainl_b");
+            self.needed.insert("_ainl_idx");
+            self.needed.insert("_ainl_off");
+            self.needed.insert("_ainl_tname");
+            // `_index_of` delegates the actual search to the byte-sequence
+            // scanner, which `Array#index` cannot express for a multi-byte
+            // needle. Both live in the same RUNTIME table, emitted in
+            // declaration order, so it must be requested by name.
+            self.needed.insert("_ainl_seq_find");
+            // Every helper reports failure through `_error`, so a `catch` can
+            // intercept it and the message is AINL's own rather than a host
+            // exception carrying a backtrace.
+            self.needed.insert("_error");
+        }
         // AINL-level `error` must raise the type `catch` looks for. Asking for
         // `_error` alone would emit the raise without the class it raises.
         if self.needed.contains("_error") {
@@ -446,6 +474,18 @@ impl Rb {
                 "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
                 "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
                 "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                // ---- Tier 3: byte-oriented string primitives ----
+                "substring" => return self.call_builtin("_substring", args, Some("_substring")),
+                "char" => return self.call_builtin("_char", args, Some("_char")),
+                // `(code s)` and `(code s i)` differ only in arity, and the
+                // helper's second parameter defaults to nil — so one arm covers
+                // both.
+                "code" => return self.call_builtin("_code", args, Some("_code")),
+                "starts-with" => {
+                    return self.call_builtin("_starts_with", args, Some("_starts_with"))
+                }
+                "ends-with" => return self.call_builtin("_ends_with", args, Some("_ends_with")),
+                "index-of" => return self.call_builtin("_index_of", args, Some("_index_of")),
                 "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
                 "exit" => return self.call_builtin("_exit", args, Some("_exit")),
                 "now" => return self.call_builtin("_now", args, Some("_now")),
@@ -1154,6 +1194,87 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_contains",
         "def _contains(hay, needle)\n  raise TypeError, 'contains expects a str' unless hay.is_a?(String) && needle.is_a?(String)\n  hay.include?(needle)\nend",
+    ),
+    // ---- Tier 3: byte-oriented string primitives ----
+    // AINL strings are BYTE strings, but a Ruby String indexes by *character*:
+    // `s[a, b]` slices characters, `s.index(sub)` returns a character offset,
+    // and `s[a]` is a character. None of the six can delegate to the host, so
+    // each works on `s.b` (an Array of Integer bytes) instead and decodes the
+    // result back — the same reasoning as _list_dir, which already sorts by
+    // `.b` to match the interpreter's byte order. See ainl-core/src/eval.rs for
+    // the rules.
+    //
+    // Every failure goes through `_error`, i.e. raises AinlError, so `catch` can
+    // intercept it and the message is AINL's own. A host TypeError would escape
+    // the generated `rescue AinlError` clause and abort with a backtrace.
+    (
+        "_ainl_b",
+        // The bytes of a string, rejecting a non-String under the *calling*
+        // builtin's name. Shared so the six helpers agree on the type-error
+        // wording. A quoted AINL symbol is a real Ruby Symbol, so `is_a?`
+        // rejects it the way the interpreter's `as_str_arg` does.
+        //
+        // `s.bytes` (an Array of Integer), NOT `s.b` — `String#b` returns a
+        // binary-encoded *String*, so `b[i]` would be a one-character String and
+        // `b[i] & 0xC0` would raise NoMethodError. Every helper below indexes
+        // with a single Integer and slices with a length, which is Array
+        // behaviour. (`_list_dir` uses `n.b` for a different job — a sort key,
+        // where a binary String is exactly right.)
+        "def _ainl_b(s, who)\n  _error(\"#{who} expects a str, got #{_ainl_tname(s)}\") unless s.is_a?(String)\n  s.bytes\nend",
+    ),
+    (
+        "_ainl_idx",
+        // An int index operand. A Float is rejected rather than truncated: Ruby
+        // would raise on a non-integer index anyway, and truncating here would
+        // make an arithmetic bug in the caller invisible on three backends.
+        "def _ainl_idx(i, who, which)\n  _error(\"#{who} expects an int #{which}index, got #{_ainl_tname(i)}\") unless i.is_a?(Integer)\n  i\nend",
+    ),
+    (
+        "_ainl_off",
+        // Resolve a byte offset, rejecting out-of-range and mid-character
+        // positions. The `which` argument carries a trailing space for the
+        // two-operand builtins, so the message reads `substring start index
+        // out of bounds` with no double space.
+        "def _ainl_off(b, i, who, which)\n  _error(\"#{who} #{which}index out of bounds\") if i < 0 || i > b.length\n  # A UTF-8 continuation byte cannot start or end a slice.\n  _error(\"#{who} #{which}index splits a multi-byte character\") if i < b.length && (b[i] & 0xC0) == 0x80\n  i\nend",
+    ),
+    (
+        // `end` is a Ruby keyword and cannot be a parameter name, so the bound
+        // is called `hi` here and the emitted helper keeps AINL's own
+        // "start"/"end" wording in its messages.
+        "_substring",
+        "def _substring(s, lo_i, hi_i)\n  b = _ainl_b(s, 'substring')\n  lo_i = _ainl_idx(lo_i, 'substring', 'start ')\n  hi_i = _ainl_idx(hi_i, 'substring', 'end ')\n  _error('substring start index is greater than end index') if lo_i > hi_i\n  lo = _ainl_off(b, lo_i, 'substring', 'start ')\n  hi = _ainl_off(b, hi_i, 'substring', 'end ')\n  b[lo...hi].pack('C*').force_encoding('UTF-8')\nend",
+    ),
+    (
+        "_char",
+        "def _char(s, i)\n  b = _ainl_b(s, 'char')\n  i = _ainl_idx(i, 'char', '')\n  _error('char index out of bounds') if i < 0 || i >= b.length\n  _error('char index splits a multi-byte character') if (b[i] & 0xC0) == 0x80\n  # The lead byte's high bits give the sequence length: 10xxxxxx=2, 1110=3,\n  # 11110xxx=4. utf8_valid on the way in means no other case can occur.\n  c = b[i]\n  n = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : (c >= 0xC0 ? 2 : 1))\n  b[i, n].pack('C*').force_encoding('UTF-8')\nend",
+    ),
+    (
+        "_code",
+        "def _code(s, i = nil)\n  b = _ainl_b(s, 'code')\n  if i.nil?\n    _error('code expects a non-empty string') if b.empty?\n    return b[0]\n  end\n  i = _ainl_idx(i, 'code', '')\n  _error('code index out of bounds') if i < 0 || i >= b.length\n  b[i]\nend",
+    ),
+    (
+        "_starts_with",
+        "def _starts_with(s, prefix)\n  b = _ainl_b(s, 'starts-with')\n  p = _ainl_b(prefix, 'starts-with')\n  b[0, p.length] == p\nend",
+    ),
+    (
+        "_ends_with",
+        "def _ends_with(s, suffix)\n  b = _ainl_b(s, 'ends-with')\n  p = _ainl_b(suffix, 'ends-with')\n  p.length <= b.length && b[b.length - p.length, p.length] == p\nend",
+    ),
+    (
+        // An empty needle is 0, not -1 — the same answer str.find, Ruby and JS
+        // all give, and the one that keeps `index-of` consistent with
+        // `contains` (whose empty-needle case is already `true`).
+        "_index_of",
+        "def _index_of(s, sub)\n  b = _ainl_b(s, 'index-of')\n  p = _ainl_b(sub, 'index-of')\n  return 0 if p.empty?\n  _ainl_seq_find(b, p)\nend",
+    ),
+    (
+        // A byte-pattern search. Array#index matches a single Integer, so a
+        // multi-byte needle needs the sliding comparison below. Returns the
+        // first offset whose window equals the needle, or -1. The needle cannot
+        // be empty here (_index_of answers 0 for that), so `last` is >= 0
+        // whenever any comparison can succeed.
+        "_ainl_seq_find",
+        "def _ainl_seq_find(b, p)\n  last = b.length - p.length\n  i = 0\n  while i <= last\n    return i if b[i, p.length] == p\n    i += 1\n  end\n  -1\nend",
     ),
     (
         "_env_get",

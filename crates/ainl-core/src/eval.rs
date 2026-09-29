@@ -879,6 +879,15 @@ fn install_stdlib(env: &Env) {
     b!("upcase", |a| builtin_case(a, true));
     b!("downcase", |a| builtin_case(a, false));
     b!("contains", builtin_contains);
+    // Byte-oriented string primitives (see the section header on
+    // `builtin_substring` for why these are byte-indexed and what the four
+    // hosts would otherwise each answer).
+    b!("substring", builtin_substring);
+    b!("char", builtin_char);
+    b!("code", builtin_code);
+    b!("starts-with", builtin_starts_with);
+    b!("ends-with", builtin_ends_with);
+    b!("index-of", builtin_index_of);
 
     // env / process
     b!("env-get", builtin_env_get);
@@ -977,6 +986,183 @@ fn as_num_arg(v: &Value, who: &str) -> Result<f64> {
             other.type_name()
         ))),
     }
+}
+
+// ---- stdlib: byte-oriented string primitives -------------------------------
+//
+// AINL strings are BYTE strings. `substring`, `char`, `code` and `index-of` all
+// index and slice by byte offset, never by character or grapheme cluster.
+//
+// This is a decision forced by the 4-backend rule, not a preference. Every host
+// indexes its own way — Python's `str.find` returns a *character* index, Ruby's
+// `String#index` likewise, and JavaScript's `String#indexOf` returns a UTF-16
+// *code-unit* index — so a "natural" implementation gives three different
+// numbers for the same non-ASCII input. (The byte/character split is already
+// load-bearing elsewhere: `len` on a string already counts *characters*, and
+// `list-dir` already sorts by byte. `list-dir`'s doc comment is the precedent
+// for the unsigned-byte ordering this module also relies on.)
+//
+// One consequence needs stating, because it is the rule every backend has to
+// share: a slice or a character extraction that would **split a multi-byte
+// UTF-8 sequence** is an error, not a replacement character and not a silently
+// short read. AINL strings are always valid UTF-8, so there is no `Value` that
+// could hold half a character — the alternative would be U+FFFD, which the
+// `read-file`/JSON code already refuses to invent for the same reason.
+
+/// Whether `at` is a UTF-8 character boundary in `s` — i.e. whether a slice may
+/// start or end there without cutting a character in half.
+fn is_char_boundary(s: &str, at: usize) -> bool {
+    at <= s.len() && s.is_char_boundary(at)
+}
+
+/// A byte offset, checked against the string's length and required to be a
+/// UTF-8 character boundary. `which` names the operand and must include its own
+/// trailing space ("" for the single-index builtins, "start " / "end " for the
+/// two-operand one), so the message reads `char index out of bounds` and
+/// `substring start index out of bounds` with no double space.
+fn byte_offset(s: &str, idx: i64, who: &str, which: &str) -> Result<usize> {
+    if idx < 0 || idx > s.len() as i64 {
+        return Err(Error::runtime(format!("{who} {which}index out of bounds")));
+    }
+    let at = idx as usize;
+    if !is_char_boundary(s, at) {
+        return Err(Error::runtime(format!(
+            "{who} {which}index splits a multi-byte character"
+        )));
+    }
+    Ok(at)
+}
+
+/// An integer index operand. A float is rejected rather than truncated: the
+/// hosts disagree about what `(substring s 1.5 2)` means (Python raises, JS
+/// coerces to 1, Ruby raises), and truncating here would make a caller's
+/// arithmetic bug invisible on three backends and fatal on two.
+///
+/// `which` is the same prefix `byte_offset` takes: "" for the single-index
+/// builtins, "start " / "end " for the two-operand one. The format is
+/// `{who} expects an int {which}index` with no space after `{which}`, so the
+/// single-index case reads `char expects an int index` (one space) and the
+/// other reads `substring expects an int start index` — matching the C runtime's
+/// `"%s expects an int %s index"` with which="start" byte-for-byte.
+fn as_index_arg(v: &Value, who: &str, which: &str) -> Result<i64> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        other => Err(Error::runtime(format!(
+            "{who} expects an int {which}index, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `(substring s start end)` → the bytes in `[start, end)`, `end` exclusive.
+///
+/// Bounds are **checked, not clamped**. Clamping would make every
+/// `(substring s 0 999)` quietly succeed and turn an off-by-one in a caller's
+/// arithmetic into a silently wrong string, which is the failure this whole
+/// module exists to prevent. `start == end` is the empty string, not an error.
+fn builtin_substring(args: &[Value]) -> Result<Value> {
+    let [s_val, start_val, end_val] = args else {
+        return Err(Error::runtime(
+            "substring expects (substring str start end)",
+        ));
+    };
+    let s = as_str_arg(s_val, "substring")?;
+    let start = as_index_arg(start_val, "substring", "start ")?;
+    let end = as_index_arg(end_val, "substring", "end ")?;
+    if start > end {
+        return Err(Error::runtime(
+            "substring start index is greater than end index",
+        ));
+    }
+    let lo = byte_offset(s, start, "substring", "start ")?;
+    let hi = byte_offset(s, end, "substring", "end ")?;
+    Ok(Value::str(&s[lo..hi]))
+}
+
+/// `(char s i)` → the character starting at byte offset `i`.
+///
+/// One byte for ASCII; the whole multi-byte sequence for anything else, because
+/// half a character is not a value AINL can hold. `i` must be a character
+/// boundary — `(char "日本" 1)` is an error, not a mojibake byte.
+fn builtin_char(args: &[Value]) -> Result<Value> {
+    let [s_val, i_val] = args else {
+        return Err(Error::runtime("char expects (char str i)"));
+    };
+    let s = as_str_arg(s_val, "char")?;
+    let i = as_index_arg(i_val, "char", "")?;
+    let at = byte_offset(s, i, "char", "")?;
+    if at == s.len() {
+        return Err(Error::runtime("char index out of bounds"));
+    }
+    // `at` is a boundary and `at < len`, so exactly one character follows.
+    let c = s[at..].chars().next().expect("boundary implies a char");
+    Ok(Value::str(c.to_string()))
+}
+
+/// `(code s)` → the byte value of the first byte; `(code s i)` → of byte `i`.
+///
+/// Unlike `char`, `code` reads a raw byte and so needs no boundary: it is the
+/// escape hatch for a program that deliberately wants a continuation byte.
+fn builtin_code(args: &[Value]) -> Result<Value> {
+    match args {
+        [s_val] => {
+            let s = as_str_arg(s_val, "code")?;
+            match s.as_bytes().first() {
+                Some(b) => Ok(Value::Int(*b as i64)),
+                None => Err(Error::runtime("code expects a non-empty string")),
+            }
+        }
+        [s_val, i_val] => {
+            let s = as_str_arg(s_val, "code")?;
+            let i = as_index_arg(i_val, "code", "")?;
+            if i < 0 || i >= s.len() as i64 {
+                return Err(Error::runtime("code index out of bounds"));
+            }
+            Ok(Value::Int(s.as_bytes()[i as usize] as i64))
+        }
+        _ => Err(Error::runtime("code expects (code str) or (code str i)")),
+    }
+}
+
+/// `(starts-with s prefix)` → bool. An empty prefix is `true`, which is what
+/// every host does and what makes `(starts-with s "")` a useful no-op guard.
+fn builtin_starts_with(args: &[Value]) -> Result<Value> {
+    let [hay, needle] = args else {
+        return Err(Error::runtime(
+            "starts-with expects (starts-with str prefix)",
+        ));
+    };
+    let hay = as_str_arg(hay, "starts-with")?;
+    let needle = as_str_arg(needle, "starts-with")?;
+    Ok(Value::Bool(hay.as_bytes().starts_with(needle.as_bytes())))
+}
+
+/// `(ends-with s suffix)` → bool. An empty suffix is `true`, as above.
+fn builtin_ends_with(args: &[Value]) -> Result<Value> {
+    let [hay, needle] = args else {
+        return Err(Error::runtime("ends-with expects (ends-with str suffix)"));
+    };
+    let hay = as_str_arg(hay, "ends-with")?;
+    let needle = as_str_arg(needle, "ends-with")?;
+    Ok(Value::Bool(hay.as_bytes().ends_with(needle.as_bytes())))
+}
+
+/// `(index-of s sub)` → the **byte** index of the first occurrence, or `-1`.
+///
+/// An empty `sub` is `0`, not `-1`. That is what all four hosts already answer
+/// (`str.find("")`, `String#index("")` and `indexOf("")` are all 0), so it costs
+/// nothing in parity — and it is the answer that keeps this builtin consistent
+/// with `contains`, whose empty-needle case is already `true`: an empty `sub`
+/// is contained at offset 0, so `index-of` must report 0.
+fn builtin_index_of(args: &[Value]) -> Result<Value> {
+    let [hay, needle] = args else {
+        return Err(Error::runtime("index-of expects (index-of str sub)"));
+    };
+    let hay = as_str_arg(hay, "index-of")?;
+    let needle = as_str_arg(needle, "index-of")?;
+    // `str::find` already returns a byte offset and already gives 0 for an
+    // empty needle — the one host that happens to be right for free.
+    Ok(Value::Int(hay.find(needle).map_or(-1, |at| at as i64)))
 }
 
 // ---- stdlib: file I/O ------------------------------------------------------
@@ -2585,6 +2771,189 @@ mod tests {
             (r#"(upcase (list 1))"#, "upcase expects a str, got list"),
             (r#"(contains "a" 1)"#, "contains expects a str, got int"),
             (r#"(split 1 ",")"#, "split expects a str, got int"),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_string_primitives_slice_and_search_by_byte() {
+        // substring: [start, end), end exclusive, and the two boundaries are
+        // both legal — a whole-string slice and an empty one.
+        assert_eq!(
+            crate::run_str(r#"(substring "abcdef" 0 6)"#).unwrap(),
+            Value::str("abcdef")
+        );
+        assert_eq!(
+            crate::run_str(r#"(substring "abcdef" 2 4)"#).unwrap(),
+            Value::str("cd")
+        );
+        assert_eq!(
+            crate::run_str(r#"(substring "abcdef" 0 0)"#).unwrap(),
+            Value::str("")
+        );
+        assert_eq!(
+            crate::run_str(r#"(substring "abcdef" 6 6)"#).unwrap(),
+            Value::str("")
+        );
+
+        // THE byte/character distinction. "héllo" is 6 bytes and 5 characters:
+        // a character-indexed implementation answers 2 for the `index-of` and
+        // "éll" for the slice, where these say 3 and "é".
+        assert_eq!(
+            crate::run_str(r#"(substring "héllo" 1 3)"#).unwrap(),
+            Value::str("é")
+        );
+        assert_eq!(
+            crate::run_str(r#"(index-of "héllo" "llo")"#).unwrap(),
+            Value::Int(3)
+        );
+        // `len` on a str still counts CHARACTERS — the two rules coexist, and
+        // a 2-byte slice is one character.
+        assert_eq!(crate::run_str(r#"(len "é")"#).unwrap(), Value::Int(1));
+
+        // char returns a whole character, never half of one, and skips by bytes.
+        assert_eq!(
+            crate::run_str(r#"(char "abc" 0)"#).unwrap(),
+            Value::str("a")
+        );
+        assert_eq!(
+            crate::run_str(r#"(char "日本" 0)"#).unwrap(),
+            Value::str("日")
+        );
+        assert_eq!(
+            crate::run_str(r#"(char "日本" 3)"#).unwrap(),
+            Value::str("本")
+        );
+
+        // code reads a raw byte, so it CAN address a continuation byte — that is
+        // the escape hatch `char` deliberately refuses to be.
+        assert_eq!(crate::run_str(r#"(code "A")"#).unwrap(), Value::Int(65));
+        assert_eq!(
+            crate::run_str(r#"(code "日本" 0)"#).unwrap(),
+            Value::Int(0xE6)
+        );
+        assert_eq!(
+            crate::run_str(r#"(code "日本" 1)"#).unwrap(),
+            Value::Int(0x97)
+        );
+
+        // starts-with / ends-with, including the empty-needle case.
+        assert_eq!(
+            crate::run_str(r#"(starts-with "hello" "he")"#).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::run_str(r#"(starts-with "hello" "")"#).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::run_str(r#"(ends-with "hello" "lo")"#).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            crate::run_str(r#"(ends-with "hello" "he")"#).unwrap(),
+            Value::Bool(false)
+        );
+        // A needle longer than the haystack is false, not a bounds error.
+        assert_eq!(
+            crate::run_str(r#"(starts-with "ab" "abc")"#).unwrap(),
+            Value::Bool(false)
+        );
+
+        // index-of: first occurrence, -1 when absent, 0 for an empty needle.
+        assert_eq!(
+            crate::run_str(r#"(index-of "banana" "na")"#).unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            crate::run_str(r#"(index-of "hello" "z")"#).unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            crate::run_str(r#"(index-of "hello" "")"#).unwrap(),
+            Value::Int(0)
+        );
+    }
+
+    /// The one rule every backend has to share: a slice or a character
+    /// extraction that would split a multi-byte sequence is an error, not a
+    /// replacement character. AINL strings are always valid UTF-8, so there is
+    /// no value that could hold half a character.
+    #[test]
+    fn byte_string_primitives_error_rather_than_split_a_character() {
+        for (src, want) in [
+            (
+                r#"(substring "héllo" 0 2)"#,
+                "substring end index splits a multi-byte character",
+            ),
+            (
+                r#"(substring "héllo" 1 2)"#,
+                "substring end index splits a multi-byte character",
+            ),
+            // Byte 1 of "héllo" IS a boundary (the lead byte of "é"), so this
+            // case is rejected for its END, not its start. The start is checked
+            // first and passes.
+            (
+                r#"(substring "héllo" 2 3)"#,
+                "substring start index splits a multi-byte character",
+            ),
+            (
+                r#"(char "日本" 1)"#,
+                "char index splits a multi-byte character",
+            ),
+            (
+                r#"(substring "abc" 3 1)"#,
+                "substring start index is greater than end index",
+            ),
+            (
+                r#"(substring "abc" -1 2)"#,
+                "substring start index out of bounds",
+            ),
+            (
+                r#"(substring "abc" 0 99)"#,
+                "substring end index out of bounds",
+            ),
+            (r#"(char "abc" 3)"#, "char index out of bounds"),
+            (r#"(code "abc" 9)"#, "code index out of bounds"),
+            (r#"(code "")"#, "code expects a non-empty string"),
+        ] {
+            let err = crate::run_str(src).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "for `{src}` expected {want:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A float index is rejected, not truncated. The hosts disagree about what
+    /// `(substring s 1.5 2)` means, so accepting it would make an arithmetic bug
+    /// in the caller invisible on three backends and fatal on two.
+    #[test]
+    fn byte_string_primitives_reject_a_float_index() {
+        for (src, want) in [
+            (
+                r#"(substring "abc" 0 1.5)"#,
+                "substring expects an int end index, got float",
+            ),
+            (
+                r#"(char "abc" 1.5)"#,
+                "char expects an int index, got float",
+            ),
+            (
+                r#"(code "abc" 1.5)"#,
+                "code expects an int index, got float",
+            ),
+            (r#"(substring 1 0 2)"#, "substring expects a str, got int"),
+            (
+                r#"(starts-with "a" 1)"#,
+                "starts-with expects a str, got int",
+            ),
+            (r#"(index-of 1 "a")"#, "index-of expects a str, got int"),
         ] {
             let err = crate::run_str(src).unwrap_err().to_string();
             assert!(

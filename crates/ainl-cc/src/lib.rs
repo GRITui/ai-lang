@@ -95,6 +95,13 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
      * crates/ainl-cc/tests/aot_stdlib.rs. `map` / `filter` / `reduce` are
      * special forms, not builtins, so they have no id. */
     ("sort", 55),
+    /* Tier 3 byte-oriented string primitives. Appended for the same reason. */
+    ("substring", 56),
+    ("char", 57),
+    ("code", 58),
+    ("starts-with", 59),
+    ("ends-with", 60),
+    ("index-of", 61),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

@@ -161,6 +161,30 @@ impl Js {
                 self.needed.insert("_ainl_tname");
             }
         }
+        // Tier 3 byte-oriented string primitives. `_ainl_b` rejects a quoted
+        // symbol the way the interpreter's `as_str_arg` does, and reports the
+        // type through `_ainl_tname`, so every helper here pulls in both.
+        if [
+            "_substring",
+            "_char",
+            "_code",
+            "_starts_with",
+            "_ends_with",
+            "_index_of",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_ainl_b");
+            self.needed.insert("_ainl_idx");
+            self.needed.insert("_ainl_off");
+            self.needed.insert("_ainl_tname");
+            // Every helper reports failure through `_error`, so a `catch` can
+            // intercept it and the message is AINL's own rather than a host
+            // TypeError carrying a stack trace.
+            self.needed.insert("_error");
+            self.needed.insert("_Sym");
+        }
         // AINL-level `error` must throw the type `catch` looks for. Runs after
         // the loop above, which is what can insert `_error` indirectly.
         if self.needed.contains("_error") {
@@ -567,6 +591,17 @@ impl Js {
                 "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
                 "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
                 "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                // ---- Tier 3: byte-oriented string primitives ----
+                "substring" => return self.call_builtin("_substring", args, Some("_substring")),
+                "char" => return self.call_builtin("_char", args, Some("_char")),
+                // `(code s)` and `(code s i)` differ only in arity, and
+                // `arguments.length` distinguishes them, so one arm covers both.
+                "code" => return self.call_builtin("_code", args, Some("_code")),
+                "starts-with" => {
+                    return self.call_builtin("_starts_with", args, Some("_starts_with"))
+                }
+                "ends-with" => return self.call_builtin("_ends_with", args, Some("_ends_with")),
+                "index-of" => return self.call_builtin("_index_of", args, Some("_index_of")),
                 "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
                 "exit" => return self.call_builtin("_exit", args, Some("_exit")),
                 "now" => return self.call_builtin("_now", args, Some("_now")),
@@ -1246,6 +1281,68 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_contains",
         "function _contains(hay, needle) {\n  if (typeof hay !== \"string\") throw new TypeError(\"contains expects a str\");\n  if (typeof needle !== \"string\") throw new TypeError(\"contains expects a str\");\n  return hay.indexOf(needle) !== -1;\n}",
+    ),
+    // ---- Tier 3: byte-oriented string primitives ----
+    // AINL strings are BYTE strings, but a JS string is a sequence of UTF-16
+    // *code units*: `s.slice(a, b)` slices code units, `s.indexOf` returns a
+    // code-unit offset, and `s.charCodeAt(i)` can even split a surrogate pair
+    // in half. None of the six can delegate to the host, so each works on
+    // `Buffer.from(s, "utf8")` instead and decodes the result back — the same
+    // reasoning as _list_dir, which already sorts by Buffer to match the
+    // interpreter's byte order. See ainl-core/src/eval.rs for the rules.
+    //
+    // Every failure goes through `_error`, i.e. throws `_AinlError`, so `catch`
+    // can intercept it and the message is AINL's own. A host `TypeError` would
+    // escape the generated `catch` clause and abort with a stack trace.
+    (
+        "_ainl_b",
+        // The bytes of a string, rejecting a non-str under the *calling*
+        // builtin's name. Shared so the six helpers agree on the type-error
+        // wording. `_Sym` is a class, so `instanceof` covers it too.
+        "function _ainl_b(s, who) {\n  if (typeof s !== \"string\") _error(who + \" expects a str, got \" + _ainl_tname(s));\n  return Buffer.from(s, \"utf8\");\n}\n",
+    ),
+    (
+        "_ainl_idx",
+        // An int index operand. JS has one number type, so a float is rejected
+        // rather than coerced: the interpreter, Python and Ruby all refuse
+        // 1.5, and coercing here would make a caller's arithmetic bug invisible
+        // on this target and fatal on the other three.
+        "function _ainl_idx(i, who, which) {\n  if (typeof i !== \"number\" || !Number.isInteger(i)) _error(who + \" expects an int \" + which + \"index, got \" + _ainl_tname(i));\n  return i;\n}\n",
+    ),
+    (
+        "_ainl_off",
+        // Resolve a byte offset, rejecting out-of-range and mid-character
+        // positions. The `which` argument carries a trailing space for the
+        // two-operand builtins, so the message reads `substring start index
+        // out of bounds` with no double space.
+        "function _ainl_off(b, i, who, which) {\n  if (i < 0 || i > b.length) _error(who + \" \" + which + \"index out of bounds\");\n  // A UTF-8 continuation byte cannot start or end a slice.\n  if (i < b.length && (b[i] & 0xC0) === 0x80) _error(who + \" \" + which + \"index splits a multi-byte character\");\n  return i;\n}\n",
+    ),
+    (
+        "_substring",
+        "function _substring(s, start, end) {\n  const b = _ainl_b(s, \"substring\");\n  start = _ainl_idx(start, \"substring\", \"start \");\n  end = _ainl_idx(end, \"substring\", \"end \");\n  if (start > end) _error(\"substring start index is greater than end index\");\n  const lo = _ainl_off(b, start, \"substring\", \"start \");\n  const hi = _ainl_off(b, end, \"substring\", \"end \");\n  return b.slice(lo, hi).toString(\"utf8\");\n}\n",
+    ),
+    (
+        "_char",
+        "function _char(s, i) {\n  const b = _ainl_b(s, \"char\");\n  i = _ainl_idx(i, \"char\", \"\");\n  if (i < 0 || i >= b.length) _error(\"char index out of bounds\");\n  if ((b[i] & 0xC0) === 0x80) _error(\"char index splits a multi-byte character\");\n  // The lead byte's high bits give the sequence length: 10xxxxxx=2, 1110=3,\n  // 11110xxx=4. utf8_valid on the way in means no other case can occur.\n  const c = b[i];\n  const n = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : (c >= 0xC0 ? 2 : 1));\n  return b.slice(i, i + n).toString(\"utf8\");\n}\n",
+    ),
+    (
+        "_code",
+        "function _code(s, i) {\n  const b = _ainl_b(s, \"code\");\n  // `(code s)` and `(code s i)` differ only in arity, and `call_builtin`\n  // passes exactly the operands, so arguments.length is the discriminator.\n  if (arguments.length < 2) {\n    if (b.length === 0) _error(\"code expects a non-empty string\");\n    return b[0];\n  }\n  i = _ainl_idx(i, \"code\", \"\");\n  if (i < 0 || i >= b.length) _error(\"code index out of bounds\");\n  return b[i];\n}\n",
+    ),
+    (
+        "_starts_with",
+        "function _starts_with(s, prefix) {\n  const b = _ainl_b(s, \"starts-with\");\n  const p = _ainl_b(prefix, \"starts-with\");\n  return p.length <= b.length && b.slice(0, p.length).equals(p);\n}\n",
+    ),
+    (
+        "_ends_with",
+        "function _ends_with(s, suffix) {\n  const b = _ainl_b(s, \"ends-with\");\n  const p = _ainl_b(suffix, \"ends-with\");\n  return p.length <= b.length && b.slice(b.length - p.length).equals(p);\n}\n",
+    ),
+    (
+        // An empty needle is 0, not -1 — the same answer str.find, Ruby and JS
+        // all give, and the one that keeps `index-of` consistent with
+        // `contains` (whose empty-needle case is already `true`).
+        "_index_of",
+        "function _index_of(s, sub) {\n  const b = _ainl_b(s, \"index-of\");\n  const p = _ainl_b(sub, \"index-of\");\n  return b.indexOf(p);\n}\n",
     ),
     (
         "_env_get",
