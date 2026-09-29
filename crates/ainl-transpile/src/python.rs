@@ -123,6 +123,18 @@ impl Py {
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
+        // The six stdlib math builtins report a non-numeric operand through
+        // `_anumber`, which names the type with `_ainl_tname` and raises through
+        // `_error`. `_error` pulls `_AinlError` further down.
+        for dep in ["_sleep", "_abs", "_floor", "_sqrt", "_minmax", "_anumber"] {
+            if self.needed.contains(dep) {
+                self.needed.insert("_anumber");
+            }
+        }
+        if self.needed.contains("_anumber") {
+            self.needed.insert("_error");
+            self.needed.insert("_ainl_tname");
+        }
         // Tier 1 file I/O: the three path builtins share one canonicalizer, and
         // every new builtin rejects a quoted symbol (a `_Sym` str subclass) the
         // way the interpreter's `as_path_arg` rejects a non-str — without the
@@ -1222,6 +1234,25 @@ const RUNTIME: &[(&str, &str)] = &[
         "def _alist(who, x):\n    if not isinstance(x, list) or isinstance(x, _Hash): _error(who + ' expects list, got ' + _ainl_tname(x))",
     ),
     (
+        // The numeric-operand guard shared by the stdlib math builtins —
+        // `abs`, `floor`, `sqrt`, `sleep`, `min`, `max`.
+        //
+        // Same reason as `_alist`/`_ahash`: a host `TypeError` is not AINL's
+        // `_AinlError`, so it escapes an AINL `catch` and prints a Python
+        // traceback, and its wording is not the interpreter's either.
+        //
+        // `type(x) in (int, float)` rather than `isinstance`, because Python's
+        // bool is a subclass of int: `isinstance(True, int)` is True, and
+        // `(abs true)` has to report `got bool` like every other backend. The
+        // arithmetic helpers make the same choice for the same reason.
+        //
+        // The builtin passes its own name in because AINL's wording leads with
+        // it: `min` and `max` share this helper and must not report each other's
+        // name.
+        "_anumber",
+        "def _anumber(who, x):\n    if type(x) not in (int, float): _error(who + ' expects a number, got ' + _ainl_tname(x))",
+    ),
+    (
         // The path-argument check shared by every file builtin. It exists as one
         // helper because AINL's rule is uniform across them — a quoted symbol is
         // a `str` subclass in Python, so `isinstance` alone would accept
@@ -1676,30 +1707,39 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_sleep",
-        "def _sleep(secs):\n    import time\n    if secs != secs or secs < 0: raise ValueError('sleep expects a non-negative number')\n    if secs > 0: time.sleep(secs)",
+        "def _sleep(secs):\n    import time\n    _anumber('sleep', secs)\n    if secs != secs or secs < 0: _error('sleep expects a non-negative number')\n    if secs > 0: time.sleep(secs)",
     ),
     (
         "_abs",
-        "def _abs(n):\n    if not isinstance(n, (int, float)) or isinstance(n, bool): raise TypeError('abs expects a number')\n    return n if n >= 0 else -n",
+        "def _abs(n):\n    _anumber('abs', n)\n    return n if n >= 0 else -n",
     ),
     (
         "_min",
-        "def _min(*xs):\n    if not xs: raise TypeError('min expects at least 1 argument')\n    return _minmax(xs, False)",
+        "def _min(*xs):\n    if not xs: _error('min expects at least 1 argument')\n    return _minmax(xs, 'min', False)",
     ),
     (
         "_max",
-        "def _max(*xs):\n    if not xs: raise TypeError('max expects at least 1 argument')\n    return _minmax(xs, True)",
+        "def _max(*xs):\n    if not xs: _error('max expects at least 1 argument')\n    return _minmax(xs, 'max', True)",
     ),
     (
+        // The fold loops over ALL of `xs`, not `xs[1:]`. Slicing off the head
+        // looks like an optimization — `best` is `xs[0]` either way — but it
+        // skips the guard on the first element, so `(min "s")` returned the
+        // string with exit 0 where every other backend raises. The interpreter
+        // checks its seed: `as_num_arg(&best, who)` runs before the loop.
+        //
+        // `who` is passed in rather than derived from `want_max` because the
+        // message leads with the builtin's own name, and the one caller that
+        // knows which builtin it was is `_min`/`_max`.
         "_minmax",
-        "def _minmax(xs, want_max):\n    best = xs[0]\n    for x in xs[1:]:\n        if not isinstance(x, (int, float)) or isinstance(x, bool): raise TypeError('min/max expects a number')\n        if (x > best) if want_max else (x < best): best = x\n    return best",
+        "def _minmax(xs, who, want_max):\n    best = xs[0]\n    for x in xs:\n        _anumber(who, x)\n        if (x > best) if want_max else (x < best): best = x\n    return best",
     ),
     (
         "_floor",
-        "def _floor(n):\n    import math\n    if isinstance(n, bool) or not isinstance(n, (int, float)): raise TypeError('floor expects a number')\n    return n if isinstance(n, int) else math.floor(n)",
+        "def _floor(n):\n    import math\n    _anumber('floor', n)\n    return n if isinstance(n, int) else math.floor(n)",
     ),
     (
         "_sqrt",
-        "def _sqrt(n):\n    import math\n    if isinstance(n, bool) or not isinstance(n, (int, float)): raise TypeError('sqrt expects a number')\n    if n < 0: raise ValueError('sqrt expects a non-negative number')\n    return math.sqrt(n)",
+        "def _sqrt(n):\n    import math\n    _anumber('sqrt', n)\n    if n < 0: _error('sqrt expects a non-negative number')\n    return math.sqrt(n)",
     ),
 ];

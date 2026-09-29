@@ -262,13 +262,28 @@ const RAISERS: &[(&str, &str)] = &[
     // `sort` is the helper whose own `_error` edge was missing outright on JS,
     // rather than merely mis-ordered.
     ("(sort (list 1 \"s\"))", "sort expects"),
-    // `min`/`max` are deliberately absent. They raise a host `TypeError`
+    // `min`/`max` used to be absent here. They raised a host `TypeError`
     // ("min/max expects a number"), not AINL's `_error`, on all three targets —
-    // a pre-existing wording divergence, unrelated to the class-missing bug,
-    // and it also means a `catch` cannot intercept them. See t_457f643f. They
-    // are relevant here because they DID lose `_isnum` on JS, and the
-    // structural test below covers that; asserting a message they do not
-    // produce would fail for a reason that is not this card's.
+    // so a `catch` could not intercept them, and asserting a message they did
+    // not produce would have failed this gate for a reason outside the card
+    // that owned it. Fixed in t_457f643f: the six stdlib math builtins now route
+    // through a shared `_anumber` guard that reports through `_error`, so the
+    // class edge they need is real and is listed here. The rest of the family
+    // (`abs`/`floor`/`sqrt`/`sleep`) is covered in
+    // `math_builtin_error_parity.rs`; `min`/`max` are listed here as well
+    // because this is the file that proves the class is *present* whenever
+    // `_error` is called, and these are the two whose absence from the list was
+    // a documented gap.
+    ("(min 1 \"s\")", "min expects a number, got str"),
+    ("(max 1 \"s\")", "max expects a number, got str"),
+    // The rest of the `_anumber` family, added with them. These also raised host
+    // errors before, and the arity/range half of each is separate from the type
+    // half — `(sqrt -1)` reported through a host `ValueError`/`ArgumentError`,
+    // which is the same non-catchable defect on the range path.
+    ("(abs \"s\")", "abs expects a number, got str"),
+    ("(floor \"s\")", "floor expects a number, got str"),
+    ("(sqrt \"s\")", "sqrt expects a number, got str"),
+    ("(sqrt -1)", "sqrt expects a non-negative number"),
 ];
 
 #[test]

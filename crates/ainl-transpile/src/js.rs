@@ -123,10 +123,23 @@ impl Js {
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
-        for dep in ["_sleep", "_abs", "_floor", "_sqrt", "_minmax"] {
+        // The six stdlib math builtins all report a non-numeric operand
+        // through `_anumber`, which names the type with `_ainl_tname` and
+        // raises through `_error`. `_isnum` is what the guard tests, so it
+        // comes with it — and `_error` pulls `_AinlError` further down.
+        //
+        // `_minmax` is named alongside them so a program that reaches the fold
+        // alone (it can, via `_min`/`_max` only — but the rule is written for
+        // the helper, not the builtin) still gets the guard.
+        for dep in ["_sleep", "_abs", "_floor", "_sqrt", "_minmax", "_anumber"] {
             if self.needed.contains(dep) {
-                self.needed.insert("_isnum");
+                self.needed.insert("_anumber");
             }
+        }
+        if self.needed.contains("_anumber") {
+            self.needed.insert("_isnum");
+            self.needed.insert("_error");
+            self.needed.insert("_ainl_tname");
         }
         // `try`. `_ainl_try` needs `_AinlError` (to tell an AINL-level error from
         // a JS bug) and `_caught` (which builds the hash and needs `_Hash`), and
@@ -1210,6 +1223,29 @@ const RUNTIME: &[(&str, &str)] = &[
         "_ahash",
         "function _ahash(who, x) { if (!(x instanceof _Hash)) _error(who + \" expects a hash, got \" + _ainl_tname(x)); }",
     ),
+    (
+        // The numeric-operand guard shared by the stdlib math builtins —
+        // `abs`, `floor`, `sqrt`, `sleep`, `min`, `max`.
+        //
+        // It exists for the same reason as `_alist`/`_ahash`, and the failure it
+        // replaces was the same shape: these builtins raised a host `TypeError`
+        // (`min expects a number`), which is not `_AinlError` and therefore
+        // escapes an AINL `catch` entirely while printing a Node stack trace.
+        // The wording also diverged — AINL reports the type (`min expects a
+        // number, got str`) and the host did not.
+        //
+        // The builtin passes its own name in, because AINL's wording leads with
+        // it: `min` and `max` share this helper and must not report each other's
+        // name. That is also why `_minmax` takes `who` rather than deriving it
+        // from `wantMax`.
+        //
+        // `_isnum` is the predicate, not an inline `typeof` test, because it is
+        // the one place that has to know JS coerces: `_isnum("1")` is false
+        // where `"1" < 9` is true, and letting that comparison through would
+        // make `(min 1 "1")` return `"1"` instead of raising.
+        "_anumber",
+        "function _anumber(who, x) { if (!_isnum(x)) _error(who + \" expects a number, got \" + _ainl_tname(x)); }",
+    ),
     // ---- Stage 3.1 stdlib ----
     // JS's own behavior diverges from the interpreter's in ways that matter
     // here, so each helper pins the interpreter's rule:
@@ -1530,24 +1566,27 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_sleep",
-        "function _sleep(secs) {\n  if (!_isnum(secs)) throw new TypeError(\"sleep expects a number\");\n  if (Number.isNaN(secs) || secs < 0) throw new Error(\"sleep expects a non-negative number\");\n  const shared = new Int32Array(new SharedArrayBuffer(4));\n  Atomics.wait(shared, 0, 0, secs * 1000);\n}",
+        "function _sleep(secs) {\n  _anumber(\"sleep\", secs);\n  if (Number.isNaN(secs) || secs < 0) _error(\"sleep expects a non-negative number\");\n  const shared = new Int32Array(new SharedArrayBuffer(4));\n  Atomics.wait(shared, 0, 0, secs * 1000);\n}",
     ),
     (
         "_abs",
-        "function _abs(n) {\n  if (!_isnum(n)) throw new TypeError(\"abs expects a number\");\n  return Math.abs(n);\n}",
+        "function _abs(n) {\n  _anumber(\"abs\", n);\n  return Math.abs(n);\n}",
     ),
     (
+        // `who` is passed in rather than derived from `wantMax` because the
+        // message leads with the builtin's own name, and the one caller that
+        // knows which builtin it was is `_min`/`_max`.
         "_minmax",
-        "function _minmax(xs, wantMax) {\n  if (!xs.length) throw new TypeError(wantMax ? \"max expects at least 1 argument\" : \"min expects at least 1 argument\");\n  let best = xs[0];\n  for (const x of xs) {\n    if (!_isnum(x)) throw new TypeError(wantMax ? \"max expects a number\" : \"min expects a number\");\n    if (wantMax ? x > best : x < best) best = x;\n  }\n  return best;\n}",
+        "function _minmax(xs, who, wantMax) {\n  if (!xs.length) _error(who + \" expects at least 1 argument\");\n  let best = xs[0];\n  for (const x of xs) {\n    _anumber(who, x);\n    if (wantMax ? x > best : x < best) best = x;\n  }\n  return best;\n}",
     ),
-    ("_min", "function _min(...xs) { return _minmax(xs, false); }"),
-    ("_max", "function _max(...xs) { return _minmax(xs, true); }"),
+    ("_min", "function _min(...xs) { return _minmax(xs, \"min\", false); }"),
+    ("_max", "function _max(...xs) { return _minmax(xs, \"max\", true); }"),
     (
         "_floor",
-        "function _floor(n) {\n  if (!_isnum(n)) throw new TypeError(\"floor expects a number\");\n  return Math.floor(n);\n}",
+        "function _floor(n) {\n  _anumber(\"floor\", n);\n  return Math.floor(n);\n}",
     ),
     (
         "_sqrt",
-        "function _sqrt(n) {\n  if (!_isnum(n)) throw new TypeError(\"sqrt expects a number\");\n  if (n < 0) throw new Error(\"sqrt expects a non-negative number\");\n  return Math.sqrt(n);\n}",
+        "function _sqrt(n) {\n  _anumber(\"sqrt\", n);\n  if (n < 0) _error(\"sqrt expects a non-negative number\");\n  return Math.sqrt(n);\n}",
     ),
 ];
