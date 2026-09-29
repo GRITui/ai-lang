@@ -45,6 +45,23 @@ jobs:
       - name: Build
         run: cargo build --workspace --verbose
 
+      # `error_class_parity.rs` shells out to the `ainl` CLI, and it resolves the
+      # binary by preferring `target/release/ainl` and only falling back to
+      # `target/debug/ainl`. The step above builds *debug*, so without a release
+      # build here the run depends on whatever release binary the restored
+      # `target/` cache happens to carry — and a cache restored from an older
+      # commit makes the file's own staleness guard fire, failing seven tests
+      # with "is older than the sources it is supposed to be built from".
+      #
+      # The guard is right to fire; the job was the thing that was wrong. It
+      # failed on the first push of this card purely because editing runtime.c
+      # changed the cache key above, so the restored release binary was from a
+      # different commit than the sources. Building both profiles makes the
+      # binary this test uses a function of *this* commit, which is the whole
+      # point of the guard.
+      - name: Build release (the CLI that shells out to itself must be current)
+        run: cargo build --release --workspace
+
       - name: Test
         run: cargo test --workspace --verbose
 
