@@ -148,6 +148,48 @@ jobs:
       - name: Package manager + standalone AOT gate
         run: ./scripts/check-pkg.sh
 
+  if-parity:
+    name: if (a 2-arg `if` in a closure body; 5-backend parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: if-parity-${{ hashFiles('Cargo.lock') }}
+          restore-keys: if-parity-
+
+      - name: Install Python, Node and Ruby
+        # These three are the reason the job exists. A 2-arg `if` compiled to
+        # a trailing Nil with no Jump over it, so a TRUE condition pushed both
+        # the then-value and the Nil; in a fn/let body the surplus shifted the
+        # next form's operand. A `while` masked it, so the bug survived the
+        # language's whole life. "It ran" is not the claim; "the bytes matched
+        # the interpreter" is — and a leaked operand is invisible in a single
+        # call, so every program here makes a SECOND call after the `if`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # Eight programs through five runners — interpreter/VM, AOT C, python3,
+      # node, ruby — diffed byte for byte. The AOT and transpiler backends
+      # were always right (a host `if`/`else` assigns one temporary; there is
+      # no operand stack to over-push), and this is what turns that from an
+      # assumption into a gate. The AOT half needs `cc`, preinstalled on
+      # ubuntu runners.
+      - name: Documented if behavior + 5-backend parity
+        run: ./scripts/check-if-parity.sh
+
   try-catch:
     name: try/catch (4-backend parity on the error path)
     runs-on: ubuntu-latest
