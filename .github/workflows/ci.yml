@@ -157,6 +157,44 @@ jobs:
       - name: Documented try/catch behavior + 4-backend parity
         run: ./scripts/check-docs-try.sh
 
+  collections:
+    name: collections (map/filter/reduce/sort; fn as data on 4 backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: collections-${{ hashFiles('Cargo.lock') }}
+          restore-keys: collections-
+
+      - name: Install Python, Node and Ruby
+        # These three are the reason the job exists. `filter`'s predicate is
+        # decided by truthiness, and `0` and `""` are TRUTHY in AINL while all
+        # three hosts call them falsey — so a `filter` compiled with host
+        # truthiness silently drops elements on one target and nowhere else.
+        # "It ran" is not the claim; "the bytes matched the interpreter" is.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # Every claim in SYNTAX.md §3f, executed against the real binary, plus
+      # the byte-identical check across the interpreter, the AOT C binary and
+      # the three transpiler hosts — including a comparator `sort`, a `reduce`
+      # that builds a list, stability, and the whole truthiness table.
+      - name: Documented collections behavior + 4-backend parity
+        run: ./scripts/check-docs-collections.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest

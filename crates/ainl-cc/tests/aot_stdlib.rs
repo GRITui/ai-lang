@@ -843,6 +843,12 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         "json-parse",
         "json-serialize",
         "test",
+        // Tier 3 collections. `map` / `filter` / `reduce` are special forms
+        // lowered to loops before codegen (see ainl_core::collection_forms), so
+        // they are deliberately absent: there is no builtin to emit, and adding
+        // an arm for them here would only invite the question of what a
+        // `map`-as-builtin would do with a `fn` it cannot call.
+        "sort",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -865,7 +871,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 55, "update this list when the prelude changes");
+    assert_eq!(names.len(), 56, "update this list when the prelude changes");
 
     // The other direction, which is the one that actually catches drift: every
     // name the prelude binds must be either in the table above (reachable by
@@ -892,10 +898,153 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        57,
+        58,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),
         INTERPRETER_ONLY.len()
     );
+}
+
+// ---- Tier 3 collections ----------------------------------------------------
+//
+// `map` / `filter` / `reduce` reach the C runtime already lowered to `def`s and
+// a `while` (see ainl_core::collection_forms), so for the AOT backend these cases
+// test that the *shared* expansion compiles to C and runs — the same program text
+// as the other backends, so any divergence is a real one.
+//
+// `sort` is different: it IS a builtin here, with a hand-written merge sort and a
+// comparator invoked through `v_call`. It is the only place in the card where the
+// AOT runtime implements an operation itself, so it gets the closest reading.
+
+#[test]
+fn aot_map_filter_and_reduce_match_the_interpreter() {
+    assert_stdout_parity(
+        r#"
+        (def nums (list 1 2 3 4 5))
+        (def dbl (fn (x) (* x 2)))
+        (def big (fn (x) (> x 2)))
+        (def add (fn (a x) (+ a x)))
+        (print (map dbl nums))
+        (print (filter big nums))
+        (print (reduce add 0 nums))
+        "#,
+        "aot-collections-core",
+    );
+}
+
+#[test]
+fn aot_reduce_building_a_list_matches_the_interpreter() {
+    // The card calls this shape out: an accumulator that is itself a list.
+    assert_stdout_parity(
+        r#"
+        (def add (fn (a x) (push a (* x 10))))
+        (print (reduce add (list) (list 1 2 3)))
+        "#,
+        "aot-collections-reduce-list",
+    );
+}
+
+#[test]
+fn aot_empty_collection_results_match_the_interpreter() {
+    assert_stdout_parity(
+        r#"
+        (def id (fn (x) x))
+        (def add (fn (a b) a))
+        (print (map id (list)))
+        (print (filter id (list)))
+        (print (reduce add 99 (list)))
+        (print (sort (list)))
+        "#,
+        "aot-collections-empty",
+    );
+}
+
+#[test]
+fn aot_walks_a_list_containing_nil_to_the_end() {
+    // The termination test is `(> (len cur) 0)`, not `(= (first cur) nil)`.
+    // A C port that used the `first` form would stop at the `nil` — and it would
+    // be the *only* backend to do so, which is what this pins.
+    assert_stdout_parity(
+        r#"
+        (def id (fn (x) x))
+        (def keep (fn (a x) (push a x)))
+        (print (map id (list 1 nil 2)))
+        (print (filter id (list 1 nil 2 3)))
+        (print (reduce keep (list) (list nil 1 nil 2)))
+        "#,
+        "aot-collections-nil",
+    );
+}
+
+#[test]
+fn aot_sort_matches_the_interpreter() {
+    assert_stdout_parity(
+        r#"
+        (print (sort (list 3 1 2)))
+        (print (sort (list "pear" "apple" "fig")))
+        (print (sort (list -1 5 0)))
+        "#,
+        "aot-sort-default",
+    );
+}
+
+#[test]
+fn aot_sort_with_a_comparator_matches_the_interpreter() {
+    // The comparator crosses the C function-pointer boundary here — a `Closure`
+    // reached from inside a builtin, which is the AOT half of the card's
+    // "fn-as-data" requirement.
+    assert_stdout_parity(
+        r#"
+        (def sub (fn (a b) (- a b)))
+        (def desc (fn (a b) (- b a)))
+        (def byage (fn (a b) (- (nth a 1) (nth b 1))))
+        (def people (list (list "bob" 30) (list "amy" 25) (list "cid" 30) (list "dan" 25)))
+        (print (sort sub (list 3 1 2)))
+        (print (sort desc (list 3 1 2)))
+        (print (sort byage people))
+        "#,
+        "aot-sort-comparator",
+    );
+}
+
+#[test]
+fn aot_sort_is_stable() {
+    // Equal keys keep input order. The C runtime uses a hand-written bottom-up
+    // merge that takes from the left run on ties, so this is a property of that
+    // code rather than of `qsort` (which is not stable and is not used).
+    assert_stdout_parity(
+        r#"
+        (def byage (fn (a b) (- (nth a 1) (nth b 1))))
+        (def people (list (list "bob" 30) (list "amy" 25) (list "cid" 30) (list "dan" 25)))
+        (print (sort byage people))
+        (print (sort (list 1 1 1 1 1 1)))
+        (print (sort (fn (a b) (- b a)) (list 1 2 2 2 3 3 1)))
+        "#,
+        "aot-sort-stable",
+    );
+}
+
+#[test]
+fn aot_sort_rejects_a_mixed_type_list_with_the_same_message() {
+    assert_error_parity(r#"(sort (list 1 "a"))"#, "aot-sort-mixed");
+}
+
+#[test]
+fn aot_sort_rejects_a_bad_comparator_with_the_same_message() {
+    assert_error_parity(r#"(sort (fn (a b) true) (list 1 2 3))"#, "aot-sort-badcmp");
+}
+
+#[test]
+fn aot_sort_rejects_a_non_list_with_the_same_message() {
+    assert_error_parity(r#"(sort 5)"#, "aot-sort-notlist");
+}
+
+#[test]
+fn aot_sort_rejects_a_non_fn_comparator_even_on_a_short_list() {
+    // The comparator's type is checked before any comparison runs, so a
+    // 1-element list — where the comparator would never be called — still fails.
+    // A C port that checked lazily would accept this silently.
+    assert_error_parity(r#"(sort "x" (list 1))"#, "aot-sort-notfn-short");
+    assert_error_parity(r#"(sort "x" (list))"#, "aot-sort-notfn-empty");
 }

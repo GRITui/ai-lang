@@ -255,8 +255,16 @@ impl Default for Env {
 /// guard always decrements on the way out, success or error.
 pub fn run_forms(forms: &[Node], env: &Env) -> Result<Value> {
     reset_limits();
+    // Lower the whole program before evaluating any of it. The tree-walk
+    // evaluates one node at a time and keeps no slot table, so it does not
+    // *need* the helpers reserved ahead of time the way the VM's `collect_defs`
+    // does — but lowering the form list once here is what puts the helper
+    // `def`s in front of the program, in an order where they are bound before
+    // the first `map` call is evaluated. Rewriting node-by-node inside `eval`
+    // would not: the use would be evaluated with the helper still unbound.
+    let lowered = crate::collection_forms::lower(forms)?;
     let mut last = Value::Nil;
-    for form in forms {
+    for form in &lowered {
         last = eval(form, env)?;
     }
     Ok(last)
@@ -893,6 +901,11 @@ fn install_stdlib(env: &Env) {
     // decisions (string keys only, insertion-order objects, one canonical
     // float spelling, non-finite floats are an error).
     crate::json_value::install(env);
+
+    // Collections. `sort` is a real builtin (see collections.rs for why it can
+    // be one when map/filter/reduce cannot); the other three are special forms
+    // lowered by collection_forms and never reach the prelude.
+    crate::collections::install(env);
 
     // Testing. `(test name expr expected)` — see testing.rs for why a failure
     // is an error rather than a printed line. The interpreter and the VM share
