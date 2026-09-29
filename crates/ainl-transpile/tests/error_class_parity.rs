@@ -46,17 +46,83 @@ const ERRCASE: &[(&str, &str, &str)] = &[
 
 /// The `ainl` binary under test. Prefers the release build for the same reason
 /// `json_parity.rs` does, and falls back to debug.
+///
+/// Every assertion in this file goes through the CLI, not the library, because
+/// the subject is the generated *source* and the host's own output. That makes
+/// the binary an input to the test rather than a byproduct of it — and a
+/// `target/release/ainl` left over from an earlier build silently satisfies
+/// every assertion in this file while testing code that is not in the tree.
+/// That is not hypothetical: these tests were green against deliberately
+/// reverted runtime helpers, because the stale binary still had the fix. So the
+/// mtime check below is load-bearing, not hygiene.
 fn ainl_bin() -> PathBuf {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("target");
+    // The newest *library* source file. Deliberately not the whole crate: the
+    // test file itself is newer than the binary every time it is edited, and
+    // requiring `cargo build` to outrun its own test file would make the guard
+    // fire on every `cargo test` in a fresh checkout. Only `src/` can change
+    // what the binary contains.
+    let crate_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let core_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/ainl-core/src");
+    let newest_src = newest_mtime(&crate_src)
+        .into_iter()
+        .chain(newest_mtime(&core_src))
+        .max();
     for profile in ["release", "debug"] {
         let p = root.join(profile).join("ainl");
         if p.is_file() {
+            let bin_mtime = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .expect("stat the ainl binary");
+            if let Some(newest) = newest_src {
+                if bin_mtime < newest {
+                    panic!(
+                        "{} is older than the sources it is supposed to be built from \
+                         (bin {bin_mtime:?}, newest source {newest:?}).\n\
+                         These tests shell out to this binary, so a stale one makes every \
+                         assertion in this file pass regardless of the current code.\n\
+                         Rebuild it: `cargo build --release`",
+                        p.display()
+                    );
+                }
+            }
             return p;
         }
     }
     panic!("no ainl binary under target/{{release,debug}} — run `cargo build` first");
+}
+
+/// The most recent modification time of any `.rs` file under `dir`, or `None`
+/// if there are none (which the caller treats as "cannot check").
+fn newest_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                // `target/` under the workspace root is build output, not source.
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                    newest = Some(match newest {
+                        Some(n) if n >= t => n,
+                        _ => t,
+                    });
+                }
+            }
+        }
+    }
+    newest
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -163,11 +229,20 @@ const RAISERS: &[(&str, &str)] = &[
     ("(rest 5)", "rest expects list, got int"),
     ("(push 5 1)", "push expects"),
     ("(nth 1 \"s\")", "nth expects"),
-    // `keys`/`vals`/`has` are deliberately absent: JS `_keys` has no type guard
-    // at all (`Array.from(h, p => p[0])` returns `()` for an int), so the
-    // program *succeeds* on JS and there is no error path to check. That is a
-    // missing-guard bug, not a missing-class one, and it reproduces on clean
-    // main. See t_3f1fdac1 — add these three back when that lands.
+    // `keys`/`vals`/`has` guard through `_ahash` like `get`/`assoc` do, and
+    // that guard is what raises. They were deliberately absent while JS's
+    // `_keys`/`_vals` had no guard at all (`Array.from(5, …)` is legal and
+    // yields `[]`, so the program *succeeded* and printed `()`) and JS's
+    // `_has` raised a host `TypeError` instead of AINL's message. Fixed in
+    // t_3f1fdac1; listed here so the class edge they need is covered.
+    ("(keys 5)", "keys expects a hash, got int"),
+    ("(vals 5)", "vals expects a hash, got int"),
+    ("(has 5 \"a\")", "has expects a hash, got int"),
+    // And the cross-container shape, which is the same hole reached the other
+    // way round: a list or str where a hash is expected, which `Array.from`
+    // also accepts silently.
+    ("(keys (list 1 2))", "keys expects a hash, got list"),
+    ("(has \"ab\" \"a\")", "has expects a hash, got str"),
     ("(hash 1)", "hash expects an even number"),
     // Tier 1 file I/O and Tier 3 fs: both clusters name `_error` from a rule
     // that runs near the bottom of `resolve_deps`. These are *type* errors on
@@ -243,6 +318,10 @@ fn every_helper_the_generated_source_calls_is_also_defined() {
         "(read-file 5)",
         "(str \"a\")",
         "(if true 1 2)",
+        // The three that reached an unguarded host method on JS.
+        "(keys 5)",
+        "(vals 5)",
+        "(has 5 \"a\")",
     ];
     for target in TARGETS {
         for case in cases {
@@ -398,6 +477,92 @@ fn a_program_with_no_error_path_does_not_carry_the_error_class() {
         assert!(
             !out.contains(class),
             "{target}: a program with no error path must not carry {class}:\n{out}"
+        );
+    }
+}
+
+/// The JS hash builtins must CALL `_ahash`, not merely have it emitted.
+///
+/// The two tests above are behavioural, and a behavioural test is satisfied by
+/// any implementation that produces the right message — including a future
+/// refactor that inlines a different check. What is worth pinning here is the
+/// thing that actually broke, and it is narrower than "errors on a non-hash":
+/// it is that these three were the only AINL helpers that reached a host method
+/// which accepts a non-collection, and the reason nobody noticed is that JS's
+/// two such methods fail in *opposite* directions.
+///
+///   * `Array.from(5, f)` is legal and yields `[]` — so `(keys 5)` printed `()`
+///     and exited 0. The worst failure shape in the transpiler: the program
+///     succeeded, and a caller branching on `(len (keys x))` got 0 here and an
+///     error on the other four backends.
+///   * `(5).some(f)` raises, but with a host `TypeError` carrying a node stack
+///     trace. Not `_AinlError`, so an AINL `catch` does not intercept it and the
+///     message differs from the interpreter's.
+///
+/// One guard fixes both, and it is the guard the sibling builtins already use —
+/// so the assertion is that these three are indistinguishable from `get` and
+/// `assoc`: same helper, same calling convention, AINL's own name passed in so
+/// the message leads with the builtin the user wrote.
+#[test]
+fn js_hash_builtins_call_the_ahash_guard() {
+    for (builtin, who, call) in [
+        ("_keys", "keys", "(keys 5)"),
+        ("_vals", "vals", "(vals 5)"),
+        ("_has", "has", "(has 5 \"a\")"),
+    ] {
+        let out = generated(&format!("(print {call})\n"), "js")
+            .expect("js target always transpiles (no host needed)");
+        let body = out
+            .lines()
+            .find(|l| l.contains(&format!("function {builtin}(")))
+            .unwrap_or_else(|| panic!("{builtin} is not emitted at all:\n{out}"));
+        assert!(
+            body.contains(&format!("_ahash(\"{who}\"")),
+            "{builtin} does not call the _ahash guard, so a non-hash reaches a host \
+             method that accepts one ({call}):\n{body}"
+        );
+        // The guard's own name must come from the builtin, not be hardcoded:
+        // `keys` reports `keys expects a hash`, `vals` reports `vals …`. A
+        // shared literal would make all three report whichever name won.
+        assert!(
+            !body.contains("_ahash(\"get\"") && !body.contains("_ahash(\"assoc\""),
+            "{builtin} passes another builtin's name to _ahash, so it reports the \
+             wrong message:\n{body}"
+        );
+    }
+}
+
+/// The cross-container shape, which is the same hole reached from the other
+/// side: a list or a str where a hash is expected. `Array.from` accepts both
+/// silently — `Array.from("ab", p => p[0])` is `["a", "b"]`, no error at all —
+/// so these exit 0 with a plausible-looking answer on JS and raise on the other
+/// four. Included because they are one missing call away from regressing the
+/// same way, and because a guard that only rejected ints would not catch it.
+#[test]
+fn js_hash_builtins_reject_a_list_and_a_str_as_well_as_an_int() {
+    for (call, want) in [
+        ("(keys (list 1 2))", "keys expects a hash, got list"),
+        ("(vals \"ab\")", "vals expects a hash, got str"),
+        ("(has (list 1 2) \"a\")", "has expects a hash, got list"),
+    ] {
+        let Some((code, stdout, stderr)) = run(&format!("(print {call})\n"), "js") else {
+            eprintln!("skipping js: node unavailable");
+            continue;
+        };
+        assert_ne!(
+            code,
+            0,
+            "js: `{call}` exited 0 and printed {:?} — the interpreter raises here",
+            stdout.trim_end()
+        );
+        assert!(
+            stderr.contains(want),
+            "js: `{call}` did not report {want:?}:\n{stderr}"
+        );
+        // Not a host TypeError either: that escapes `catch` and prints a stack.
+        assert!(
+            !stderr.contains("TypeError"),
+            "js: `{call}` raised a host TypeError instead of AINL's message:\n{stderr}"
         );
     }
 }
