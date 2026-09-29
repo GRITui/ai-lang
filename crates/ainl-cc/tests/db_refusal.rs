@@ -43,15 +43,20 @@ const HOSTS: &[ainl_transpile::Target] = &[
     ainl_transpile::Target::Ruby,
 ];
 
-/// The nine builtins, with a program that calls each.
+/// The storage builtins, with a program that calls each.
 ///
 /// The refusal test and the AOT-supports test below are driven by this same
 /// list, so they cannot drift apart — a builtin added to one and forgotten in
 /// the other would leave it untested on exactly one backend, which is the one
 /// place a backend's coverage silently shrinks.
 ///
-/// All nine are expected to be **accepted** by the AOT backend. Asserting that
-/// is what keeps a blanket "storage is too hard for a compiled binary" rule
+/// **No count is written here on purpose.** The list used to say "the nine
+/// builtins" while holding ten, because a number in prose is a number to
+/// remember to update. scripts/check-refusal-kv.sh prints the length it
+/// actually checked, and the doc comment names the *layers* instead.
+///
+/// All of them are expected to be **accepted** by the AOT backend. Asserting
+/// that is what keeps a blanket "storage is too hard for a compiled binary" rule
 /// from sweeping the AOT backend in by accident: every refusal test could keep
 /// passing while the backend that actually ships the binary lost the feature.
 const CALLS: &[(&str, &str)] = &[
@@ -66,6 +71,18 @@ const CALLS: &[(&str, &str)] = &[
     ("db-del", r#"(db-del 1 "k")"#),
     ("db-keys", "(db-keys 1)"),
     ("db-count", "(db-count 1)"),
+    // The table layer (Tier 4 card 3). These five are the reason this list is
+    // a list and not a count: they are a coherent-looking group that no earlier
+    // doc section mentions, so a list written from the value layer alone would
+    // omit all five and keep passing. The Ruby emitter's fallback for an
+    // unknown name is `db_all_rows.call(1, "t")` — a call on an object that
+    // does not exist — so the omission produced working-looking output rather
+    // than an error, and only this test caught it.
+    ("db-create-table", r#"(db-create-table 1 "t")"#),
+    ("db-insert", r#"(db-insert 1 "t" (list "a" 1))"#),
+    ("db-select", r#"(db-select 1 "t" "a")"#),
+    ("db-delete-row", r#"(db-delete-row 1 "t" "a")"#),
+    ("db-all-rows", r#"(db-all-rows 1 "t")"#),
 ];
 
 /// The call program for `sym`, from the table above.
@@ -189,25 +206,27 @@ fn aot_accepts_every_storage_builtin() {
     }
 }
 
-/// Every name in the two modules' own lists has a fixture above.
+/// Every name in the three modules' own lists has a fixture above.
 ///
-/// This is the drift guard for the table: a builtin added to `db.rs` or
-/// `dbkv.rs` and not to `CALLS` would be refused by the transpilers (the
-/// scanner reads the module lists) and accepted by AOT (codegen reads
-/// `BUILTIN_IDS`) while *no test in this file exercised it*. Comparing the
-/// lists to the table is what turns that into a failure here.
+/// This is the drift guard for the table: a builtin added to `db.rs`,
+/// `dbkv.rs` or `dbtab.rs` and not to `CALLS` would be refused by the
+/// transpilers (the scanner reads the module lists) and accepted by AOT
+/// (codegen reads `BUILTIN_IDS`) while *no test in this file exercised it*.
+/// Comparing the lists to the table is what turns that into a failure here.
 #[test]
 fn every_db_name_in_the_modules_has_a_fixture() {
     for &sym in ainl_core::db::DB_BUILTINS
         .iter()
         .chain(ainl_core::dbkv::KV_BUILTINS.iter())
+        .chain(ainl_core::dbtab::TABLE_BUILTINS.iter())
     {
         program_for(sym);
     }
-    // Five byte-layer names plus five value-layer names, with `db-get` in both
-    // lists and one fixture for it. So ten fixtures for ten distinct names, and
-    // the AOT-accepts test above proves each one is really reached.
-    assert_eq!(CALLS.len(), 10, "update CALLS when a db-* builtin is added");
+    // Five byte-layer names, five value-layer names and five table names, with
+    // `db-get` in the first two lists and one fixture for it. So fifteen
+    // fixtures for fifteen distinct names, and the AOT-accepts test above proves
+    // each one is really reached.
+    assert_eq!(CALLS.len(), 15, "update CALLS when a db-* builtin is added");
 }
 
 /// And the whole surface at once, so a *combination* is not what breaks it.

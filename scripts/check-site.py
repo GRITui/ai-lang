@@ -50,15 +50,15 @@ assets = re.findall(r'(?:src|href)="(?!https?://|#)([^"]+)"', html)
 print("local assets  :", assets or "none — fully self-contained")
 
 # Headline numbers must match the README exactly (single source of truth).
-# "79" and "67" are both required, and both are honest: 79 is the
-# prelude size, 67 is the portable subset (the other 12
-# are the 2 HTTP builtins every backend refuses and the 10 `db-*` builtins the
-# AOT C runtime carries but the transpilers refuse). Both are measured by
+# "84" and "67" are both required, and both are measured by
 # scripts/measure-prelude.sh — do not adjust them by hand. Editing one without
-# the other fails here, which is the whole point of the check.
+# the other fails here, which is the whole point of the check. 84 is the prelude
+# size and 67 is the portable subset; the 17 that are not portable are the 2 HTTP
+# builtins every backend refuses and the 15 `db-*` builtins the AOT C runtime
+# carries but the transpilers refuse.
 nums = ["20/20", "0/20", "10/10", "9/10", "47.3", "0.576", "30 969.0",
         "0.604", "35.4", "5.9", "2.25", "1.77", "1.27", "0.69", "51",
-        "+108%", "+64%", "+95%", "561", "79", "67"]
+        "+108%", "+64%", "+95%", "561", "84", "67"]
 missing = [n for n in nums if n not in html or n not in readme]
 print("numbers in both:", "all %d match" % len(nums) if not missing else f"MISSING {missing}")
 

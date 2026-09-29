@@ -4,11 +4,13 @@
 //! [`eval`] runtime [`Value`]. Zero external dependencies so the runtime can be
 //! packaged as a static, zero-dependency binary (see docs/MASTER_PLAN.md §1.2).
 
+pub mod btree;
 pub mod code;
 pub mod collection_forms;
 pub mod collections;
 pub mod db;
 pub mod dbkv;
+pub mod dbtab;
 pub mod deserialize;
 pub mod error;
 pub mod eval;
