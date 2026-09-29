@@ -358,6 +358,15 @@ jobs:
       - name: Documented file-system semantics
         run: ./scripts/check-docs-fs.sh
 
+      # The same for SYNTAX.md §3k (storage). §3k's claims are the ones a host
+      # file API cannot reproduce — an append-only log, last-write-wins, a
+      # missing key as nil, a refused open that creates no file, a torn tail
+      # truncated on disk — so they rot the same way and are checked the same
+      # way. It also asserts the backend asymmetry: the transpilers must refuse
+      # `db-*`, and `ainl compile` must accept it.
+      - name: Documented storage semantics
+        run: ./scripts/check-docs-db.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest

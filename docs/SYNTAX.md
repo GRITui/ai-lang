@@ -1332,6 +1332,168 @@ Write floats whose value is not whole where the output is compared across
 backends — the transpiler test suites are written this way on purpose, so JS can
 be diffed byte-for-byte against the interpreter with no exemptions at all.
 
+## 3k. Storage: `db-open` / `db-put` / `db-get` / `db-flush` / `db-close`
+
+Five builtins, a whole durable store, and no dependency:
+
+```ainl
+(def h (db-open "notes.ainl-db"))
+(db-put h "todo" "buy milk")
+(db-put h "todo" "buy oat milk")   ; overwrites, does not erase
+(db-flush h)
+(print (db-get h "todo"))          ; buy oat milk
+(print (db-get h "absent"))        ; nil
+(db-close h)
+```
+
+Keys and values are **strings**. `db-open` returns a **handle** — an ordinary
+int — and `db-get` returns the latest value for a key or `nil`.
+
+### The rules
+
+- **`db-open path` → int.** Creates the file if it is missing, replays it if it
+  is not.
+- **`db-put handle key value` → nil.** Appends a record. An existing key is
+  *not* rewritten in place: the new value is appended and the last write wins.
+- **`db-get handle key` → str or nil.** Never fails for an open handle. A
+  missing key is `nil`, so a caller can probe without a `try`.
+- **`db-flush handle` → nil.** `fsync`: the data is on the device, not in a
+  buffer.
+- **`db-close handle` → nil.** Flushes, then releases the handle.
+- **At most 64 databases** may be open at once. The 65th is refused with
+  `db-open: too many open databases (max 64)` — and the check runs *before* the
+  file is created, so a refused open leaves no file behind.
+- Handles are **1-based, lowest free slot first**, and the number comes back
+  after a close.
+- A handle that is not open — stale, closed, zero, negative, or never issued —
+  is refused as `db-get: handle 7 is not open`.
+
+### Why an append-only log
+
+A `db-put` **appends**. It never seeks back to rewrite a record, and it never
+rewrites the file to apply an update. That is the whole design, and it is what
+buys the durability:
+
+If a process dies mid-write, the file is a **prefix** of complete records
+followed by at most one partial one. Every record carries a length and a
+checksum, so the reader can tell the two apart exactly: it replays the prefix,
+discards the tail, and **truncates the file back to the last good record** so
+the next append lands on a clean boundary. A store that updated in place would
+instead have a *hole* — the old value half-overwritten — and no checksum could
+tell a hole from a value.
+
+The consequence worth knowing: the file **grows**. Overwriting a key a thousand
+times leaves a thousand records on disk. The log is not compacted; that is a
+future tier, and it needs a rule about when it is safe (only when a single
+writer has the file), so it is not in this one.
+
+### The format
+
+A 16-byte header, then records. Every integer is little-endian.
+
+```text
+header   "AINLDB" | version u8 | 0 u8 | header_len u32 | 0 u32
+record   key_len u32 | val_len u32 | crc32 u32 | key bytes | val bytes
+```
+
+The CRC is CRC-32/ISO-HDLC — the reflected IEEE polynomial `0xEDB88320`, the one
+zlib's `crc32()` computes, with the standard `123456789 → 0xCBF43926` check
+value. It covers **`key ++ value`**, the record's body and not its header; the
+two length fields are what frame the key/value split, so `("a","b")` and
+`("ab","")` are different records even though their checksums are equal.
+
+A file that is not an AINL database is **refused**, not repaired:
+`db-open: 'x.ainl-db' is not an AINL database`. So is a future version, and the
+message names both: `is database version 2, but this AINL reads version 1`.
+
+Replay stops at the first record it cannot trust — torn, mis-checksummed, not
+UTF-8, or holding a NUL. Everything before it survives.
+
+### Backend scope: interpreter, VM and AOT C — **not** the transpilers
+
+This is the first tier where the four backends genuinely differ, so the
+difference is the point rather than a gap.
+
+| backend | `db-*` | why |
+|---|---|---|
+| interpreter | **supported** | the normative implementation |
+| bytecode VM | **supported** | the same Rust code, reached through a different entry point |
+| AOT C | **supported** | a hand-port of the engine in `runtime.c`, libc only |
+| Python, JS, Ruby | **refused** | a host file API cannot reproduce the log |
+
+`crates/ainl-core/src/db.rs` is normative — it defines the behaviour above and
+the format. `runtime.c` is a **hand-port**, the same relationship the C JSON
+implementation has to the Rust one, and it is checked for real rather than by
+inspection: `crates/ainl-cc/tests/db_crash.rs` compiles a program, runs it, and
+compares the resulting `.ainl-db` **byte for byte** against the interpreter's
+for the same program. A file written by the interpreter opens in a compiled
+binary and vice versa.
+
+The AOT port is not a wrapper around a host library, and it adds no dependency:
+`fopen`, `read`, `write`, `ftruncate`, `fsync` and a local CRC table. The
+`aot-standalone` CI job still links `musl-static`, which is the property the
+whole project is selling.
+
+The transpilers **refuse** at transpile time:
+
+```text
+ainl transpile --to python: `db-open` is transpiler-only (found at byte 0) — …
+```
+
+Note the wording: **transpiler-only**, not interpreter-only. `ainl compile` runs
+these programs, and a message saying "interpreter-only" would send a user
+looking for the wrong runner.
+
+The refusal is deliberate over an emulation. A Python `open()`, a JS `fs` handle
+and a Ruby `File` could all be made to *look* like this API, and each would be
+quietly wrong: no append-only log, so an update rewrites the file; no per-record
+checksum, so a torn write is served as data; no recovery, so a crashed write
+poisons the file for good; and no single uniform meaning for "durable". A
+program that transpiled cleanly and then read a *different file* than the one
+the interpreter wrote is a far worse outcome than a build that stops and says
+why. The refusal names the reason, the byte offset, and the two runners that do
+work.
+
+### Reading a handle
+
+A handle is an int, not a distinct type. It has to be: adding a `Value` variant
+would need a new arm in `print`, `=`, `json-serialize` and every other consumer
+on every backend, for no gain. So a handle is comparable, printable and
+arithmetic-able like any other number — `(= h 1)` is how you test one.
+
+The consequence is that a handle can be *wrong* rather than absent, so the rules
+above are all about catching that: a handle is checked against the open table on
+every call, and a bad one is a clear error naming the number.
+
+### Two rules that exist only because two ports have to agree
+
+Most of the rules above would be the same on a single implementation. These two
+are not — they exist because `runtime.c` is a *separate* implementation of the
+same format, and a rule that is right on one side and absent on the other is a
+silent divergence rather than a bug.
+
+**The checksum is pinned to an external constant, not to the other port.** The
+CRC-32 test vector is `crc32("123456789") == 0xCBF43926`, and both sides assert
+that value. Comparing the C port against the Rust one would be worthless here: if
+the C table had a typo, the two would still agree with each other and every
+recovery test would still pass, over a format whose checksums nothing outside the
+project could produce. Pinning to zlib's published vector is what makes it an
+integrity check instead of a private convention.
+
+**A record holding a NUL is dropped, and the record has a correct CRC when it
+is.** Values travel as a `char *` through the C runtime, so a record containing
+a NUL would read back *truncated* there while Rust kept the bytes. Both sides
+therefore reject such a record during replay. The test for this builds a record
+with a **valid** checksum and objectionable content, precisely so that a replay
+checking only the CRC would accept it — otherwise the test would pass for the
+wrong reason.
+
+Both tests are in `crates/ainl-cc/tests/db_crash.rs`, and both were confirmed to
+*fail* when the corresponding C code was deliberately broken: flipping the
+polynomial to `0xEDB88321` fails the CRC test, and dropping the NUL check makes
+the C port return `"a"` where Rust returns `nil`. A test never seen failing is
+not known to work.
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

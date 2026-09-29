@@ -7,6 +7,7 @@
 pub mod code;
 pub mod collection_forms;
 pub mod collections;
+pub mod db;
 pub mod deserialize;
 pub mod error;
 pub mod eval;

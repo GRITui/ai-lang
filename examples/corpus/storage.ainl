@@ -1,0 +1,92 @@
+; @example   storage
+; @summary   A durable key/value store: write, overwrite, reopen, read back.
+; @teaches   db-open, db-put, db-get, db-flush, db-close, handles, append-only
+; @scope     aot
+; @expect    reopened visits: 2
+; @run       ainl run examples/corpus/storage.ainl
+;
+; Five builtins and a file on disk that survives the process.
+;
+; The program is a small counter store, which is the shape a durable key/value
+; tier is actually for: a program that has to remember something between runs.
+; It is also written to be *idempotent*, because CI runs every example on every
+; push and a program that printed a different number each time would fail the
+; build. So it deletes its own database first — which is itself worth showing,
+; because `db-open` creating the file is the only way to get a handle, and there
+; is no `db-remove`: a file the program owns, it manages with the file builtins.
+;
+; Run it twice and the count goes up by one each time, not by two: `db-put` on an
+; existing key appends a new record, and the last write is the one that wins.
+; That is not an accident of the implementation — it is what makes a crash
+; during an overwrite leave the *old* value intact rather than a half-written
+; one. See docs/SYNTAX.md §3k.
+
+(def db "storage-demo.ainl-db")
+
+; Start from nothing, so repeated runs are identical.
+(do (if (file-exists db) (delete-file db)))
+
+(def h (db-open db))
+
+; ---- put, and read back what was just written ---------------------------
+; A `db-get` on a key that was never written is `nil`, not an error, so a probe
+; needs no `try`. That is worth seeing early: it makes `db-get` a total function.
+(do
+  (db-put h "visits" "1")
+  (print "visits:" (db-get h "visits"))
+  (print "absent:" (db-get h "never-written")))
+
+; ---- overwrite, and see the last write win -------------------------------
+(do
+  (db-put h "visits" "2")
+  (print "after overwrite:" (db-get h "visits")))
+
+; ---- several keys, and an awkward one -----------------------------------
+; Keys and values are strings, and the framing is length-prefixed, so a key with
+; a space or a newline in it is not special. There is no escaping to learn.
+(do
+  (db-put h "owner" "grit")
+  (db-put h "last seen" "2026-09-29")
+  (db-put h "note" "multi
+line value")
+  (print "owner:" (db-get h "owner"))
+  (print "last seen:" (db-get h "last seen")))
+
+; ---- flush is the durability barrier -------------------------------------
+; `db-put` hands the record to the OS; `db-flush` fsyncs it, so after this the
+; data is on the device rather than in a buffer. A program that cannot afford to
+; lose the last few writes on a power cut calls it; one that can, does not.
+(do
+  (db-flush h)
+  (print "flushed"))
+
+; ---- close, reopen, and the data is still there --------------------------
+; This is the whole point of the tier. The handle is gone — the program has no
+; reference to it any more — and the state is not, because it was in the file
+; the whole time. The in-memory index is a cache of the log, not the log.
+(db-close h)
+
+(def h2 (db-open db))
+(print "reopened visits:" (db-get h2 "visits"))
+(print "reopened owner:" (db-get h2 "owner"))
+(db-close h2)
+
+; ---- a handle can be wrong, and says so ---------------------------------
+; A handle is an ordinary int, not a distinct type, so it is comparable and
+; printable like any other number. The cost of that choice is that a stale
+; handle is a *value* rather than an absence, so every call checks it and a bad
+; one is refused by number. `catch` is here to show the shape, not because this
+; program needs it: an uncaught one would abort the run.
+(do
+  (def h3 (db-open db))
+  (db-close h3)
+  (try
+    (db-get h3 "visits")
+    (catch (e) (print "stale handle:" e))))
+
+; ---- clean up -----------------------------------------------------------
+; `db-*` has no remove: the file is the program's, and it removes its own. The
+; read is at the end, after the last close, so nothing re-creates it.
+(do
+  (delete-file db)
+  (print "cleaned up"))

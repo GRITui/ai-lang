@@ -24,6 +24,7 @@ AINL, and a broken example teaches the broken shape.
 | [`csv-report.ainl`](corpus/csv-report.ainl) | Delimited text into records; group-by with `assoc`; what the stdlib does *not* give you. |
 | [`json-payload.ainl`](corpus/json-payload.ainl) | Parse an API-shaped payload, extract nested fields, re-serialize, round-trip. |
 | [`file-roundtrip.ainl`](corpus/file-roundtrip.ainl) | Read a file, transform it line by line, write it back, clean up. |
+| [`storage.ainl`](corpus/storage.ainl) | The `db-*` store: write, overwrite, flush, close, reopen, read back what survived. |
 | [`http-get-json.ainl`](corpus/http-get-json.ainl) | An HTTP GET, a JSON response, request headers, and a 404 as a value. |
 | [`cli-tool.ainl`](corpus/cli-tool.ainl) | Arguments from the environment, validation, and exit codes as a contract. |
 | [`error-handling.ainl`](corpus/error-handling.ainl) | Checking before acting, the shape of a diagnostic, and what `error` is for. |
@@ -49,6 +50,15 @@ hoped for.
 - **interpreter-only** — `libmod/main.ainl` and `testing/run-tests.ainl` use
   `import`, which the AOT and transpiler backends *refuse* rather than
   silently mishandle. The gate asserts that refusal rather than skipping.
+- **aot** — `storage.ainl` uses the `db-*` builtins, which the **AOT C binary
+  runs** (the runtime carries a hand-port of the storage engine) and the three
+  transpilers *refuse*, because a host `open()` cannot reproduce an
+  append-only checksummed log. The gate asserts both halves: the AOT binary's
+  output must match the interpreter's byte for byte, and each transpiler must
+  refuse with the word `transpiler-only`. This scope exists because the
+  `interpreter-only` case above allows AOT to refuse and this one forbids it —
+  an AOT refusal here would mean the C port was lost, and every refusal test
+  would still pass.
 - **server** — `http-get-json.ainl` needs a local HTTP server;
   `scripts/check-examples.sh` starts one on a port the OS picks and asserts
   the program runs against it.
@@ -146,7 +156,7 @@ built around showing it.
    ; @example   <name>          must match the file stem
    ; @summary   <one line>      for this table
    ; @teaches   <a, b, c>       the patterns it demonstrates
-   ; @scope     portable | interpreter-only | server
+   ; @scope     portable | aot | interpreter-only | server
    ; @expect    <one line>      a line of output that must appear
    ; @run       ainl run examples/corpus/<name>.ainl
    ```
