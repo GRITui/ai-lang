@@ -181,6 +181,18 @@ impl Rb {
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
+        // The six stdlib math builtins report a non-numeric operand through
+        // `_anumber`, which names the type with `_ainl_tname` and raises through
+        // `_error`. `_error` pulls `AinlError` further down.
+        for dep in ["_sleep", "_abs", "_floor", "_sqrt", "_minmax", "_anumber"] {
+            if self.needed.contains(dep) {
+                self.needed.insert("_anumber");
+            }
+        }
+        if self.needed.contains("_anumber") {
+            self.needed.insert("_error");
+            self.needed.insert("_ainl_tname");
+        }
         // Tier 1 file I/O: the three path builtins share one canonicalizer, and
         // `_ainl_tname` (path-join's positional type error) branches on AHash.
         if ["_path_join", "_path_base", "_path_dir"]
@@ -1032,6 +1044,25 @@ const RUNTIME: &[(&str, &str)] = &[
         "def _ahash(who, x)\n  _error(who + ' expects a hash, got ' + _ainl_tname(x)) unless x.is_a?(AHash)\nend",
     ),
     (
+        // The numeric-operand guard shared by the stdlib math builtins —
+        // `abs`, `floor`, `sqrt`, `sleep`, `min`, `max`.
+        //
+        // Same reason as `_alist`/`_ahash`: a host `TypeError` is not AINL's
+        // `AinlError`, so it escapes an AINL `catch` and prints a Ruby backtrace
+        // with the file and line, and its wording is not the interpreter's
+        // either (`min expects a number` rather than
+        // `min expects a number, got str`).
+        //
+        // `Numeric` excludes `true`/`false` in Ruby, so the bool case the other
+        // backends guard against needs no separate check here.
+        //
+        // The builtin passes its own name in because AINL's wording leads with
+        // it: `min` and `max` share this helper and must not report each other's
+        // name.
+        "_anumber",
+        "def _anumber(who, x)\n  _error(who + ' expects a number, got ' + _ainl_tname(x)) unless x.is_a?(Numeric)\nend",
+    ),
+    (
         // `len` accepts a list, a str or a hash in AINL, so it cannot be
         // Ruby's own `length` — which would also accept a Hash/Range and would
         // raise a host NoMethodError on an Integer.
@@ -1458,24 +1489,27 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_sleep",
-        "def _sleep(secs)\n  raise TypeError, 'sleep expects a number' unless secs.is_a?(Numeric)\n  raise ArgumentError, 'sleep expects a non-negative number' if secs.respond_to?(:nan?) && secs.nan? || secs < 0\n  sleep(secs) if secs > 0\n  nil\nend",
+        "def _sleep(secs)\n  _anumber('sleep', secs)\n  _error('sleep expects a non-negative number') if secs.respond_to?(:nan?) && secs.nan? || secs < 0\n  sleep(secs) if secs > 0\n  nil\nend",
     ),
     (
         "_abs",
-        "def _abs(n)\n  raise TypeError, 'abs expects a number' unless n.is_a?(Numeric)\n  n < 0 ? -n : n\nend",
+        "def _abs(n)\n  _anumber('abs', n)\n  n < 0 ? -n : n\nend",
     ),
     (
+        // `who` is passed in rather than derived from `want_max` because the
+        // message leads with the builtin's own name, and the one caller that
+        // knows which builtin it was is `_min`/`_max`.
         "_minmax",
-        "def _minmax(xs, want_max)\n  who = want_max ? 'max' : 'min'\n  raise TypeError, \"#{who} expects at least 1 argument\" if xs.empty?\n  best = xs[0]\n  xs.each do |x|\n    raise TypeError, \"#{who} expects a number\" unless x.is_a?(Numeric)\n    best = x if (want_max ? x > best : x < best)\n  end\n  best\nend",
+        "def _minmax(xs, who, want_max)\n  _error(who + ' expects at least 1 argument') if xs.empty?\n  best = xs[0]\n  xs.each do |x|\n    _anumber(who, x)\n    best = x if (want_max ? x > best : x < best)\n  end\n  best\nend",
     ),
-    ("_min", "def _min(*xs)\n  _minmax(xs, false)\nend"),
-    ("_max", "def _max(*xs)\n  _minmax(xs, true)\nend"),
+    ("_min", "def _min(*xs)\n  _minmax(xs, 'min', false)\nend"),
+    ("_max", "def _max(*xs)\n  _minmax(xs, 'max', true)\nend"),
     (
         "_floor",
-        "def _floor(n)\n  raise TypeError, 'floor expects a number' unless n.is_a?(Numeric)\n  n.is_a?(Integer) ? n : n.floor\nend",
+        "def _floor(n)\n  _anumber('floor', n)\n  n.is_a?(Integer) ? n : n.floor\nend",
     ),
     (
         "_sqrt",
-        "def _sqrt(n)\n  raise TypeError, 'sqrt expects a number' unless n.is_a?(Numeric)\n  raise ArgumentError, 'sqrt expects a non-negative number' if n < 0\n  Math.sqrt(n)\nend",
+        "def _sqrt(n)\n  _anumber('sqrt', n)\n  _error('sqrt expects a non-negative number') if n < 0\n  Math.sqrt(n)\nend",
     ),
 ];
