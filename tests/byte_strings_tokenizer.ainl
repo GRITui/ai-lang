@@ -1,0 +1,172 @@
+; The e2e tokenizer this card exists for: turning a line of AINL source into
+; tokens, using the byte primitives.
+;
+; Before this card AINL had no way to look *inside* a string: no substring, no
+; char→byte, no prefix test, no find. The only tokenizer available was the
+; blunt one below — pad every paren with spaces and re-`split` — and it
+; corrupts a quoted operand that contains a paren, which is asserted here.
+;
+; With `code`/`char` (read the byte at an offset), `index-of` (find a delimiter)
+; and `substring` (slice a token), a tokenizer can instead walk the line, track
+; whether it is inside a string, and report the byte offset of every token —
+; the thing the old version has no way to express, because after padding it no
+; longer knows where anything was.
+;
+; Both tokenizers are defined here and compared, so the rewrite is proven
+; equivalent on the inputs where the old one was correct, and the input where it
+; was not is pinned rather than glossed.
+
+; ---- the old way: pad every paren with a space, then split ----
+; `split` keeps trailing empty fields (docs/SYNTAX.md §3), so the trailing
+; spaces the padding adds must be dropped with the `= w ""` check.
+(def tokenize_pad (fn (src)
+  (let ((padded (replace (replace src "(" " ( ") ")" " ) "))
+        (words (split padded " "))
+        (out (list))
+        (i 0))
+    (while (< i (len words))
+      (def w (nth words i))
+      (if (= w "")
+        nil
+        (def out (push out w)))
+      (def i (+ i 1)))
+    out)))
+
+; ---- the new way: walk the bytes, tracking string state ----
+;
+; `(code (char s i))` is how a loop asks "which byte is at position i" — the
+; primitive that did not exist before this card. A delimiter only ends a token
+; when it is not inside a quoted string, and a quote only toggles when it is not
+; itself escaped; both are decided from the byte value, so a paren in `"a(b"`
+; stays part of its token.
+;
+; AINL has no `return`, and a `while` body does NOT open a scope
+; (docs/SYNTAX.md §2a), so the accumulators are the enclosing `let`'s own
+; bindings and are mutated in place; that is why `out`/`buf` are declared above
+; the loop rather than inside it.
+(def delim-byte (fn (c) (or (= c 32) (= c 9) (= c 10) (= c 40) (= c 41))))
+(def quote-byte (fn (c) (= c 34)))
+(def backslash-byte (fn (c) (= c 92)))
+(def paren-byte (fn (c) (or (= c 40) (= c 41))))
+
+; Tokenize into a list, and report each token's byte offset: (list toks offs).
+; `in-str` tracks the quote state; `esc` makes `\"` not toggle it.
+;
+; A paren is a token in its own right, so when one ends a run the scanner emits
+; the run, then the paren — which is the difference from the pad-and-split
+; version, where the paren is a separator and never appears in the output.
+(def scan (fn (src)
+  (let ((out (list))
+        (offs (list))
+        (buf "")
+        (i 0)
+        (n (len src))
+        (start 0)
+        (in-str false)
+        (esc false))
+    (while (< i n)
+      (def c (code (char src i)))
+      (if esc
+        (do (def esc false) (def buf (str buf (char src i))))
+        (if (backslash-byte c)
+          (do (def esc true) (def buf (str buf (char src i))))
+          (if (quote-byte c)
+            (do (def in-str (not in-str)) (def buf (str buf (char src i))))
+            (if (and (not in-str) (delim-byte c))
+              (do (if (= buf "")
+                   nil
+                   (do (def out (push out buf)) (def offs (push offs start))))
+                  (if (paren-byte c)
+                    (do (def out (push out (char src i)))
+                        (def offs (push offs i)))
+                    nil)
+                  (def buf "")
+                  (def start (+ i 1)))
+              (def buf (str buf (char src i)))))))
+      (def i (+ i 1)))
+    ; the final flush: a line that ends mid-token still has one to emit
+    (if (= buf "")
+      (list out offs)
+      (list (push out buf) (push offs start))))))
+
+(def tokenize (fn (src) (first (scan src))))
+(def offsets (fn (src) (nth (scan src) 1)))
+
+; ---- equivalence on the inputs the old tokenizer got right ----
+(test "tokenizers agree on a nested call"
+       (str (tokenize "(print (add 1 2))"))
+       (str (tokenize_pad "(print (add 1 2))")))
+(test "tokenizers agree on an empty argument list"
+       (str (tokenize "(f)"))
+       (str (tokenize_pad "(f)")))
+(test "tokenizers agree on a trailing token"
+       (str (tokenize "(f x"))
+       (str (tokenize_pad "(f x")))
+(test "tokenizers agree on an empty line"
+       (str (tokenize ""))
+       (str (tokenize_pad "")))
+
+; ---- where the old one is wrong, and the new one is not ----
+; A space or paren inside a quoted string is data, not syntax. Padding cannot
+; tell the difference, so it shreds the operand into three tokens. These are the
+; concrete defects the new primitives remove, asserted rather than described.
+(test "the old tokenizer shreds a space inside a string"
+       (str (tokenize_pad "(print \"a b\")"))
+       "(\"(\" \"print\" \"\\\"a\" \"b\\\"\" \")\")")
+(test "the new tokenizer keeps the string intact"
+       (str (tokenize "(print \"a b\")"))
+       "(\"(\" \"print\" \"\\\"a b\\\"\" \")\")")
+(test "the old tokenizer shreds a paren inside a string"
+       (str (tokenize_pad "(print \"a(b\")"))
+       "(\"(\" \"print\" \"\\\"a\" \"(\" \"b\\\"\" \")\")")
+(test "the new tokenizer keeps that one intact too"
+       (str (tokenize "(print \"a(b\")"))
+       "(\"(\" \"print\" \"\\\"a(b\\\"\" \")\")")
+; The token keeps the backslash: this scanner reports *token boundaries*, not a
+; decoded string, so `\"` survives as the two characters the source has. A real
+; unescape is `replace`'s job.
+(test "an escaped quote does not end the string"
+       (str (tokenize "(f \"a\\\"b c\")"))
+       "(\"(\" \"f\" \"\\\"a\\\\\\\"b c\\\"\" \")\")")
+
+; ---- the thing the old tokenizer cannot express at all: a position ----
+; After padding, the old one has no idea where a token was; `index-of` gives the
+; byte offset directly, which is what a real tokenizer needs to report errors
+; and to slice the source for a nested parse.
+(def line "(print 42)")
+(test "the opening paren's byte offset"
+       (str (index-of line "("))
+       "0")
+(test "the closing paren's byte offset"
+       (str (index-of line ")"))
+       "9")
+(test "substring slices the call without its parens"
+       (substring line (+ (index-of line "(") 1) (index-of line ")"))
+       "print 42")
+; The token list and the offset list are the same length and line up: token
+; k starts at offset k. That pairing is what a caller needs to slice the source
+; for a nested parse, and it is the capability the old tokenizer cannot offer
+; at all — after padding, the parens no longer exist to be located.
+(test "the tokenizer reports every token's own offset"
+       (str (offsets "(print 42)"))
+       "(0 1 7 9)")
+(test "the token list and the offset list are the same length"
+       (str (= (len (tokenize line)) (len (offsets line))))
+       "true")
+(test "a reported offset slices the token it belongs to"
+       ; token 1 is "print", which spans [1, 6) — the next offset is 7, and the
+       ; byte before it is the separating space.
+       (str (substring line (nth (offsets line) 1) (- (nth (offsets line) 2) 1)))
+       "print")
+(test "ends-with confirms the line closes a call"
+       (str (ends-with line ")"))
+       "true")
+(test "starts-with confirms it opens one"
+       (str (starts-with line "("))
+       "true")
+(test "code and char read a byte at a found offset"
+       (str (code (char line (index-of line "("))))
+       "40")
+(test "a multi-byte string is measured in bytes, not characters"
+       (str (index-of "x = é" "="))
+       "2")

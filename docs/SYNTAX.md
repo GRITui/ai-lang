@@ -118,6 +118,8 @@ counter                                    ; => 0
 
 **String functions**: `(split s sep)` → a list, `(join list sep)` → a string, `(trim s)`, `(replace s old new)`, `(upcase s)` / `(downcase s)`, `(contains hay needle)` → bool.
 
+**Byte-oriented string functions** — all indices and lengths are **byte offsets**, not character offsets: `(substring s start end)` → the slice `[start, end)`, `(char s i)` → the whole character at byte `i`, `(code s)` / `(code s i)` → a raw byte value, `(starts-with s p)` / `(ends-with s sfx)` → bool, `(index-of s sub)` → the byte index of the first occurrence, or `-1`. A slice that would split a multi-byte character is an **error**, and an out-of-range index is an error rather than a clamp. See §3g for the rules and why.
+
 `upcase`/`downcase` fold **ASCII only** (`a`–`z`), and `trim` strips only the ASCII whitespace set — space, tab, newline, carriage return, form feed, vertical tab. This is deliberate: the alternative (Unicode-aware case folding and whitespace) is not implementable in the AOT C runtime without pulling in a Unicode library, and the four backends have to agree exactly. A consequence worth knowing: `"héllo"` and `"日本"` are unaffected by `upcase`, and a non-breaking space is not trimmed.
 
 Two edge cases are **rejected rather than guessed**, because the hosts disagree about them and a language that behaves differently in a compiled binary than in its interpreter is worse than one that refuses:
@@ -799,6 +801,134 @@ host's `sort` for the reasons above — Ruby's `sort_by` is not stable, JS order
 strings by UTF-16 code unit and Python by code point, and none of them rejects
 a mixed list. One explicit stable merge sort per backend makes each of those a
 property of code that is right there.
+
+## 3g. Byte-oriented string primitives: `substring` / `char` / `code` / `starts-with` / `ends-with` / `index-of`
+
+Six builtins for looking *inside* a string. Before them AINL could only take a
+string apart with `split` and `replace`: there was no way to slice, no way to ask
+what character is at a position, no prefix or suffix test, and no find. A
+tokenizer had to `replace` every paren with a space and re-`split` the line —
+which cannot report *where* anything was.
+
+### AINL strings are byte strings
+
+**Every index and every length in these six builtins is a byte offset.** Not a
+character, not a grapheme cluster. `(index-of "héllo" "llo")` is `3`, because
+`"héllo"` is six bytes (`é` is two) and five characters; a character-indexed
+answer would be `2`.
+
+This is forced by the 4-backend rule, not chosen for elegance. Each host indexes
+its own way — Python's `str.find` and Ruby's `String#index` return a *character*
+offset, and JavaScript's `String#indexOf` returns a UTF-16 *code-unit* offset —
+so a "natural" implementation returns three different numbers for the same
+non-ASCII input. Byte offsets are the one thing all five can be made to agree
+on.
+
+The rule already half-existed: `len` on a string counts **characters**, and
+`list-dir` sorts by **byte value**. Those coexist deliberately, and the
+distinction is worth internalizing — `(len (substring "héllo" 1 3))` is `1`,
+because that 2-byte slice is one character.
+
+### The builtins
+
+- `(substring s start end)` → the bytes in `[start, end)`, **`end` exclusive**.
+  `(substring "abcdef" 2 4)` is `"cd"`. Both boundaries are legal, so
+  `(substring "abcdef" 0 0)` and `(substring "abcdef" 6 6)` are both `""` — an
+  empty slice is a value, not an error.
+- `(char s i)` → the **character** starting at byte offset `i`, whole. One byte
+  for ASCII, the entire multi-byte sequence for anything else. `(char "日本" 3)`
+  is `"本"`, because byte 3 is where the second character starts.
+- `(code s)` → the byte value of the **first byte** of `s`; `(code s i)` → the
+  byte at offset `i`. `(code "A")` is `65`.
+- `(starts-with s prefix)` / `(ends-with s suffix)` → bool. An empty prefix or
+  suffix is `true` — the empty string is contained in everything, which is the
+  same answer `contains` already gives and what makes `(starts-with s "")` a
+  useful no-op guard. A needle **longer** than the haystack is `false`, not a
+  bounds error.
+- `(index-of s sub)` → the byte index of the **first** occurrence of `sub`, or
+  `-1`. `(index-of "banana" "na")` is `2`. An empty `sub` is **`0`**, not `-1`:
+  the empty needle occurs at offset 0, and that is also what keeps `index-of`
+  consistent with `contains`. (It is what all four hosts answer anyway, so it
+  costs nothing in parity.)
+
+### A slice that splits a character is an error
+
+There is one consequence every backend has to share, and it is the reason `char`
+takes an index at all rather than returning half a sequence: a slice or a
+character extraction that would **cut a multi-byte UTF-8 sequence in half** is a
+**runtime error** — `substring end index splits a multi-byte character` — not a
+replacement character and not a silently short read.
+
+```
+(substring "héllo" 0 2)   ; error — byte 2 is the middle of "é"
+(substring "héllo" 1 3)   ; "é"    — both ends are boundaries
+(char "日本" 1)            ; error — byte 1 is a continuation byte
+(char "日本" 3)            ; "本"
+```
+
+An AINL string is always valid UTF-8 (`read-file` rejects a file that is not),
+so there is no value that could hold half a character. The alternative — quietly
+substituting U+FFFD — is exactly what the file and JSON code already refuses to
+invent, for the same reason.
+
+`code` is the deliberate escape hatch: it reads a **raw byte** and so needs no
+boundary at all. `(code "日本" 1)` is `151`, a continuation byte, for a program
+that genuinely wants to walk UTF-8 by hand.
+
+### Out-of-range is an error, not a clamp
+
+`(substring s 0 999)` is `substring end index out of bounds`. Clamping would make
+it quietly succeed and turn an off-by-one in a caller's arithmetic into a
+silently wrong string — the exact failure these builtins exist to prevent.
+
+```
+(substring "abc" -1 2)   ; substring start index out of bounds
+(substring "abc" 3 1)    ; substring start index is greater than end index
+(char "abc" 3)           ; char index out of bounds
+(code "")                ; code expects a non-empty string
+(code "abc" 9)           ; code index out of bounds
+```
+
+An index operand must be an **int**. A float is rejected, not truncated:
+`(substring "abc" 0 1.5)` is `substring expects an int end index, got float`.
+The hosts disagree about what a fractional index means (Python raises, JS
+coerces to 1, Ruby raises), and truncating would make a caller's arithmetic bug
+invisible on three backends and fatal on two.
+
+### Composing them: a tokenizer
+
+The vocabulary these six add is enough to find where a call opens and closes,
+which the `replace`/`split` approach cannot do:
+
+```
+(index-of "(print 42)" "(")                                  ; 0
+(substring "(print 42)" 1 (index-of "(print 42)" ")"))      ; "print 42"
+(code (char "(print 42)" (index-of "(print 42)" "(")))      ; 40  — the "("
+(ends-with "(print 42)" ")")                                 ; true
+```
+
+`tests/byte_strings_tokenizer.ainl` builds a full line tokenizer on this — one
+that tracks whether it is inside a quoted string, and so does not shred
+`(print "a(b")` into four tokens the way padding parens into whitespace does.
+
+### Backend scope: all four
+
+All six are supported on **all four backends** — the interpreter, the bytecode
+VM, the AOT C runtime, and the Python, JS and Ruby transpilers — byte-identical
+on stdout and on every error message above.
+
+None of the three transpiler targets can delegate to its host, and the reason
+differs in each case, which is why the helpers look the way they do. Python works
+on `s.encode('utf-8')` because a `str` slices by character. JavaScript works on
+`Buffer.from(s, "utf8")` because a JS string is a sequence of UTF-16 *code
+units* — `s.slice(a, b)` slices code units and `s.charCodeAt(i)` will return
+half a surrogate pair. Ruby works on `s.bytes` (an Array of Integer) because a
+`String` slices by character; note that `s.b` looks equivalent and is not — it
+returns a binary-encoded **String**, so `b[i] & 0xC0` raises `NoMethodError`.
+
+`scripts/check-byte-strings.sh` runs `tests/byte_strings_parity.ainl` through all
+five runners and diffs them against the interpreter, which is the normative
+implementation.
 
 ## 4. Canonical examples
 

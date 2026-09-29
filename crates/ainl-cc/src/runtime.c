@@ -141,6 +141,9 @@ enum {
    * `filter` and `reduce` are special forms lowered to loops before codegen
    * (see ainl_core::collection_forms), so they need no id here. */
   B_SORT,
+  /* Byte-oriented string primitives (Tier 3). Appended last for the same
+   * reason. */
+  B_SUBSTRING, B_CHAR, B_CODE, B_STARTS_WITH, B_ENDS_WITH, B_INDEX_OF,
   B_COUNT
 };
 
@@ -2098,6 +2101,210 @@ static Value builtin_contains(Value *args, int nargs) {
   return v_bool(strstr(hay, needle) != NULL);
 }
 
+/* ---- Byte-oriented string primitives (Tier 3) ---------------------------
+ *
+ * AINL strings are BYTE strings: `substring`, `char`, `code` and `index-of`
+ * index and slice by byte offset. Every host indexes its own way — Python's
+ * and Ruby's String#index return a *character* offset, JavaScript's indexOf a
+ * UTF-16 *code-unit* offset — so a natural strstr/memcpy port would disagree
+ * with the interpreter on any non-ASCII input. The C runtime is the easiest
+ * backend to get right by accident here precisely because strstr returns a
+ * char*, which is already a byte pointer; the boundary checks below are what
+ * keep it honest.
+ *
+ * Two rules are shared with the other four backends:
+ *   * a slice that would split a multi-byte character is an error, not a
+ *     replacement character (see utf8_valid for why there is no value to
+ *     return);
+ *   * `index-of` of an empty needle is 0, matching strstr's own answer.
+ */
+
+/* Is `at` a UTF-8 character boundary? A lead byte or the end of the string
+ * starts a character; a continuation byte (10xxxxxx) does not. Every AINL
+ * string in this runtime has already passed utf8_valid, so there is no
+ * malformed case to decide here. */
+static int a_is_char_boundary(const char *s, size_t at) {
+  if (at == 0)
+    return 1;
+  unsigned char c = (unsigned char)s[at];
+  return (c & 0xC0) != 0x80;
+}
+
+/* Is `v` an int index operand? On failure the message is AINL's own, matching
+ * `as_index_arg` in ainl-core's eval.rs, and 0 is returned. Callers check
+ * g_err, so no sentinel value is needed. */
+static int a_is_index(Value *v, const char *who, const char *which) {
+  if (v->tag != V_INT) {
+    if (which && *which)
+      set_err("%s expects an int %s index, got %s", who, which, type_name(v));
+    else
+      set_err("%s expects an int index, got %s", who, type_name(v));
+    return 0;
+  }
+  return 1;
+}
+
+/* Resolve a byte offset, rejecting out-of-range and mid-character positions.
+ * On failure sets the error and returns 0; callers test g_err. */
+static size_t a_byte_offset(const char *s, size_t len, Value *iv, const char *who,
+                            const char *which) {
+  if (!a_is_index(iv, who, which))
+    return 0;
+  long long idx = iv->u.i;
+  if (idx < 0 || idx > (long long)len) {
+    set_err("%s %s index out of bounds", who, which);
+    return 0;
+  }
+  if (!a_is_char_boundary(s, (size_t)idx)) {
+    set_err("%s %s index splits a multi-byte character", who, which);
+    return 0;
+  }
+  return (size_t)idx;
+}
+
+/* (substring s start end) -> the bytes in [start, end), end exclusive. */
+static Value builtin_substring(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("substring expects (substring str start end)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "substring");
+  if (!s)
+    return v_nil();
+  size_t len = strlen(s);
+  /* Type-check both bounds before reading either, so `(substring s 1.5 x)`
+   * names the start index rather than a later failure. */
+  if (!a_is_index(&args[1], "substring", "start"))
+    return v_nil();
+  if (!a_is_index(&args[2], "substring", "end"))
+    return v_nil();
+  if (args[1].u.i > args[2].u.i) {
+    set_err("substring start index is greater than end index");
+    return v_nil();
+  }
+  size_t lo = a_byte_offset(s, len, &args[1], "substring", "start");
+  if (g_err)
+    return v_nil();
+  size_t hi = a_byte_offset(s, len, &args[2], "substring", "end");
+  if (g_err)
+    return v_nil();
+  size_t n = hi - lo;
+  char *out = malloc(n + 1);
+  memcpy(out, s + lo, n);
+  out[n] = 0;
+  return v_str_take(out);
+}
+
+/* (char s i) -> the character starting at byte offset i, whole (never half). */
+static Value builtin_char(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("char expects (char str i)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "char");
+  if (!s)
+    return v_nil();
+  size_t len = strlen(s);
+  if (!a_is_index(&args[1], "char", NULL))
+    return v_nil();
+  long long i = args[1].u.i;
+  if (i < 0 || (size_t)i >= len) {
+    set_err("char index out of bounds");
+    return v_nil();
+  }
+  if (!a_is_char_boundary(s, (size_t)i)) {
+    set_err("char index splits a multi-byte character");
+    return v_nil();
+  }
+  size_t n = 1;
+  unsigned char c = (unsigned char)s[i];
+  if (c >= 0xF0)
+    n = 4;
+  else if (c >= 0xE0)
+    n = 3;
+  else if (c >= 0xC0)
+    n = 2;
+  char *out = malloc(n + 1);
+  memcpy(out, s + i, n);
+  out[n] = 0;
+  return v_str_take(out);
+}
+
+/* (code s) -> first byte value; (code s i) -> byte value at i. */
+static Value builtin_code(Value *args, int nargs) {
+  if (nargs != 1 && nargs != 2) {
+    set_err("code expects (code str) or (code str i)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "code");
+  if (!s)
+    return v_nil();
+  size_t len = strlen(s);
+  if (nargs == 1) {
+    if (len == 0) {
+      set_err("code expects a non-empty string");
+      return v_nil();
+    }
+    return v_int((long long)(unsigned char)s[0]);
+  }
+  if (!a_is_index(&args[1], "code", NULL))
+    return v_nil();
+  long long i = args[1].u.i;
+  if (i < 0 || (size_t)i >= len) {
+    set_err("code index out of bounds");
+    return v_nil();
+  }
+  return v_int((long long)(unsigned char)s[i]);
+}
+
+/* (starts-with s prefix) -> bool. An empty prefix is true. */
+static Value builtin_starts_with(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("starts-with expects (starts-with str prefix)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "starts-with");
+  if (!s)
+    return v_nil();
+  const char *pre = as_str_arg(&args[1], "starts-with");
+  if (!pre)
+    return v_nil();
+  return v_bool(strncmp(s, pre, strlen(pre)) == 0);
+}
+
+/* (ends-with s suffix) -> bool. An empty suffix is true. */
+static Value builtin_ends_with(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("ends-with expects (ends-with str suffix)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "ends-with");
+  if (!s)
+    return v_nil();
+  const char *suf = as_str_arg(&args[1], "ends-with");
+  if (!suf)
+    return v_nil();
+  size_t slen = strlen(s), suflen = strlen(suf);
+  return v_bool(slen >= suflen && memcmp(s + slen - suflen, suf, suflen) == 0);
+}
+
+/* (index-of s sub) -> byte index of the first occurrence, or -1. strstr
+ * already returns a byte offset and already answers 0 for an empty needle. */
+static Value builtin_index_of(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("index-of expects (index-of str sub)");
+    return v_nil();
+  }
+  const char *s = as_str_arg(&args[0], "index-of");
+  if (!s)
+    return v_nil();
+  const char *sub = as_str_arg(&args[1], "index-of");
+  if (!sub)
+    return v_nil();
+  const char *at = strstr(s, sub);
+  return v_int(at ? (long long)(at - s) : -1);
+}
+
 /* (env-get name) -> str or nil. */
 static Value builtin_env_get(Value *args, int nargs) {
   if (nargs != 1) {
@@ -2382,6 +2589,19 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_test(args, nargs);
     case B_SORT:
       return builtin_sort(args, nargs);
+    /* Byte-oriented string primitives (Tier 3) */
+    case B_SUBSTRING:
+      return builtin_substring(args, nargs);
+    case B_CHAR:
+      return builtin_char(args, nargs);
+    case B_CODE:
+      return builtin_code(args, nargs);
+    case B_STARTS_WITH:
+      return builtin_starts_with(args, nargs);
+    case B_ENDS_WITH:
+      return builtin_ends_with(args, nargs);
+    case B_INDEX_OF:
+      return builtin_index_of(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -3565,6 +3785,10 @@ static void scope_install_prelude(Scope *env) {
       {"test", B_TEST},
       /* Tier 3 collections */
       {"sort", B_SORT},
+      /* Byte-oriented string primitives (Tier 3) */
+      {"substring", B_SUBSTRING}, {"char", B_CHAR}, {"code", B_CODE},
+      {"starts-with", B_STARTS_WITH}, {"ends-with", B_ENDS_WITH},
+      {"index-of", B_INDEX_OF},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

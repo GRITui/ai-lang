@@ -255,6 +255,62 @@ fn aot_contains_matches_the_interpreter() {
     );
 }
 
+// ---- Tier 3 byte-oriented string primitives --------------------------------
+
+/// The six byte primitives, including multi-byte input so a character-indexed
+/// port cannot pass: `strstr` returns a byte offset, but a wrong length check
+/// would still let a 2-byte character through.
+#[test]
+fn aot_byte_string_primitives_match_the_interpreter() {
+    assert_stdout_parity(
+        r#"(do (print (substring "abcdef" 0 6))
+             (print (substring "abcdef" 2 4))
+             (print (substring "abcdef" 0 0))
+             (print (substring "héllo" 1 3))
+             (print (char "abc" 0))
+             (print (char "日本" 0))
+             (print (char "日本" 3))
+             (print (code "A"))
+             (print (code "日本" 0))
+             (print (code "日本" 1))
+             (print (code "日本" 2))
+             (print (starts-with "hello" "he"))
+             (print (starts-with "hello" ""))
+             (print (ends-with "hello" "lo"))
+             (print (ends-with "hello" "he"))
+             (print (index-of "hello" "llo"))
+             (print (index-of "héllo" "llo"))
+             (print (index-of "hello" "z"))
+             (print (index-of "hello" ""))
+             (print (index-of "日本" "本")))"#,
+        "byte_strings",
+    );
+}
+
+/// The one shared error message per failure mode, byte-identical between the
+/// interpreter and the compiled binary — including the byte-offset wording,
+/// which is where a hand-written port most easily drifts.
+#[test]
+fn aot_byte_string_error_messages_match_the_interpreter() {
+    for (src, name) in [
+        (r#"(substring "abc" 3 1)"#, "sub_start_gt_end"),
+        (r#"(substring "abc" -1 2)"#, "sub_neg_start"),
+        (r#"(substring "abc" 0 99)"#, "sub_past_end"),
+        (r#"(substring "héllo" 0 2)"#, "sub_splits_char"),
+        (r#"(substring "abc" 0 1.5)"#, "sub_float_end"),
+        (r#"(char "日本" 1)"#, "char_splits_char"),
+        (r#"(char "abc" 3)"#, "char_oob"),
+        (r#"(char "abc" 1.5)"#, "char_float"),
+        (r#"(code "")"#, "code_empty"),
+        (r#"(code "abc" 9)"#, "code_oob"),
+        (r#"(substring 1 0 2)"#, "sub_not_str"),
+        (r#"(starts-with "a" 1)"#, "sw_not_str"),
+        (r#"(index-of 1 "a")"#, "io_not_str"),
+    ] {
+        assert_error_parity(src, name);
+    }
+}
+
 // ---- env / time ------------------------------------------------------------
 
 #[test]
@@ -849,6 +905,15 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         // an arm for them here would only invite the question of what a
         // `map`-as-builtin would do with a `fn` it cannot call.
         "sort",
+        // Tier 3 byte-oriented string primitives. All six are real builtins
+        // (unlike map/filter/reduce, which are special forms), so all six need
+        // an id and a name here.
+        "substring",
+        "char",
+        "code",
+        "starts-with",
+        "ends-with",
+        "index-of",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -871,7 +936,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 56, "update this list when the prelude changes");
+    assert_eq!(names.len(), 62, "update this list when the prelude changes");
 
     // The other direction, which is the one that actually catches drift: every
     // name the prelude binds must be either in the table above (reachable by
@@ -898,7 +963,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        58,
+        64,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),

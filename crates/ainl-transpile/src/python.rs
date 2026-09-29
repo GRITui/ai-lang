@@ -160,6 +160,35 @@ impl Py {
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
+        // Tier 3 byte-oriented string primitives. `_ainl_b` rejects a quoted
+        // symbol the way the interpreter's `as_str_arg` does, and reports the
+        // type through `_ainl_tname`, so every helper here pulls in both. They
+        // are emitted from the RUNTIME table in declaration order, and `_ainl_b`
+        // and `_ainl_off` sit above the six builtins, so the cluster is only
+        // complete once all three are named.
+        if [
+            "_substring",
+            "_char",
+            "_code",
+            "_starts_with",
+            "_ends_with",
+            "_index_of",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_ainl_b");
+            self.needed.insert("_ainl_idx");
+            self.needed.insert("_ainl_off");
+            self.needed.insert("_ainl_tname");
+            // Every helper reports failure through `_error`, so a `catch` can
+            // intercept it and the message is AINL's own rather than a host
+            // traceback. `_error` pulls in `_AinlError` and `_disp` (it renders
+            // its arguments), which is why it is requested here and not left to
+            // the caller.
+            self.needed.insert("_error");
+            self.needed.insert("_Sym");
+        }
         // `try`. `_ainl_try` needs `_AinlError` (the except clause) and
         // `_caught` (which builds the hash and needs `_Hash`), and the RUNTIME
         // table is emitted in declaration order, so `_Hash` must be pulled in
@@ -593,6 +622,18 @@ impl Py {
                 "upcase" => return self.call_builtin("_upcase", args, Some("_upcase")),
                 "downcase" => return self.call_builtin("_downcase", args, Some("_downcase")),
                 "contains" => return self.call_builtin("_contains", args, Some("_contains")),
+                // ---- Tier 3: byte-oriented string primitives ----
+                "substring" => return self.call_builtin("_substring", args, Some("_substring")),
+                "char" => return self.call_builtin("_char", args, Some("_char")),
+                // `(code s)` and `(code s i)` differ only in arity, and the
+                // helper's second parameter defaults to None — so one arm
+                // covers both.
+                "code" => return self.call_builtin("_code", args, Some("_code")),
+                "starts-with" => {
+                    return self.call_builtin("_starts_with", args, Some("_starts_with"))
+                }
+                "ends-with" => return self.call_builtin("_ends_with", args, Some("_ends_with")),
+                "index-of" => return self.call_builtin("_index_of", args, Some("_index_of")),
                 "env-get" => return self.call_builtin("_env_get", args, Some("_env_get")),
                 "exit" => return self.call_builtin("_exit", args, Some("_exit")),
                 "now" => return self.call_builtin("_now", args, Some("_now")),
@@ -1390,6 +1431,68 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_contains",
         "def _contains(hay, needle):\n    return needle in hay",
+    ),
+    // ---- Tier 3: byte-oriented string primitives ----
+    // AINL strings are BYTE strings, but Python's str indexes by *character*.
+    // So none of these can delegate to the host: `s[a:b]` would return
+    // characters, `s.find(needle)` a character offset, and `ord(s[i])` a code
+    // point. Each helper works on `s.encode('utf-8')` instead, and decodes the
+    // result back — which is the only way to get the interpreter's answer in
+    // this target. See ainl-core/src/eval.rs for the normative rules.
+    //
+    // Every failure raises through `_error`, i.e. as `_AinlError`, so `catch`
+    // can intercept it and the message is AINL's own. A host `ValueError`
+    // would escape the generated `except _AinlError` clause and abort with a
+    // Python traceback, which is neither a caught value nor a shared message.
+    (
+        "_ainl_b",
+        // The bytes of a string, rejecting a non-str under the *calling*
+        // builtin's name. Shared so the three slicing helpers agree on the
+        // type-error wording.
+        "def _ainl_b(s, who):\n    if isinstance(s, _Sym) or not isinstance(s, str): _error('%s expects a str, got %s' % (who, _ainl_tname(s)))\n    return s.encode('utf-8')",
+    ),
+    (
+        "_ainl_idx",
+        // An int index operand. A float is rejected rather than truncated:
+        // Python would happily slice with 1.5, and truncating here would make
+        // an arithmetic bug in the caller invisible on three backends and
+        // fatal on two.
+        "def _ainl_idx(i, who, which):\n    if isinstance(i, bool) or not isinstance(i, int): _error('%s expects an int %sindex, got %s' % (who, which, _ainl_tname(i)))\n    return i",
+    ),
+    (
+        "_ainl_off",
+        // Resolve a byte offset, rejecting out-of-range and mid-character
+        // positions. The `which` argument carries a trailing space for the
+        // two-operand builtins, so the message reads `substring start index
+        // out of bounds` with no double space.
+        "def _ainl_off(b, i, who, which):\n    if i < 0 or i > len(b): _error('%s %sindex out of bounds' % (who, which))\n    # A UTF-8 continuation byte cannot start or end a slice.\n    if i < len(b) and (b[i] & 0xC0) == 0x80: _error('%s %sindex splits a multi-byte character' % (who, which))\n    return i",
+    ),
+    (
+        "_substring",
+        "def _substring(s, start, end):\n    b = _ainl_b(s, 'substring')\n    start = _ainl_idx(start, 'substring', 'start ')\n    end = _ainl_idx(end, 'substring', 'end ')\n    if start > end: _error('substring start index is greater than end index')\n    lo = _ainl_off(b, start, 'substring', 'start ')\n    hi = _ainl_off(b, end, 'substring', 'end ')\n    return b[lo:hi].decode('utf-8')",
+    ),
+    (
+        "_char",
+        "def _char(s, i):\n    b = _ainl_b(s, 'char')\n    i = _ainl_idx(i, 'char', '')\n    if i < 0 or i >= len(b): _error('char index out of bounds')\n    if (b[i] & 0xC0) == 0x80: _error('char index splits a multi-byte character')\n    # The lead byte's high bits give the sequence length: 10xxxxxx=2, 1110=3,\n    # 11110xxx=4. utf8_valid on the way in means no other case can occur.\n    c = b[i]\n    n = 4 if c >= 0xF0 else (3 if c >= 0xE0 else (2 if c >= 0xC0 else 1))\n    return b[i:i + n].decode('utf-8')",
+    ),
+    (
+        "_code",
+        "def _code(s, i=None):\n    b = _ainl_b(s, 'code')\n    if i is None:\n        if not b: _error('code expects a non-empty string')\n        return b[0]\n    i = _ainl_idx(i, 'code', '')\n    if i < 0 or i >= len(b): _error('code index out of bounds')\n    return b[i]",
+    ),
+    (
+        "_starts_with",
+        "def _starts_with(s, prefix):\n    b = _ainl_b(s, 'starts-with')\n    p = _ainl_b(prefix, 'starts-with')\n    return b.startswith(p)",
+    ),
+    (
+        "_ends_with",
+        "def _ends_with(s, suffix):\n    b = _ainl_b(s, 'ends-with')\n    p = _ainl_b(suffix, 'ends-with')\n    return b.endswith(p)",
+    ),
+    (
+        // An empty needle is 0, not -1 — the same answer str.find, Ruby and JS
+        // all give, and the one that keeps `index-of` consistent with
+        // `contains` (whose empty-needle case is already `true`).
+        "_index_of",
+        "def _index_of(s, sub):\n    b = _ainl_b(s, 'index-of')\n    p = _ainl_b(sub, 'index-of')\n    return b.find(p)",
     ),
     ("_env_get", "def _env_get(name):\n    import os\n    return os.environ.get(name)"),
     (
