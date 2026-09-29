@@ -568,17 +568,17 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
         if c.is_ascii_digit() || (c == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
             let mut text = String::new();
             if c == b'-' {
-                text.push(bump!() as char);
+                text.push(bump!());
             }
             while i < b.len() && b[i].is_ascii_digit() {
-                text.push(bump!() as char);
+                text.push(bump!());
             }
             let mut is_float = false;
             if i < b.len() && b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
                 is_float = true;
-                text.push(bump!() as char);
+                text.push(bump!());
                 while i < b.len() && b[i].is_ascii_digit() {
-                    text.push(bump!() as char);
+                    text.push(bump!());
                 }
             }
             // `1abc`, `1.2.3` and `1e9` are one mistake, not two. The position
@@ -1193,11 +1193,16 @@ fn parse(who: &str, sql: &str) -> Result<Query> {
                 return Err(p.refuse_unsupported(&t));
             }
             let col = p.column()?;
+            // ASC is the default, so `else if p.eat("ASC") { Asc }` would be the
+            // same answer as the final `else`. The `eat` stays anyway, and has
+            // to: it is what *consumes* the word, so without it a written
+            // `ORDER BY 2 ASC` would leave `ASC` unparsed and fail as a
+            // trailing token. The direction is the default; the token is not
+            // optional to read.
             let dir = if p.eat("DESC") {
                 Dir::Desc
-            } else if p.eat("ASC") {
-                Dir::Asc
             } else {
+                p.eat("ASC");
                 Dir::Asc
             };
             order = Some((col, dir));
