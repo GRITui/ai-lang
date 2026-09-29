@@ -43,6 +43,8 @@ pub fn transpile_python(forms: &[Node], src: &str) -> Result<String> {
         body: String::new(),
         indent: 0,
         needed: BTreeSet::new(),
+        temps: 0,
+        used: shared::used_symbols(forms, sanitize),
     };
     for form in forms {
         py.top_form(form, &idx)?;
@@ -54,6 +56,12 @@ struct Py {
     body: String,
     indent: usize,
     needed: BTreeSet<&'static str>,
+    /// Counter behind `logic_temp`, so two `and`/`or` chains in one expression
+    /// cannot name their operand the same thing.
+    temps: usize,
+    /// Every name the program already uses, so a generated temp cannot shadow
+    /// one. See `shared::used_symbols`.
+    used: BTreeSet<String>,
 }
 
 impl Py {
@@ -832,45 +840,21 @@ impl Py {
         Ok(format!("({})", parts.join(&format!(" {op} "))))
     }
 
-    /// AINL's `and` / `or`, which short-circuit on AINL truthiness.
+    /// AINL's `and` / `or`, which short-circuit on AINL truthiness and return an
+    /// OPERAND.
     ///
-    /// NOT the host operator. `(and 0 "x")` is `"x"` in AINL — `0` is truthy, so
-    /// the chain continues — but `0` in Python, because `0` is falsey there. The
-    /// host operator also returns an OPERAND rather than a boolean, so
-    /// `(or 0 "")` would answer `0` here and `""` in the interpreter: a different
-    /// value, not just a different truthiness reading.
+    /// Delegates to [`shared::logic`], which is the one place the fold is
+    /// written. Python used to carry its own copy of it, differing only in
+    /// spelling the conditional value-first — and that copy drifted: it kept the
+    /// old `parts[last]` seed, so an all-falsy `or` answered the last operand
+    /// here and `false` on the interpreter and the AOT binary. Keeping one fold
+    /// is what makes that class of divergence impossible on the next change.
     ///
-    /// So each operand becomes a host conditional rather than an operator
-    /// join — see [`crate::shared::logic`] for why that is the only shape that
-    /// returns an operand. Python spells the conditional `b if c else a`
-    /// (value first), where JS and Ruby spell it `c ? a : b`.
-    ///
-    /// `op` here is the AINL **form** name (`"and"` / `"or"`), the opposite of
-    /// what the shared helper takes; the two differ precisely because the
-    /// shared one has to know which host operator to emit and this one does not.
+    /// The AINL **form** name (`"and"` / `"or"`) is translated to the host
+    /// operator here because the shared fold is keyed on the operator, not the
+    /// form name — see its doc comment for why that distinction is load-bearing.
     fn chain_logic(&mut self, args: &[Node], op: &str) -> Result<String> {
-        let parts = self.expr_all(args)?;
-        match parts.len() {
-            // The identities: `(and)` is `true` and `(or)` is `false`, not nil.
-            0 => Ok(if op == "and" { "True" } else { "False" }.to_string()),
-            1 => Ok(parts.into_iter().next().unwrap()),
-            _ => {
-                self.need("_truthy");
-                // Fold right, each earlier operand becoming a conditional
-                // against the rest. The falsey operand of `and` is the `else`
-                // arm, because that is the arm taken when it is falsey.
-                let is_and = op == "and";
-                let mut acc = parts[parts.len() - 1].clone();
-                for p in parts[..parts.len() - 1].iter().rev() {
-                    acc = if is_and {
-                        format!("({acc} if _truthy({p}) else {p})")
-                    } else {
-                        format!("({p} if _truthy({p}) else {acc})")
-                    };
-                }
-                Ok(acc)
-            }
-        }
+        shared::logic(self, args, if op == "and" { "&&" } else { "||" })
     }
 
     fn expr_if(&mut self, args: &[Node]) -> Result<String> {
@@ -1024,6 +1008,44 @@ impl Py {
 impl ExprEmit for Py {
     fn need_truthy(&mut self) {
         self.need("_truthy");
+    }
+
+    /// A Python lambda, called immediately — the same shape `expr_let` already
+    /// emits, and what makes the `and`/`or` chain a nest of thunks.
+    fn bind_once(&mut self, n: &str, val: &str, body: &str) -> String {
+        format!("(lambda {n}: {body})({val})")
+    }
+
+    /// Python spells the conditional `a if c else b`, value FIRST.
+    fn cond(&mut self, cond: &str, then: &str, els: &str) -> String {
+        format!("({then} if {cond} else {els})")
+    }
+
+    /// Python capitalises both booleans — `or`'s `false` identity is emitted
+    /// here, so getting the case wrong would be a `NameError` on precisely the
+    /// all-falsy chain this literal exists to answer.
+    fn false_lit(&self) -> &'static str {
+        "False"
+    }
+
+    fn true_lit(&self) -> &'static str {
+        "True"
+    }
+
+    fn logic_temp(&mut self) -> String {
+        // Python's identifiers are alphanumerics and `_` — `$` is a SyntaxError
+        // there, so this target needs a name its own `sanitize` could have
+        // produced from a real AINL identifier. That makes a plain counter name
+        // COLLIDABLE (a program can `def _ainl_t0`), so the generated name is
+        // checked against the program's own symbols and stepped past on a hit.
+        loop {
+            let n = self.temps;
+            self.temps += 1;
+            let name = format!("_ainl_t{n}");
+            if !self.used.contains(&name) {
+                return name;
+            }
+        }
     }
 
     fn expr(&mut self, node: &Node) -> Result<String> {

@@ -37,6 +37,8 @@ pub fn transpile_js(forms: &[Node], src: &str) -> Result<String> {
         body: String::new(),
         indent: 0,
         needed: BTreeSet::new(),
+        temps: 0,
+        used: shared::used_symbols(forms, sanitize),
     };
     for form in forms {
         js.top_form(form, &idx)?;
@@ -48,6 +50,12 @@ struct Js {
     body: String,
     indent: usize,
     needed: BTreeSet<&'static str>,
+    /// Counter behind `logic_temp`, so two `and`/`or` chains in one expression
+    /// cannot name their operand the same thing.
+    temps: usize,
+    /// Every name the program already uses, so a generated temp cannot shadow
+    /// one. See `shared::used_symbols`.
+    used: BTreeSet<String>,
 }
 
 impl Js {
@@ -897,6 +905,44 @@ impl Js {
 impl ExprEmit for Js {
     fn need_truthy(&mut self) {
         self.need("_truthy");
+    }
+
+    /// Bind the operand to an arrow parameter and call it — the JS idiom, and
+    /// the reason the emitted `and`/`or` chain is a nest of IIFEs rather than a
+    /// host `&&`/`||` chain.
+    ///
+    /// `n` is a compiler-generated name, never a user identifier, so it cannot
+    /// shadow anything the program itself bound.
+    fn bind_once(&mut self, n: &str, val: &str, body: &str) -> String {
+        format!("(({n}) => {body})({val})")
+    }
+
+    /// JS puts the condition first.
+    fn cond(&mut self, cond: &str, then: &str, els: &str) -> String {
+        format!("({cond} ? {then} : {els})")
+    }
+
+    fn false_lit(&self) -> &'static str {
+        "false"
+    }
+
+    fn true_lit(&self) -> &'static str {
+        "true"
+    }
+
+    fn logic_temp(&mut self) -> String {
+        // JS identifiers may contain `$`, so `_ainl_t$0` here could never be
+        // shadowed by a program binding. The name is kept the same as the other
+        // two targets' anyway — one spelling, one thing to grep for in a
+        // generated file — and the check below costs nothing.
+        loop {
+            let n = self.temps;
+            self.temps += 1;
+            let name = format!("_ainl_t{n}");
+            if !self.used.contains(&name) {
+                return name;
+            }
+        }
     }
 
     fn expr(&mut self, node: &Node) -> Result<String> {

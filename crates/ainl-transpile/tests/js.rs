@@ -4,6 +4,21 @@ fn js(src: &str) -> String {
     transpile_js_src(src).unwrap_or_else(|e| panic!("transpile failed for `{src}`: {e}"))
 }
 
+/// The emitted `_print(...)` CALL, as one line.
+///
+/// A plain `lines().find(|l| l.contains("_print("))` finds the runtime
+/// helper's own `function _print(...xs) {...}` definition first, so every
+/// assertion written against it was reading a line that has nothing to do with
+/// the program — it passes whatever the program emits, and fails for reasons
+/// that have nothing to do with the program either. This matches a line that
+/// *calls* it, which is the only one carrying the form under test.
+fn print_call(out: &str) -> String {
+    out.lines()
+        .find(|l| l.contains("_print(") && !l.contains("function _print"))
+        .expect("no _print call in the emitted program")
+        .to_string()
+}
+
 #[test]
 fn function_becomes_declaration() {
     let out = js("(def sq (fn (x) (* x x)))");
@@ -138,13 +153,18 @@ fn and_emits_the_conjunction_not_the_disjunction() {
     // became a disjunction, which does not short-circuit, so the second
     // operand ran with a nil path and the host raised a TypeError.
     let out = js("(print (and a b))");
-    // The conjunction is a conditional whose `else` arm is the falsey operand
-    // `a`, so a falsey `a` is returned unchanged. A disjunction would have put
-    // `b` there instead.
-    assert!(out.contains("_print((_truthy(a) ? b : a))"), "got:\n{out}");
+    // The conjunction is a conditional whose `then` arm is the rest of the chain
+    // and whose `else` arm is the falsey operand, so a falsey `a` is returned
+    // unchanged. A disjunction would have put the rest in the `else` arm.
+    // `a` is BOUND rather than repeated, so the `_truthy` test and the yielded
+    // value read the same evaluation — see `an_operand_is_evaluated_once`.
+    assert!(
+        out.contains("_print(((_ainl_t0) => (_truthy(_ainl_t0) ? b : _ainl_t0))(a))"),
+        "got:\n{out}"
+    );
     // Scoped to the emitted expression: `_truthy`'s own body contains `||`, so
     // a whole-file `!contains` would fail on the helper's null check.
-    let expr = out.lines().find(|l| l.contains("_print(")).unwrap();
+    let expr = print_call(&out);
     assert!(
         !expr.contains("||"),
         "an `and` must not be a disjunction, got:\n{expr}"
@@ -156,19 +176,86 @@ fn and_emits_the_conjunction_not_the_disjunction() {
 }
 
 #[test]
+fn an_operand_is_evaluated_once() {
+    // Each operand's text is needed twice — once inside the `_truthy` test and
+    // once as the value it yields — so repeating it evaluates it twice. The
+    // fold binds the operand instead and uses only the name, which costs a
+    // closure but is the only way to keep a side effect to a single run.
+    //
+    // This was silent before: a value-only test cannot see a doubled
+    // evaluation, and the doubled one was a function call here.
+    let out = js("(print (or (f 1) 2))");
+    let expr = print_call(&out);
+    assert_eq!(
+        expr.matches("f(1)").count(),
+        1,
+        "the operand's text appears more than once, so it runs more than once: {expr}"
+    );
+    assert!(
+        expr.contains("(f(1))"),
+        "the operand should appear as the bound value exactly once, got:\n{expr}"
+    );
+}
+
+#[test]
+fn an_all_falsy_or_ends_on_the_false_identity() {
+    // SYNTAX.md 2: `or` returns the first truthy operand, and `false` when
+    // there is none. Seeding the fold with the last operand instead made
+    // `(or nil nil)` answer `nil` here and `false` on the interpreter and the
+    // AOT binary. `false` is therefore the tail of the chain, and the final
+    // operand is tested too — otherwise a truthy one would be discarded.
+    let out = js("(print (or nil nil))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains(": false)"),
+        "an all-falsy `or` must fall through to `false`, got:\n{expr}"
+    );
+    // A lone falsey operand is the same case with no chain to run: the
+    // interpreter answers `false` for `(or nil)`, not `nil`.
+    let out = js("(print (or nil))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains(": false)"),
+        "`(or nil)` must be `false`, got:\n{expr}"
+    );
+    // And a lone TRUTHY operand still comes back unchanged — 0 is truthy in
+    // AINL (§1), so a fix that read truthiness off the emitted text, or used
+    // the host's, would break this.
+    let out = js("(print (or 42))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains("(42))") && expr.contains(": false)"),
+        "`(or 42)` must answer 42, got:\n{expr}"
+    );
+}
+
+#[test]
+fn a_logic_temp_cannot_shadow_a_user_binding() {
+    // The chain is a nest of real closures, so a generated operand name that
+    // collided with a program binding would shadow it and change what the rest
+    // of the operand reads. The counter therefore steps past any name the
+    // program already uses. An AINL identifier is any run of non-delimiter
+    // characters, so `_ainl_t0` is a legal thing for a program to `def`.
+    let out = js("(def _ainl_t0 9)\n(print (or _ainl_t0 1))\n(print _ainl_t0)");
+    assert!(
+        out.contains("_ainl_t1)"),
+        "the fold must not reuse a name the program bound, got:\n{out}"
+    );
+}
+
+#[test]
 fn and_or_return_an_operand_not_a_boolean() {
     // AINL's `and` yields the first FALSEY OPERAND and `or` the first TRUTHY
     // OPERAND. A host `&&` / `||` yields a boolean, so the whole chain has to
-    // be a conditional: `_truthy(a) ? b : a` for `and`, `_truthy(a) ? a : b` for
-    // `or`. Coercing the operands to booleans and returning one loses the
-    // value: `(or 0 "")` must be `0` (0 is truthy in AINL), and a boolean fold
-    // answers `true`.
+    // be a conditional over bound operands. Coercing the operands to booleans
+    // and returning one loses the value: `(or 0 "")` must be `0` (0 is truthy
+    // in AINL), and a boolean fold answers `true`.
     let out = js(r#"(print (or 0 ""))"#);
     assert!(
-        out.contains(r#"_print((_truthy(0) ? 0 : ""))"#),
+        out.contains(r#"((_ainl_t1) => (_truthy(_ainl_t1) ? _ainl_t1 : ((_ainl_t0) => (_truthy(_ainl_t0) ? _ainl_t0 : false))("")))(0))"#),
         "got:\n{out}"
     );
-    let expr = out.lines().find(|l| l.contains("_print(")).unwrap();
+    let expr = print_call(&out);
     assert!(
         !expr.contains("||"),
         "`or` must not be a boolean fold, got:\n{expr}"
@@ -183,13 +270,14 @@ fn and_or_return_an_operand_not_a_boolean() {
 fn and_returns_the_falsey_operand_unchanged() {
     // `(and nil false 3)` is `nil` in AINL, because the chain returns the
     // first falsey operand and `nil` is the first one. A host `&&` would
-    // answer `false`.
+    // answer `false`. The last operand is the chain's value and is emitted
+    // bare; the two before it are bound, so each is tested once.
     let out = js("(print (and nil false 3))");
     assert!(
-        out.contains("_truthy(null) ? (_truthy(false) ? 3 : false) : null"),
+        out.contains("(_ainl_t1) => (_truthy(_ainl_t1) ? ((_ainl_t0) => (_truthy(_ainl_t0) ? 3 : _ainl_t0))(false) : _ainl_t1))(null)"),
         "got:\n{out}"
     );
-    let expr = out.lines().find(|l| l.contains("_print(")).unwrap();
+    let expr = print_call(&out);
     assert!(!expr.contains("&&"), "got:\n{expr}");
 }
 

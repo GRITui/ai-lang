@@ -20,6 +20,22 @@
 # truthy operand. A parity gate that assumed C-like truthiness would "fix" the
 # AOT backend into agreeing with a program that is wrong.
 #
+# The gate has caught two different backends disagreeing with the interpreter
+# about the SAME pair of forms, which is why it asserts against the interpreter
+# rather than against a table of expected strings:
+#
+#   * the AOT emitter seeded its accumulator with `v_bool(1)` and overwrote it
+#     only on the short-circuit path, so an all-truthy `and` returned the seed
+#     (`true`) where every other backend returned the last operand;
+#   * the three transpilers folded `or` to a host conditional seeded with the
+#     LAST OPERAND, so an all-falsy `or` returned that operand where the
+#     interpreter and the C emitter return `false` (SYNTAX.md 2). The same
+#     fold emitted each operand's text twice — once in the `_truthy` test, once
+#     as the value it yields — so an operand ran twice.
+#
+# A gate that only checked values would have caught the first and missed the
+# third, so the programs below print side effects as well as results.
+#
 # "It ran" is not the claim; "the bytes matched the interpreter" is. The Rust
 # suite covers the VM/tree-walk half in a debug build; this script covers the
 # three non-bytecode backends plus the compiled C, which need a release binary
@@ -194,15 +210,30 @@ check_all_five "and/or return operands across all types" '
 (print (or nil nil 5))
 (print (or "a" "b"))
 (print (or nil (list 1 2)))
+(print (or nil nil))
+(print (or false nil))
+(print (or false false))
+(print (or nil false nil))
 '
 
-# A lone operand, both forms: the accumulator is seeded from that operand, so
-# this is where a bad seed shows up with no chain at all.
+# A lone operand, both forms. `or` is NOT the same as "hand the operand back":
+# with one operand the chain has no test to run, so `(or nil)` answers the
+# `false` identity while `(or 0)` answers `0` — 0 is TRUTHY (SYNTAX.md 1). The
+# operand's truthiness is a runtime property, so this is the case where a
+# transpiler has to emit an actual test rather than pick a branch at compile
+# time. It belongs on all five backends for the same reason the all-falsy chains
+# do: a target that answers `nil` here is wrong on a real expression.
 check_all_five "a single operand comes back unchanged" '
 (print (and 42))
 (print (or 42))
 (print (and "solo"))
 (print (or (list 1)))
+(print (and nil))
+(print (and false))
+(print (or nil))
+(print (or false))
+(print (or 0))
+(print (or ""))
 '
 
 # ---- short-circuiting must survive the rewrite ---------------------------
@@ -231,6 +262,15 @@ check_all_five "or stops at the first truthy operand" '
 # multi-statement `do` in expression position is a DOCUMENTED refusal on all
 # three transpilers (an inline two-statement lambda cannot be expressed), so
 # an inline `do` here would be testing the refusal, not the evaluation count.
+#
+# The `(or …)` rows below used to be kept out of this program: an all-falsy `or`
+# was the one shape where the transpilers disagreed with the interpreter, so
+# the gate asserted the interpreter's answer alone (the `want` block) and left
+# these three backends uncovered. With `or` returning its `false` identity they
+# belong here, and they are also the sharpest test of the count: the transpilers
+# emit each operand's text twice — once inside the `_truthy` test, once as the
+# value it yields — so a fold that repeats the text prints "A" twice where the
+# interpreter prints it once. A value-only assertion cannot see that; this can.
 check_all_five "an evaluated operand runs exactly once" '
 (def note (fn (s) (print s) s))
 (print (and 1 (note "ONCE")))
@@ -238,6 +278,10 @@ check_all_five "an evaluated operand runs exactly once" '
 (print (and 1 1 (note "ONCE")))
 (print (and false (note "DEAD")))
 (print (or true (note "DEAD")))
+(print (or (note "A") 1))
+(print (or nil (note "B")))
+(print (and (note "C") (or nil (note "D"))))
+(print (or nil (note "E") nil))
 '
 
 # The result must be a value the program can go on USING, not just print: a
