@@ -17,7 +17,10 @@ if [ -x "$BIN" ] && [ target/debug/ainl -nt "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { echo "building ainl..."; cargo build -q || exit 1; BIN=target/debug/ainl; }
 
-PROG=${1:-tests/byte_strings_parity.ainl}
+# The parity program is a *print* program, not a test file, so it lives in
+# fixtures/ rather than tests/ — `ainl test tests` sweeps that directory and
+# would count its output as suite noise.
+PROG=${1:-fixtures/byte_strings_parity.ainl}
 [ -f "$PROG" ] || { echo "no such program: $PROG" >&2; exit 1; }
 
 tmp=$(mktemp -d)
@@ -45,7 +48,12 @@ if command -v cc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
   ccbin=$(command -v cc >/dev/null 2>&1 && echo cc || echo clang)
   "$BIN" compile "$PROG" -o "$tmp/prog" --keep-c "$tmp/prog.c" >/dev/null || { echo "FAIL aot: compile"; fail=1; }
   if [ -f "$tmp/prog.c" ]; then
-    "$ccbin" -std=c11 -O1 -o "$tmp/prog.bin" "$tmp/prog.c" 2>"$tmp/cc.log" || {
+    # No -std flag, deliberately: the runtime uses strdup/lstat/nanosleep, which
+    # are POSIX rather than C11, and -std=c11 (which implies -std=__STRICT_ANSI__)
+    # hides their declarations — so the implicit-int return breaks the link on
+    # Linux while macOS's default keeps it working. This matches the flag set
+    # scripts/check-aot.sh and crates/ainl-cc/tests/aot_stdlib.rs already use.
+    "$ccbin" -O2 -o "$tmp/prog.bin" "$tmp/prog.c" 2>"$tmp/cc.log" || {
       echo "FAIL aot: cc"; sed 's/^/    /' "$tmp/cc.log"; fail=1; }
     if [ -x "$tmp/prog.bin" ]; then
       out=$("$tmp/prog.bin" 2>&1); rc=$?

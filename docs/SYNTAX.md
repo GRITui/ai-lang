@@ -926,9 +926,11 @@ half a surrogate pair. Ruby works on `s.bytes` (an Array of Integer) because a
 `String` slices by character; note that `s.b` looks equivalent and is not — it
 returns a binary-encoded **String**, so `b[i] & 0xC0` raises `NoMethodError`.
 
-`scripts/check-byte-strings.sh` runs `tests/byte_strings_parity.ainl` through all
+`scripts/check-byte-strings.sh` runs `fixtures/byte_strings_parity.ainl` through all
 five runners and diffs them against the interpreter, which is the normative
-implementation.
+implementation. (The parity program is a *print* program rather than a test
+file, so it lives in `fixtures/` — `ainl test` sweeps `tests/` and would count
+its output as suite noise.)
 
 ## 4. Canonical examples
 
