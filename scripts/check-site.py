@@ -50,12 +50,14 @@ assets = re.findall(r'(?:src|href)="(?!https?://|#)([^"]+)"', html)
 print("local assets  :", assets or "none — fully self-contained")
 
 # Headline numbers must match the README exactly (single source of truth).
-# "68" and "66" are both required, and both are honest: 68 is the prelude
-# size, 66 is the portable subset. Editing one without the other fails here,
-# which is the whole point of the check.
+# "74" and "67" are both required, and both are honest: 74 is the prelude
+# size, 67 is the portable subset (the other 7 are the 2 HTTP builtins every
+# backend refuses and the 5 `db-*` builtins the AOT C runtime carries but the
+# transpilers refuse). Editing one without the other fails here, which is the
+# whole point of the check.
 nums = ["20/20", "0/20", "10/10", "9/10", "47.3", "0.576", "30 969.0",
         "0.604", "35.4", "5.9", "2.25", "1.77", "1.27", "0.69", "51",
-        "+108%", "+64%", "+95%", "561", "68", "66"]
+        "+108%", "+64%", "+95%", "561", "74", "67"]
 missing = [n for n in nums if n not in html or n not in readme]
 print("numbers in both:", "all %d match" % len(nums) if not missing else f"MISSING {missing}")
 
