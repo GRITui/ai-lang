@@ -131,6 +131,11 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
 /// the three transpilers give (see `ainl-transpile`), so all four backends
 /// agree on which programs they can build.
 ///
+/// To compile a program that *does* import, use [`generate_program`]: it
+/// resolves the graph first and inlines it, so `import` never reaches codegen.
+/// [`generate`] remains the path for a single self-contained file, and is what
+/// the refusal tests drive.
+///
 /// # Error positions (a documented backend difference)
 ///
 /// The interpreter and the bytecode VM report `at line N, col M` and a
@@ -145,25 +150,72 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
 /// is exactly what `crates/ainl-cc/tests/aot_stdlib.rs` enforces, and the rule
 /// is documented for users in docs/SYNTAX.md §5a "Error messages".
 pub fn generate(forms: &[Node]) -> Result<String> {
+    generate_program(forms, None, None)
+}
+
+/// Compile a program, resolving and inlining its `import` graph.
+///
+/// `path` is the entry file (its directory is the base for relative
+/// specifiers) and `src` its text. Pass `None` for a program known to be
+/// self-contained; a program with an `import` and no path is refused, because
+/// there is no honest way to guess which directory its `"lib/x.ainl"` is
+/// relative to.
+///
+/// # Why inlining is the standalone guarantee, not a shortcut
+///
+/// A module's code is emitted into this one C file, which becomes the whole
+/// binary. Nothing reads a `.ainl` file at run time and nothing looks in
+/// `.ainl-vendor/`. That is the property `ainl pkg` is built to preserve, and
+/// it is also why the AOT backend can accept imports at all: there is no
+/// runtime load phase to add, because there is no runtime.
+///
+/// Two rules keep the flattened program equivalent to the interpreted one, and
+/// both are the loader's rules rather than new ones:
+///
+/// 1. **A module is emitted once per canonical path.** A diamond (`a` and `b`
+///    both import `c`) emits `c` a single time, exactly as the loader evaluates
+///    it a single time.
+/// 2. **A name may be bound once.** The loader *errors* when two modules
+///    export the same name into one file; codegen has no such error, so the
+///    check is made here, before anything is emitted, and names the collision.
+///    Without it, a duplicate `def` would silently shadow — the exact
+///    silent-wrong the loader's collision rule exists to prevent.
+pub fn generate_program(
+    forms: &[Node],
+    path: Option<&std::path::Path>,
+    src: Option<&str>,
+) -> Result<String> {
     // Lower the `map` / `filter` / `reduce` special forms before anything else
     // looks at the tree (see ainl_core::collection_forms). The interpreter and
     // the VM do the same, so all six backends compile the *same* loop rather
     // than each re-deriving it. Done before the interpreter-only scan so a
     // program that only used these forms is not misreported.
     let lowered = ainl_core::collection_forms::lower(forms)?;
-    let forms = &lowered[..];
-    if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
+    let mut forms = lowered;
+
+    // Resolve and inline the import graph, so the flattened tree is what
+    // codegen sees. A self-contained program skips this entirely.
+    if let Some(path) = path {
+        let src = src.unwrap_or_default();
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let graph = ainl_core::import::resolve_graph(&forms, src, dir)?;
+        check_collision_free(&graph)?;
+        forms = graph.flatten();
+    }
+
+    if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(&forms) {
         return Err(ainl_core::Error::runtime(format!(
             "ainl compile: `{sym}` is interpreter-only (found at byte {}) — \
-             this backend emits one standalone C program with no load phase, so it cannot \
-             resolve modules or carry an HTTP client without breaking the static-binary \
-             guarantee. Run the program with `ainl run` instead.",
-            at
+             this backend emits one standalone C program, so a program that needs {} at run \
+             time would either break the static-binary guarantee or silently do the wrong thing. \
+             (Modules are NOT in this category: they are resolved and inlined above, so \
+             `import` works here.) Run the program with `ainl run` instead.",
+            at, sym
         )));
     }
     let mut g = Gen::new();
     // Pass 1: collect top-level def names -> global slots.
-    for f in forms {
+    for f in &forms {
         g.collect_globals(f, false);
     }
     let n_globals = g.global_names.len();
@@ -173,7 +225,7 @@ pub fn generate(forms: &[Node]) -> Result<String> {
     g.emit(&format!("static Value g_top[{n_globals}];\n\n"));
     // Generate top-level code (goes into main) + collect fn bodies.
     let mut main_code = String::new();
-    for f in forms {
+    for f in &forms {
         main_code.push_str(&g.gen_toplevel(f));
     }
     // Forward declarations for all generated functions.
@@ -197,6 +249,35 @@ pub fn generate(forms: &[Node]) -> Result<String> {
     // main.
     g.emit_main(&main_code, n_globals);
     Ok(g.out)
+}
+
+/// Refuse a graph in which two modules export the same top-level name.
+///
+/// The interpreter's loader makes this an error rather than a shadowing rule
+/// (see `ainl_core::import`, "Collision rule: error, never shadowing"), and
+/// inlining would quietly drop that check: two `def`s of the same name become
+/// one global slot, and the second silently wins.
+///
+/// This walks the *same* name set the loader binds — each module's own
+/// top-level `def`s, not everything its scope happens to hold — so the two
+/// backends refuse the same programs for the same reason. A name defined twice
+/// *within one module* is not a cross-module collision and is left alone: the
+/// last `def` winning inside a single file is ordinary AINL.
+fn check_collision_free(graph: &ainl_core::import::Graph) -> Result<()> {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for m in &graph.modules {
+        for name in ainl_core::import::top_level_defs(&m.forms) {
+            if let Some(first) = seen.get(&name) {
+                return Err(ainl_core::Error::runtime(format!(
+                    "import: '{name}' is already defined (by {first}), so the inlined \
+                     program cannot define it again.\nImport one of them under a different \
+                     name, or rename one of the two definitions."
+                )));
+            }
+            seen.insert(name.clone(), format!("{}", m.path.display()));
+        }
+    }
+    Ok(())
 }
 
 struct Gen {

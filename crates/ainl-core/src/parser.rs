@@ -10,7 +10,12 @@ use crate::error::{Error, Result};
 use crate::lexer::Tok;
 
 /// Byte span `[start, end)` into the original source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is the "no position" span, used by forms a backend *synthesizes*
+/// rather than parses — an import alias re-expressed as a `def` has no bytes
+/// in any file, and inventing a plausible offset would only make an error
+/// message point at an unrelated line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
