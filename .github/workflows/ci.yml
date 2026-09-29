@@ -190,6 +190,44 @@ jobs:
       - name: Documented if behavior + 5-backend parity
         run: ./scripts/check-if-parity.sh
 
+  and-or-parity:
+    name: and/or (return an operand, not a boolean; 5-backend parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: and-or-parity-${{ hashFiles('Cargo.lock') }}
+          restore-keys: and-or-parity-
+
+      - name: Install Python, Node and Ruby
+        # `and`/`or` return an OPERAND, not a boolean, and nothing pinned that
+        # until this job. The AOT emitter seeded its accumulator with
+        # `v_bool(1)` and overwrote it only on the short-circuit path, so an
+        # all-truthy chain returned the seed: `(and 1 2 3)` printed `true` under
+        # AOT C while all four other backends printed `3`. The collections gate
+        # could not see it because every `and`/`or` there was a bare boolean
+        # guard, where "returns a boolean" and "returns the operand" are
+        # indistinguishable — so every program below uses NON-boolean operands
+        # and prints the result, making the return value the thing under test.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      - name: and/or returns operands + 5-backend parity
+        run: ./scripts/check-and-or-parity.sh
+
   try-catch:
     name: try/catch (4-backend parity on the error path)
     runs-on: ubuntu-latest
