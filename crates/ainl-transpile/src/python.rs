@@ -1173,9 +1173,14 @@ const RUNTIME: &[(&str, &str)] = &[
         "_disp",
         "def _disp(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    if x is True: return 'true'\n    if x is False: return 'false'\n    if x is None: return 'nil'\n    if isinstance(x, _Hash): return '{' + ' '.join(_repr(p[0]) + ' ' + _repr(p[1]) for p in x) + '}'\n    if isinstance(x, list): return '(' + ' '.join(_repr(e) for e in x) + ')'\n    if isinstance(x, float): return ('%.1f' % x) if x.is_integer() else repr(x)\n    return str(x)",
     ),
+    // A string is rendered INSIDE double quotes, so a quote in the string's own
+    // content has to come back out escaped or the rendering is ambiguous: the
+    // interpreter (Rust's `{:?}`) and the C runtime's `value_repr` both escape
+    // `"`/`\`/newline/tab/CR, and this used to emit none of them. Backslash goes
+    // first, or the escapes the later passes introduce are escaped again.
     (
         "_repr",
-        "def _repr(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    return '\"' + x + '\"' if isinstance(x, str) else _disp(x)",
+        "def _repr(x):\n    if isinstance(x, _Sym): return str.__str__(x)\n    # Escapes in the same order as the C runtime's value_repr: backslash first.\n    if isinstance(x, str): return '\"' + x.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"').replace('\\n', '\\\\n').replace('\\t', '\\\\t').replace('\\r', '\\\\r') + '\"'\n    return _disp(x)",
     ),
     (
         "_eq",

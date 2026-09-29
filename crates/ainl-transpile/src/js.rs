@@ -1057,9 +1057,18 @@ const RUNTIME: &[(&str, &str)] = &[
         "_disp",
         "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (x instanceof _Hash) return \"{\" + x.map(p => _repr(p[0]) + \" \" + _repr(p[1])).join(\" \") + \"}\";\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
     ),
+    // A string is rendered INSIDE double quotes, so a quote in the string's own
+    // content has to come back out escaped or the rendering is ambiguous: the
+    // interpreter (Rust's `{:?}`) and the C runtime's `value_repr` both escape
+    // `"`/`\`/newline/tab/CR, and this used to emit none of them. Backslash goes
+    // first, or the escapes the later passes introduce are escaped again.
+    //
+    // A global regex per character rather than one pass, because each pass
+    // only rewrites the ORIGINAL occurrence: a `\` produced by the quote pass
+    // must not be re-escaped by a later one, and vice versa.
     (
         "_repr",
-        "function _repr(x) {\n  return typeof x === \"string\" ? '\"' + x + '\"' : _disp(x);\n}",
+        "function _repr(x) {\n  if (typeof x !== \"string\") return _disp(x);\n  // Escapes in the same order as the C runtime's value_repr: backslash first.\n  return '\"' + x.replace(/\\\\/g, \"\\\\\\\\\").replace(/\"/g, '\\\\\"').replace(/\\n/g, \"\\\\n\").replace(/\\t/g, \"\\\\t\").replace(/\\r/g, \"\\\\r\") + '\"';\n}",
     ),
     (
         "_eq",

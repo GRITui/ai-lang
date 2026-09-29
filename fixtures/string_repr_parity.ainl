@@ -1,0 +1,83 @@
+; String rendering on all five runners: a quote or a backslash INSIDE a string has
+; to come back out escaped, or the rendering is ambiguous.
+;
+; The interpreter is the reference (Rust's `{:?}` for a string) and the C runtime's
+; `value_repr` is the hand-port of it; both escape the same five characters:
+; `"` -> `\"`, `\` -> `\\`, newline -> `\n`, tab -> `\t`, CR -> `\r`. The three
+; transpiler `_repr` helpers used to wrap the string in quotes and nothing else,
+; so `(str (list "a\"b"))` printed ("a"b") on python/js/ruby and ("a\"b") on
+; every other backend. Nothing caught it because no example or fixture put a
+; quote or a backslash inside a container.
+;
+; Both halves matter, so both are here: a container element (which goes through
+; _repr) and a BARE string (which goes through _disp and must stay unquoted — a
+; fix that escaped in _disp would double-escape this and is caught too).
+;
+; The escaping ORDER is the load-bearing detail. A backslash has to be escaped
+; first, or the backslashes the later passes introduce get escaped a second
+; time: the "literal backslash-n" case at the end is exactly that, and it is the
+; one a fix that escapes quote-first gets wrong.
+
+; ---- the card's repro, plus its neighbours ------------------------------
+(print (str (list "a\"b")))
+(print (str (list "a\\b")))
+(print (str (list "a\nb")))
+(print (str (list "a\tb")))
+(print (str (list "a\rb")))
+
+; A quote at either end, and several in a row.
+(print (str (list "\"start")))
+(print (str (list "end\"")))
+(print (str (list "q\"q\"q")))
+
+; Each escapable character on its own, so one wrong pass cannot hide behind
+; another: the rendering of a lone backslash is "\\\\" and of a lone quote "\\\"".
+(print (str (list "\\")))
+(print (str (list "\"")))
+
+; Nothing to escape, and the empty string, which must not gain a stray one.
+(print (str (list "plain")))
+(print (str (list "")))
+
+; Several in one container, so the per-element escaping composes.
+(print (str (list "a\"b" "c\\d" "e\nf")))
+
+; Nested: a list inside a list escapes the same way.
+(print (str (list (list "x\"y") (list "p\\q"))))
+
+; A hash renders keys and values through the same helper.
+(print (str (hash "k\"" "v\"")))
+(print (str (hash "a\\b" 1)))
+
+; ---- the other half: _disp must NOT quote or escape ---------------------
+; A bare string printed on its own is display, not repr. If a fix escaped in
+; the wrong helper this line would print ("a\\"b") instead of (a"b).
+(def s "raw\"quote")
+(print s)
+(print (str s))
+
+; The VALUE is untouched by the rendering: len is 9, not 15, so the escape is a
+; property of how the string is printed and not of what it holds.
+(print (len s))
+
+; Concatenated, compared and re-listed, so the escaped rendering is not the
+; only thing being checked — the string still behaves like a string.
+(print (str (str s "!")))
+(print (= s "raw\"quote"))
+(print (str (list s s)))
+
+; Non-string elements are unaffected, and still render unquoted.
+(print (str (list nil true 0 1.5 "s")))
+
+; ---- escaping ORDER, pinned by its worst case ---------------------------
+; These three strings contain a LITERAL backslash followed by a character that
+; is itself escapable. Escaping backslash-first gives exactly two backslashes
+; per literal backslash; escaping anything else first would turn each of these
+; into three. This is the assertion that fails on a quote-first fix.
+(print (str (list "\\n")))
+(print (str (list "\\t")))
+(print (str (list "\\\"")))
+(print (str (list "\\\"" "\\n" "\n")))
+
+; An escaped string is still a string afterwards.
+(print (str (str s)))
