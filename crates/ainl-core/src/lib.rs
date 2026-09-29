@@ -10,6 +10,7 @@ pub mod collection_forms;
 pub mod collections;
 pub mod db;
 pub mod dbkv;
+pub mod dbtab;
 pub mod deserialize;
 pub mod error;
 pub mod eval;

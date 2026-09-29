@@ -160,6 +160,13 @@ enum {
    * that one name rather than getting a second id, which is exactly what makes
    * `db-set`/`db-get` a round-tripping pair in a compiled binary. */
   B_DB_SET, B_DB_GET_RAW, B_DB_DEL, B_DB_KEYS, B_DB_COUNT,
+  /* Tier 4 table layer. Appended in the same order as BUILTIN_IDS in
+   * ainl-cc/src/lib.rs, which is the only thing that has to agree: a builtin id
+   * is a position in this enum, so adding one name in one place and not the
+   * other would silently renumber every id after it and break every compiled
+   * binary. The table layer rebinds no existing name, so unlike the value layer
+   * there is no ordering constraint to reason about. */
+  B_DB_CREATE_TABLE, B_DB_INSERT, B_DB_SELECT, B_DB_DELETE_ROW, B_DB_ALL_ROWS,
   B_COUNT
 };
 
@@ -2861,10 +2868,20 @@ struct DbEntry {
 };
 
 typedef struct Db Db;
+/* Defined in the table-layer block further down, before it is first used. The
+ * forward declaration is what lets `struct Db` own a table set: a handle and its
+ * index then have exactly one lifetime, and `db_close_raw` cannot forget to free
+ * one without also forgetting the other. */
+struct DbtSet;
+
 struct Db {
   char *path;  /* owned; only for error messages */
   FILE *f;     /* positioned at the end, ready to append */
   DbEntry *buckets[DB_BUCKETS];
+  /* The table set, or NULL until a table builtin is first called on this
+   * handle. Built lazily so a program that only ever calls `db-set` never pays
+   * for a tree, and so the cost is paid once per handle rather than per open. */
+  struct DbtSet *tables;
   int nkeys; /* records indexed, not distinct keys: an overwritten key counts
              * twice. Nothing reads it yet, but it is the number a future
              * compaction would need and it costs one int. */
@@ -2932,9 +2949,21 @@ static void db_entry_free(Db *db) {
   db->nkeys = 0;
 }
 
+/* Defined in the table-layer block below, which is *after* this point in the
+ * file. Declared here because `db_close_raw` — the single teardown path for a
+ * handle — has to free the table set, so the declaration has to precede it. The
+ * tag form (`struct DbtSet *`) is what makes that legal before the typedef
+ * exists. */
+static void dbt_set_free(struct DbtSet *s);
+
 static void db_close_raw(Db *db) {
   if (!db)
     return;
+  /* The table set hangs off the handle, so it is freed here rather than in
+   * `db-close`: one teardown path means a close cannot leak a tree, and a
+   * failed open cannot leave one behind either. `dbt_set_free` tolerates NULL. */
+  if (db->tables)
+    dbt_set_free(db->tables);
   db_entry_free(db);
   if (db->f)
     fclose(db->f);
@@ -3619,6 +3648,1010 @@ static Value builtin_db_count(Value *args, int nargs) {
   return v_int(n);
 }
 
+/* ---- Tier 4 table layer ------------------------------------------------- *
+ *
+ * A hand-port of ainl-core/src/dbtab.rs, and the rules are the same as for the
+ * `db_*` and `dbkv` blocks above: this is an *independent* implementation on top
+ * of the same on-disk format, not a binding to the Rust one. There is no FFI
+ * anywhere in this project, so "the engine is shared" is true for the
+ * interpreter and the VM and is a second implementation here. Read this block
+ * side by side with dbtab.rs; the comments here are only about what C forces.
+ *
+ * ## What is hand-ported, and what is not
+ *
+ * The B-tree (`dbt_*`, below) is ported in full, because it cannot be borrowed:
+ * there is no FFI, and the alternative — a flat scan — would make the compiled
+ * binary's lookup cost different in *kind* from the interpreter's, which is the
+ * one thing this card exists to prevent. So insert, lookup, delete and the
+ * in-order walk are all here, in that order, with the same minimum-fill repair
+ * and the same median rule.
+ *
+ * What is *not* re-derived is the row encoding: the length-prefixed key
+ * (`@t:<len>:<name><key-json>`), the JSON text of a row, and the tombstone all
+ * come from the same three places the other layers use — `db_append` writes the
+ * record, `builtin_json_serialize` produces the row text, and
+ * `AINL_DB_TOMBSTONE` is the delete marker. Sharing those is deliberate: a
+ * format invented here and a format invented in Rust would be two formats, and
+ * the whole point of this layer is that one file works on both engines.
+ *
+ * ## The one place C is genuinely harder: ownership
+ *
+ * The Rust tree is `Vec<String>` and drops it for free. Here every key and value
+ * is a malloc'd `char *` and every node is malloc'd too, so each of the split,
+ * merge and borrow paths below has to say what it hands over and what it takes.
+ * The rule used throughout: **a function that takes a node out of its parent
+ * owns it**, and every node that is not owned by the tree is freed by exactly
+ * one path. `dbt_node_free` is the single place that walks a node, so a leak or
+ * a double free is a bug in one function rather than spread across the port.
+ *
+ * ## The invariant the port must not break
+ *
+ * Every non-root node holds between DBT_MIN_KEYS and DBT_MAX_KEYS keys, and all
+ * leaves are at one depth. `crates/ainl-cc/tests/dbtab_aot.rs` runs the *same*
+ * operation sequence as the Rust unit tests and asserts the same results, which
+ * is what makes "the port is a port" a checked claim rather than a reviewer's
+ * opinion. It is the strongest test in the file: the two implementations share
+ * no code, so agreement is evidence.
+ */
+
+#define DBT_MAX_KEYS 15
+#define DBT_MIN_KEYS 7
+
+/* Marks a log key as a table row. Must equal ROW_PREFIX in dbtab.rs. */
+#define DBT_ROW_PREFIX "@t:"
+
+/* The empty primary key, which no user row can have because a row's key is
+ * always at least two bytes of JSON. Must equal TABLE_MARKER_KEY. */
+#define DBT_MARKER_KEY ""
+
+typedef struct DbtNode DbtNode;
+struct DbtNode {
+  char **keys;
+  char **vals;
+  DbtNode **kids;
+  int nkeys;
+  int nkids;
+};
+
+/* A whole table: the tree, plus a count so `len` is O(1). */
+typedef struct DbtTree DbtTree;
+struct DbtTree {
+  DbtNode *root;
+  size_t count;
+};
+
+static void dbt_node_free(DbtNode *n) {
+  if (!n)
+    return;
+  for (int i = 0; i < n->nkeys; i++) {
+    free(n->keys[i]);
+    free(n->vals[i]);
+  }
+  for (int i = 0; i < n->nkids; i++)
+    dbt_node_free(n->kids[i]);
+  free(n->keys);
+  free(n->vals);
+  free(n->kids);
+  free(n);
+}
+
+static DbtNode *dbt_node_new(void) {
+  DbtNode *n = calloc(1, sizeof(DbtNode));
+  if (!n)
+    set_err("db: out of memory");
+  return n;
+}
+
+/* Append one key (taking ownership of `k`) and its value to a node.
+ *
+ * `k` and `v` are both owned by the node once this returns, including on
+ * failure — so every caller can free its own reference immediately and there is
+ * no path where a key leaks because a later allocation failed. */
+static void dbt_node_push(DbtNode *n, char *k, char *v) {
+  char **nk = realloc(n->keys, sizeof(char *) * (size_t)(n->nkeys + 1));
+  char **nv = realloc(n->vals, sizeof(char *) * (size_t)(n->nkeys + 1));
+  DbtNode **nc = realloc(n->kids, sizeof(DbtNode *) * (size_t)(n->nkids + 1));
+  if (!nk || !nv || !nc) {
+    /* Out of memory mid-insert. The caller unwinds by dropping the whole tree,
+     * and the keys pushed so far are already reachable from `n`, so freeing
+     * this node is enough — which is why they are stored before the failure is
+     * reported. */
+    set_err("db: out of memory");
+    return;
+  }
+  n->keys = nk;
+  n->vals = nv;
+  n->kids = nc;
+  n->keys[n->nkeys] = k;
+  n->vals[n->nkeys] = v;
+  n->nkeys++;
+  n->nkids++;
+}
+
+/* Insert a child at index `i`, taking ownership of `kid`. Keeps the invariant
+ * that there is one more child than key once the key is added. */
+static void dbt_node_insert_kid(DbtNode *n, int i, DbtNode *kid) {
+  DbtNode **nc = realloc(n->kids, sizeof(DbtNode *) * (size_t)(n->nkids + 1));
+  if (!nc) {
+    set_err("db: out of memory");
+    return;
+  }
+  n->kids = nc;
+  for (int k = n->nkids; k > i; k--)
+    n->kids[k] = n->kids[k - 1];
+  n->kids[i] = kid;
+  n->nkids++;
+}
+
+static int dbt_is_leaf(const DbtNode *n) { return n->nkids == 0; }
+
+/* Where `key` would go: the number of keys strictly smaller than it, by
+ * memcmp. Must match `Node::search` in btree.rs — this comparator is the whole
+ * reason `db-all-rows` agrees across engines. */
+static int dbt_search(const DbtNode *n, const char *key) {
+  int lo = 0, hi = n->nkeys;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    size_t la = strlen(n->keys[mid]), lb = strlen(key);
+    int c = memcmp(n->keys[mid], key, la < lb ? la : lb);
+    if (c == 0)
+      c = la < lb ? -1 : (la > lb ? 1 : 0);
+    if (c < 0)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
+/* Split an overfull node. The median goes back through `*out_key`/`*out_val`
+ * (both owned by the caller) and the new sibling is returned. A leaf hands over
+ * no children, which is the case that makes this different from an interior
+ * node and the one the first version of this port got wrong. */
+static DbtNode *dbt_split(DbtNode *n, char **out_key, char **out_val) {
+  int mid = n->nkeys / 2;
+  *out_key = n->keys[mid];
+  *out_val = n->vals[mid];
+  DbtNode *right = dbt_node_new();
+  if (!right)
+    return NULL;
+  /* Right half: keys mid+1..end, and children mid+1..end (or none for a leaf). */
+  int rkeys = n->nkeys - (mid + 1);
+  right->keys = malloc(sizeof(char *) * (size_t)(rkeys > 0 ? rkeys : 1));
+  right->vals = malloc(sizeof(char *) * (size_t)(rkeys > 0 ? rkeys : 1));
+  if (!right->keys || !right->vals) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  for (int i = 0; i < rkeys; i++) {
+    right->keys[i] = n->keys[mid + 1 + i];
+    right->vals[i] = n->vals[mid + 1 + i];
+  }
+  right->nkeys = rkeys;
+  int rkids = dbt_is_leaf(n) ? 0 : n->nkids - (mid + 1);
+  if (rkids > 0) {
+    right->kids = malloc(sizeof(DbtNode *) * (size_t)rkids);
+    if (!right->kids) {
+      set_err("db: out of memory");
+      return NULL;
+    }
+    for (int i = 0; i < rkids; i++)
+      right->kids[i] = n->kids[mid + 1 + i];
+  }
+  right->nkids = rkids;
+  /* Left half keeps keys 0..mid-1 and children 0..mid (mid+1 of them). */
+  n->nkeys = mid;
+  n->nkids = dbt_is_leaf(n) ? 0 : mid + 1;
+  return right;
+}
+
+/* Remove index `i` from a node, freeing the key and the value. */
+static void dbt_remove_at(DbtNode *n, int i) {
+  free(n->keys[i]);
+  free(n->vals[i]);
+  for (int s = i; s < n->nkeys - 1; s++) {
+    n->keys[s] = n->keys[s + 1];
+    n->vals[s] = n->vals[s + 1];
+  }
+  n->nkeys--;
+}
+
+/* Insert at index `i`, taking ownership of both strings.
+ *
+ * The realloc comes *before* the shift, always. Growing after the shift writes
+ * one element past the end of a full array, and the two places that do this
+ * (here, and the leaf path of `dbt_insert_into`) have to agree — or the bug
+ * comes back in whichever copy someone edits. */
+static void dbt_insert_at(DbtNode *n, int i, char *k, char *v) {
+  char **nk = realloc(n->keys, sizeof(char *) * (size_t)(n->nkeys + 1));
+  char **nv = realloc(n->vals, sizeof(char *) * (size_t)(n->nkeys + 1));
+  if (!nk || !nv) {
+    set_err("db: out of memory");
+    return;
+  }
+  n->keys = nk;
+  n->vals = nv;
+  for (int s = n->nkeys; s > i; s--) {
+    n->keys[s] = n->keys[s - 1];
+    n->vals[s] = n->vals[s - 1];
+  }
+  n->keys[i] = k;
+  n->vals[i] = v;
+  n->nkeys++;
+}
+
+/* Remove and return the child at `i`; the caller owns it. */
+static DbtNode *dbt_node_take_kid(DbtNode *n, int i) {
+  DbtNode *kid = n->kids[i];
+  for (int k = i; k < n->nkids - 1; k++)
+    n->kids[k] = n->kids[k + 1];
+  n->nkids--;
+  return kid;
+}
+
+/* Insert into the subtree at `n`, promoting through `parent` if it overflows.
+ * `*up_key`/`*up_val` and the returned sibling are owned by the caller.
+ *
+ * Repairing on the way *up* after a delete is what makes the delete correct; the
+ * insert is symmetric and simpler, and the shared shape is deliberate. */
+static DbtNode *dbt_insert_into(Db *db, DbtNode *n, const char *key, const char *val,
+                                char **up_key, char **up_val) {
+  int i = dbt_search(n, key);
+  if (i < n->nkeys && strcmp(n->keys[i], key) == 0) {
+    /* Already present: replace. A tree that kept both copies would have two
+     * answers for one key and a lookup would return only one of them. */
+    free(n->vals[i]);
+    n->vals[i] = strdup(val);
+    return NULL;
+  }
+  if (dbt_is_leaf(n)) {
+    /* Insert at `i`, taking copies so the caller's strings are untouched.
+     *
+     * `dbt_insert_at` reallocates *before* it shifts. That order is not
+     * incidental: the first version of this port shifted first and reallocated
+     * after, which wrote one element past the end of a full array — a heap
+     * overflow that stayed silent on a 3-key table and crashed on the next
+     * insert into a full leaf. `dbt_insert_at` exists so that order is written
+     * once, here, and the interior path below uses it too. */
+    char *k = strdup(key), *v = strdup(val);
+    if (!k || !v) {
+      free(k);
+      free(v);
+      set_err("db: out of memory");
+      return NULL;
+    }
+    dbt_insert_at(n, i, k, v);
+    if (g_err)
+      return NULL;
+  } else {
+    char *ck = NULL, *cv = NULL;
+    DbtNode *right = dbt_insert_into(db, n->kids[i], key, val, &ck, &cv);
+    if (!right)
+      return NULL;
+    /* The child grew a sibling, so this node gains a key and a child. */
+    char *k2 = strdup(ck), *v2 = strdup(cv);
+    if (!k2 || !v2) {
+      free(k2);
+      free(v2);
+      set_err("db: out of memory");
+      return NULL;
+    }
+    for (int s = n->nkeys; s > i; s--) {
+      n->keys[s] = n->keys[s - 1];
+      n->vals[s] = n->vals[s - 1];
+    }
+    char **nk = realloc(n->keys, sizeof(char *) * (size_t)(n->nkeys + 1));
+    char **nv = realloc(n->vals, sizeof(char *) * (size_t)(n->nkeys + 1));
+    if (!nk || !nv) {
+      set_err("db: out of memory");
+      return NULL;
+    }
+    n->keys = nk;
+    n->vals = nv;
+    n->keys[i] = k2;
+    n->vals[i] = v2;
+    n->nkeys++;
+    dbt_node_insert_kid(n, i + 1, right);
+  }
+  if (n->nkeys > DBT_MAX_KEYS) {
+    char *pk = NULL, *pv = NULL;
+    DbtNode *right = dbt_split(n, &pk, &pv);
+    if (!right)
+      return NULL;
+    *up_key = pk;
+    *up_val = pv;
+    return right;
+  }
+  return NULL;
+}
+
+/* The value for `key`, or NULL. The stored pointer belongs to the tree and is
+ * valid until the next insert or remove on it. */
+static const char *dbt_get(const DbtNode *n, const char *key) {
+  for (const DbtNode *cur = n; cur; cur = NULL) {
+    int i = dbt_search(cur, key);
+    if (i < cur->nkeys && strcmp(cur->keys[i], key) == 0)
+      return cur->vals[i];
+    if (dbt_is_leaf(cur))
+      return NULL;
+    cur = cur->kids[i];
+  }
+  return NULL;
+}
+
+
+/* The largest key in a subtree: the in-order predecessor of the next key. */
+static char *dbt_rightmost_key(DbtNode *n, char **out_val) {
+  DbtNode *cur = n;
+  while (!dbt_is_leaf(cur))
+    cur = cur->kids[cur->nkids - 1];
+  *out_val = strdup(cur->vals[cur->nkeys - 1]);
+  return strdup(cur->keys[cur->nkeys - 1]);
+}
+
+/* Borrow the separator down into the underfull child at `ci` and a sibling key
+ * up into this node, from the left sibling. A leaf sibling lends no child. */
+static void dbt_borrow_from_left(DbtNode *n, int ci) {
+  char *sep = n->keys[ci - 1];
+  char *sep_val = n->vals[ci - 1];
+  DbtNode *left = n->kids[ci - 1];
+  char *up = left->keys[left->nkeys - 1];
+  char *up_val = left->vals[left->nkeys - 1];
+  left->nkeys--;
+  DbtNode *moved = NULL;
+  if (!dbt_is_leaf(left))
+    moved = dbt_node_take_kid(left, left->nkids - 1);
+  n->keys[ci - 1] = up;
+  n->vals[ci - 1] = up_val;
+  DbtNode *child = n->kids[ci];
+  dbt_insert_at(child, 0, sep, sep_val);
+  if (moved)
+    dbt_node_insert_kid(child, 0, moved);
+}
+
+/* The mirror: the separator `keys[ci]` descends, the right sibling's smallest
+ * key rises. */
+static void dbt_borrow_from_right(DbtNode *n, int ci) {
+  char *sep = n->keys[ci];
+  char *sep_val = n->vals[ci];
+  DbtNode *right = n->kids[ci + 1];
+  char *up = right->keys[0];
+  char *up_val = right->vals[0];
+  dbt_remove_at(right, 0);
+  DbtNode *moved = NULL;
+  if (!dbt_is_leaf(right))
+    moved = dbt_node_take_kid(right, 0);
+  n->keys[ci] = up;
+  n->vals[ci] = up_val;
+  DbtNode *child = n->kids[ci];
+  dbt_node_push(child, sep, sep_val);
+  if (moved)
+    dbt_node_insert_kid(child, child->nkids - 1, moved);
+}
+
+/* Merge the child at `left_ci + 1` into the one at `left_ci`. The right child
+ * is consumed. */
+static void dbt_merge(DbtNode *n, int left_ci) {
+  char *sep = n->keys[left_ci];
+  char *sep_val = n->vals[left_ci];
+  DbtNode *right = dbt_node_take_kid(n, left_ci + 1);
+  dbt_remove_at(n, left_ci);
+  DbtNode *left = n->kids[left_ci];
+  dbt_node_push(left, sep, sep_val);
+  for (int i = 0; i < right->nkeys; i++) {
+    char *k = right->keys[i], *v = right->vals[i];
+    right->keys[i] = NULL;
+    right->vals[i] = NULL;
+    dbt_node_push(left, k, v);
+  }
+  for (int i = 0; i < right->nkids; i++) {
+    DbtNode *kid = right->kids[i];
+    right->kids[i] = NULL;
+    dbt_node_insert_kid(left, left->nkids - 1, kid);
+  }
+  free(right->keys);
+  free(right->vals);
+  free(right->kids);
+  free(right);
+}
+
+/* Refill the underfull child at `ci`. Returns the index of the child that now
+ * holds what the underfull one held. */
+static int dbt_fix_child(DbtNode *n, int ci) {
+  if (n->nkids < 2)
+    return ci; /* the root's single child: the root is exempt from the minimum */
+  if (ci > 0 && n->kids[ci - 1]->nkeys > DBT_MIN_KEYS) {
+    dbt_borrow_from_left(n, ci);
+    return ci;
+  }
+  if (ci + 1 < n->nkids && n->kids[ci + 1]->nkeys > DBT_MIN_KEYS) {
+    dbt_borrow_from_right(n, ci);
+    return ci;
+  }
+  if (ci > 0) {
+    dbt_merge(n, ci - 1);
+    return ci - 1;
+  }
+  dbt_merge(n, 0);
+  return 0;
+}
+
+/* Delete `key` from the subtree at `n`, repairing on the way back up. The node
+ * is known to contain the key. */
+static void dbt_delete_from(DbtNode *n, const char *key) {
+  int i = dbt_search(n, key);
+  if (dbt_is_leaf(n)) {
+    dbt_remove_at(n, i);
+    return;
+  }
+  if (i < n->nkeys && strcmp(n->keys[i], key) == 0) {
+    /* An interior key: replace it with its in-order predecessor, then delete
+     * that from the left child, which is a leaf-side delete and so simple. */
+    char *pred_val = NULL;
+    char *pred = dbt_rightmost_key(n->kids[i], &pred_val);
+    free(n->keys[i]);
+    free(n->vals[i]);
+    n->keys[i] = pred;
+    n->vals[i] = pred_val;
+    dbt_delete_from(n->kids[i], pred);
+  } else {
+    dbt_delete_from(n->kids[i], key);
+  }
+  if (n->kids[i]->nkeys < DBT_MIN_KEYS)
+    dbt_fix_child(n, i);
+}
+
+static DbtTree *dbt_new(void) {
+  DbtTree *t = calloc(1, sizeof(DbtTree));
+  if (!t) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  t->root = dbt_node_new();
+  if (!t->root) {
+    free(t);
+    return NULL;
+  }
+  t->count = 0;
+  return t;
+}
+
+static void dbt_free(DbtTree *t) {
+  if (!t)
+    return;
+  dbt_node_free(t->root);
+  free(t);
+}
+
+/* Insert, or replace if the key is there. Returns 1 if the key was new. */
+static int dbt_insert(DbtTree *t, const char *key, const char *val) {
+  if (dbt_get(t->root, key)) {
+    /* Replace in place, which cannot overflow a node. */
+    int i = dbt_search(t->root, key);
+    DbtNode *cur = t->root;
+    while (1) {
+      i = dbt_search(cur, key);
+      if (i < cur->nkeys && strcmp(cur->keys[i], key) == 0) {
+        free(cur->vals[i]);
+        cur->vals[i] = strdup(val);
+        return 0;
+      }
+      if (dbt_is_leaf(cur))
+        break;
+      cur = cur->kids[i];
+    }
+    return 0;
+  }
+  char *up_key = NULL, *up_val = NULL;
+  DbtNode *right = dbt_insert_into(NULL, t->root, key, val, &up_key, &up_val);
+  if (!right)
+    return 1;
+  DbtNode *new_root = dbt_node_new();
+  if (!new_root)
+    return 1;
+  new_root->keys = malloc(sizeof(char *));
+  new_root->vals = malloc(sizeof(char *));
+  new_root->kids = malloc(sizeof(DbtNode *) * 2);
+  if (!new_root->keys || !new_root->vals || !new_root->kids) {
+    set_err("db: out of memory");
+    return 1;
+  }
+  new_root->keys[0] = up_key;
+  new_root->vals[0] = up_val;
+  new_root->nkeys = 1;
+  DbtNode *old = t->root;
+  new_root->kids[0] = old;
+  new_root->kids[1] = right;
+  new_root->nkids = 2;
+  t->root = new_root;
+  t->count++;
+  return 1;
+}
+
+/* Remove `key`. Returns 1 if it was there. */
+static int dbt_remove(DbtTree *t, const char *key) {
+  if (!dbt_get(t->root, key))
+    return 0;
+  dbt_delete_from(t->root, key);
+  /* The root lost its only key: the child becomes the new root, so the tree
+   * loses a level instead of keeping an underfull one. */
+  if (t->root->nkeys == 0 && t->root->nkids == 1) {
+    DbtNode *child = dbt_node_take_kid(t->root, 0);
+    dbt_node_free(t->root);
+    t->root = child;
+  }
+  t->count--;
+  return 1;
+}
+
+/* How many levels; a single leaf is 1. */
+static int dbt_height(const DbtTree *t) {
+  int h = 1;
+  for (const DbtNode *n = t->root; n && !dbt_is_leaf(n); n = n->kids[0])
+    h++;
+  return h;
+}
+
+/* Walk the tree in key order, calling `fn` per pair. The callback returns 0 to
+ * stop. Used by `db-all-rows` and by the tests. */
+static void dbt_walk(const DbtNode *n,
+                     void (*fn)(const char *, const char *, void *), void *ctx) {
+  for (int i = 0; i < n->nkeys; i++) {
+    if (i < n->nkids)
+      dbt_walk(n->kids[i], fn, ctx);
+    fn(n->keys[i], n->vals[i], ctx);
+  }
+  if (n->nkids > n->nkeys)
+    dbt_walk(n->kids[n->nkids - 1], fn, ctx);
+}
+
+/* ---- the log key encoding ----------------------------------------------- */
+
+/* "@t:<len>:<name><key-json>" — length-prefixed so no table name or key can
+ * make two pairs encode alike. Must equal `row_key` in dbtab.rs, including the
+ * length being the name's **byte** length. */
+static char *dbt_row_key(const char *table, const char *key_json) {
+  size_t tl = strlen(table), kl = strlen(key_json);
+  char *out = malloc(tl + kl + 32);
+  if (!out) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  snprintf(out, tl + kl + 32, "%s%zu:%s%s", DBT_ROW_PREFIX, tl, table, key_json);
+  return out;
+}
+
+/* The table a log key belongs to, or NULL if it is not a row key.
+ *
+ * The caller owns the returned string. Only the table name is needed: the
+ * primary key is the rest, and every operation re-derives it from the value it
+ * is given rather than reading it back out of the log key. */
+static char *dbt_row_table(const char *logkey) {
+  size_t pl = strlen(DBT_ROW_PREFIX);
+  if (strncmp(logkey, DBT_ROW_PREFIX, pl) != 0)
+    return NULL;
+  const char *rest = logkey + pl;
+  const char *colon = strchr(rest, ':');
+  if (!colon || colon == rest)
+    return NULL;
+  /* Parse the length, then copy exactly that many bytes. A length that runs
+   * past the end, or that would cut a multi-byte character, yields NULL rather
+   * than a truncated name — the same refusal dbtab.rs's `get(..len)` gives. */
+  char *endp = NULL;
+  unsigned long len = strtoul(rest, &endp, 10);
+  if (!endp || *endp != ':')
+    return NULL;
+  const char *name = colon + 1;
+  size_t avail = strlen(name);
+  if (len > avail)
+    return NULL;
+  char *out = malloc(len + 1);
+  if (!out) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  memcpy(out, name, len);
+  out[len] = 0;
+  return out;
+}
+
+/* ---- per-database table sets -------------------------------------------- */
+
+/* One table, by name. A fixed-size slot array rather than a linked list, for
+ * the same reason the handle table is: a linked list would need a comparison
+ * per lookup, and the number of tables a program creates is small and known at
+ * the point it creates them. 64 is a guess, and a generous one — but a fixed
+ * table means a bounded, predictable memory cost per open database, which is
+ * the property that keeps the "no allocator accounting" promise. */
+#define DBT_MAX_TABLES 64
+
+typedef struct DbtTable DbtTable;
+struct DbtTable {
+  char *name;
+  DbtTree *tree;
+};
+
+/* The table set for one open database, held on the Db itself so it has exactly
+ * the same lifetime as the handle. Built lazily, like the Rust one: a program
+ * that only ever calls `db-set` never allocates a tree. */
+typedef struct DbtSet DbtSet;
+struct DbtSet {
+  DbtTable *tabs[DBT_MAX_TABLES];
+  int n;
+};
+
+static void dbt_set_free(DbtSet *s) {
+  for (int i = 0; i < s->n; i++) {
+    free(s->tabs[i]->name);
+    dbt_free(s->tabs[i]->tree);
+    free(s->tabs[i]);
+  }
+  s->n = 0;
+}
+
+static DbtTable *dbt_set_find(DbtSet *s, const char *name) {
+  for (int i = 0; i < s->n; i++)
+    if (strcmp(s->tabs[i]->name, name) == 0)
+      return s->tabs[i];
+  return NULL;
+}
+
+/* Create `name`, or return it if it exists. Idempotent — see dbtab.rs. */
+static DbtTable *dbt_set_create(DbtSet *s, const char *name) {
+  DbtTable *t = dbt_set_find(s, name);
+  if (t)
+    return t;
+  if (s->n >= DBT_MAX_TABLES) {
+    set_err("db-create-table: too many tables in one database (max %d)",
+            DBT_MAX_TABLES);
+    return NULL;
+  }
+  t = calloc(1, sizeof(DbtTable));
+  if (!t) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  t->name = strdup(name);
+  t->tree = dbt_new();
+  if (!t->name || !t->tree) {
+    free(t->name);
+    dbt_free(t->tree);
+    free(t);
+    return NULL;
+  }
+  s->tabs[s->n++] = t;
+  return t;
+}
+
+/* Build the set from a replayed log. Called once per open, on the same records
+ * the hash index already holds, so a torn tail is already gone. */
+static DbtSet *dbt_set_rebuild(Db *db) {
+  DbtSet *s = calloc(1, sizeof(DbtSet));
+  if (!s) {
+    set_err("db: out of memory");
+    return NULL;
+  }
+  for (int b = 0; b < DB_BUCKETS; b++) {
+    for (DbEntry *e = db->buckets[b]; e; e = e->next) {
+      char *table = dbt_row_table(e->key);
+      if (!table)
+        continue;
+      if (strcmp(e->val, AINL_DB_TOMBSTONE) == 0) {
+        /* Deleted: the table still exists, the row does not. */
+        dbt_set_create(s, table);
+        free(table);
+        continue;
+      }
+      DbtTable *t = dbt_set_create(s, table);
+      if (!t) {
+        free(table);
+        return s;
+      }
+      /* The key is the part of the log key after the table name, which
+       * `dbt_row_table` already skipped past; recompute it rather than trust a
+       * second parse to agree. */
+      char *rk = dbt_row_key(table, "");
+      if (rk) {
+        size_t skip = strlen(rk);
+        const char *keyjson = e->key + skip;
+        if (strcmp(keyjson, DBT_MARKER_KEY) != 0)
+          dbt_insert(t->tree, keyjson, e->val);
+        free(rk);
+      }
+      free(table);
+    }
+  }
+  return s;
+}
+
+/* The table set for this handle, building it on first use. */
+static DbtSet *db_tables(Db *db) {
+  if (!db->tables)
+    db->tables = dbt_set_rebuild(db);
+  return db->tables;
+}
+
+/* ---- the builtins -------------------------------------------------------- */
+
+/* The key text of a primary key, or NULL with g_err set. Mirrors `key_json` in
+ * dbtab.rs: only a scalar is a legal key, and the JSON writer is what both
+ * engines use, so the bytes agree by construction rather than by convention. */
+static char *dbt_key_json(Value *v, const char *who) {
+  if (v->tag == V_LIST || v->tag == V_MAP) {
+    set_err("%s: primary key cannot be a %s — a table is indexed on one column, "
+            "and a composite or unordered key has no order to index by",
+            who, type_name(v));
+    return NULL;
+  }
+  if (v->tag == V_CLOSURE || v->tag == V_BUILTIN || v->tag == V_SYM) {
+    set_err("%s: primary key cannot be a %s", who, type_name(v));
+    return NULL;
+  }
+  Value enc = dbkv_encode(v);
+  if (g_err)
+    return NULL;
+  char *out = strdup(enc.u.s->data);
+  v_unref(&enc);
+  if (!out)
+    set_err("db: out of memory");
+  return out;
+}
+
+/* The row operand: a non-empty list. */
+static int dbt_row_of(Value *v, Value **out, int *n, const char *who) {
+  if (v->tag != V_LIST) {
+    set_err("%s expects a list row, got %s", who, type_name(v));
+    return 0;
+  }
+  ConsCell *c = v->u.l;
+  *n = (int)c->len;
+  if (*n == 0) {
+    set_err("%s: a row needs a primary key, so it cannot be empty", who);
+    return 0;
+  }
+  Value *items = malloc(sizeof(Value) * (size_t)*n);
+  if (!items) {
+    set_err("db: out of memory");
+    return 0;
+  }
+  int k = 0;
+  for (; c; c = c->tail)
+    items[k++] = c->head;
+  *out = items;
+  return 1;
+}
+
+/* (db-create-table handle name) -> the name. Idempotent. */
+static Value builtin_db_create_table(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("db-create-table expects (db-create-table handle name)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-create-table");
+  if (!h)
+    return v_nil();
+  const char *name = as_str_arg(&args[1], "db-create-table");
+  if (!name)
+    return v_nil();
+  Db *db = db_lookup(h, "db-create-table");
+  if (!db)
+    return v_nil();
+  DbtSet *s = db_tables(db);
+  if (!s)
+    return v_nil();
+  if (!dbt_set_create(s, name))
+    return v_nil();
+  /* The marker record, so an empty table survives a reopen: rebuild learns
+   * which tables exist from the records it finds. */
+  char *rk = dbt_row_key(name, DBT_MARKER_KEY);
+  if (!rk)
+    return v_nil();
+  db_append(db, rk, "", "db-create-table");
+  free(rk);
+  return v_str(name);
+}
+
+/* (db-insert handle table row) -> nil. */
+static Value builtin_db_insert(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("db-insert expects (db-insert handle table row)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-insert");
+  if (!h)
+    return v_nil();
+  const char *table = as_str_arg(&args[1], "db-insert");
+  if (!table)
+    return v_nil();
+  Db *db = db_lookup(h, "db-insert");
+  if (!db)
+    return v_nil();
+  Value *cols = NULL;
+  int ncols = 0;
+  if (!dbt_row_of(&args[2], &cols, &ncols, "db-insert"))
+    return v_nil();
+  char *key = dbt_key_json(&cols[0], "db-insert");
+  if (!key) {
+    free(cols);
+    return v_nil();
+  }
+  Value row = v_list_from_array(cols, ncols);
+  Value enc = dbkv_encode(&row);
+  free(cols);
+  if (g_err)
+    return v_nil();
+  DbtTable *t = dbt_set_find(db_tables(db), table);
+  if (!t) {
+    set_err("db-insert: no table named '%s' in this database", table);
+    v_unref(&enc);
+    free(key);
+    return v_nil();
+  }
+  char *rk = dbt_row_key(table, key);
+  if (!rk) {
+    v_unref(&enc);
+    free(key);
+    return v_nil();
+  }
+  db_append(db, rk, enc.u.s->data, "db-insert");
+  if (!g_err)
+    dbt_insert(t->tree, key, enc.u.s->data);
+  v_unref(&enc);
+  free(rk);
+  free(key);
+  return v_nil();
+}
+
+/* Collects rows for `db-all-rows`. */
+typedef struct {
+  Value *items;
+  int n;
+  int cap;
+  int failed;
+} DbtCollect;
+
+static void dbt_collect_cb(const char *key, const char *val, void *ctx) {
+  DbtCollect *c = (DbtCollect *)ctx;
+  (void)key;
+  if (strcmp(val, AINL_DB_TOMBSTONE) == 0)
+    return; /* a deleted row is not a row */
+  if (c->n >= c->cap) {
+    c->cap = c->cap ? c->cap * 2 : 16;
+    Value *grown = realloc(c->items, sizeof(Value) * (size_t)c->cap);
+    if (!grown) {
+      c->failed = 1;
+      return;
+    }
+    c->items = grown;
+  }
+  if (!dbkv_decode(val, &c->items[c->n]))
+    c->failed = 1;
+  else
+    c->n++;
+}
+
+/* (db-all-rows handle table) -> every row, sorted by primary key. */
+static Value builtin_db_all_rows(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("db-all-rows expects (db-all-rows handle table)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-all-rows");
+  if (!h)
+    return v_nil();
+  const char *table = as_str_arg(&args[1], "db-all-rows");
+  if (!table)
+    return v_nil();
+  Db *db = db_lookup(h, "db-all-rows");
+  if (!db)
+    return v_nil();
+  DbtSet *s = db_tables(db);
+  DbtTable *t = s ? dbt_set_find(s, table) : NULL;
+  if (!t) {
+    set_err("db-all-rows: no table named '%s' in this database", table);
+    return v_nil();
+  }
+  DbtCollect c = {NULL, 0, 0, 0};
+  dbt_walk(t->tree->root, dbt_collect_cb, &c);
+  if (c.failed) {
+    for (int i = 0; i < c.n; i++)
+      v_unref(&c.items[i]);
+    free(c.items);
+    set_err("db-all-rows: a row of '%s' is not readable; it was not written by "
+            "db-insert",
+            table);
+    return v_nil();
+  }
+  Value out = v_list_from_array(c.items, c.n);
+  free(c.items);
+  return out;
+}
+
+/* (db-select handle table key) -> the row, or nil. */
+static Value builtin_db_select(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("db-select expects (db-select handle table key)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-select");
+  if (!h)
+    return v_nil();
+  const char *table = as_str_arg(&args[1], "db-select");
+  if (!table)
+    return v_nil();
+  Db *db = db_lookup(h, "db-select");
+  if (!db)
+    return v_nil();
+  char *key = dbt_key_json(&args[2], "db-select");
+  if (!key)
+    return v_nil();
+  DbtSet *s = db_tables(db);
+  DbtTable *t = s ? dbt_set_find(s, table) : NULL;
+  if (!t) {
+    set_err("db-select: no table named '%s' in this database", table);
+    free(key);
+    return v_nil();
+  }
+  const char *val = dbt_get(t->tree->root, key);
+  if (!val || strcmp(val, AINL_DB_TOMBSTONE) == 0) {
+    free(key);
+    return v_nil();
+  }
+  Value out;
+  if (!dbkv_decode(val, &out)) {
+    set_err("db-select: the row for key %s in '%s' is not readable; it was not "
+            "written by db-insert",
+            key, table);
+    free(key);
+    return v_nil();
+  }
+  free(key);
+  return out;
+}
+
+/* (db-delete-row handle table key) -> true if the row was there. */
+static Value builtin_db_delete_row(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("db-delete-row expects (db-delete-row handle table key)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-delete-row");
+  if (!h)
+    return v_nil();
+  const char *table = as_str_arg(&args[1], "db-delete-row");
+  if (!table)
+    return v_nil();
+  Db *db = db_lookup(h, "db-delete-row");
+  if (!db)
+    return v_nil();
+  char *key = dbt_key_json(&args[2], "db-delete-row");
+  if (!key)
+    return v_nil();
+  DbtSet *s = db_tables(db);
+  DbtTable *t = s ? dbt_set_find(s, table) : NULL;
+  if (!t) {
+    set_err("db-delete-row: no table named '%s' in this database", table);
+    free(key);
+    return v_nil();
+  }
+  const char *cur = dbt_get(t->tree->root, key);
+  int existed = cur && strcmp(cur, AINL_DB_TOMBSTONE) != 0;
+  if (existed) {
+    char *rk = dbt_row_key(table, key);
+    if (!rk) {
+      free(key);
+      return v_nil();
+    }
+    db_append(db, rk, AINL_DB_TOMBSTONE, "db-delete-row");
+    if (!g_err)
+      dbt_remove(t->tree, key);
+    free(rk);
+  }
+  free(key);
+  return v_bool(existed);
+}
+
+
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
   tick(); /* bounds recursion / runaway calls */
@@ -3793,6 +4826,17 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_db_keys(args, nargs);
     case B_DB_COUNT:
       return builtin_db_count(args, nargs);
+    /* Tier 4 table layer */
+    case B_DB_CREATE_TABLE:
+      return builtin_db_create_table(args, nargs);
+    case B_DB_INSERT:
+      return builtin_db_insert(args, nargs);
+    case B_DB_SELECT:
+      return builtin_db_select(args, nargs);
+    case B_DB_DELETE_ROW:
+      return builtin_db_delete_row(args, nargs);
+    case B_DB_ALL_ROWS:
+      return builtin_db_all_rows(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();

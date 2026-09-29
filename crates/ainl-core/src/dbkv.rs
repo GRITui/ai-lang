@@ -132,7 +132,12 @@ pub const KV_BUILTINS: &[&str] = &[DB_SET, DB_GET, DB_GET_RAW, DB_DEL, DB_KEYS, 
 /// `f`, `n`, `-` or a digit. The tombstone begins with `~`, which is in none of
 /// those sets. This is the property that lets deletion share the byte layer
 /// instead of needing a second record type.
-const TOMBSTONE: &str = "~";
+///
+/// `pub(crate)` rather than private because the table layer deletes rows with
+/// **the same** tombstone, deliberately: "this key is gone" must be one byte
+/// string in the log rather than two, or a row deleted as a table row and a key
+/// deleted as a KV key would be recovered by two different rules.
+pub(crate) const TOMBSTONE: &str = "~";
 
 /// Borrow the handle `n`, apply `f`, and turn an absent handle into an error.
 ///

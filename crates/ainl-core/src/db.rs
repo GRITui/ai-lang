@@ -191,6 +191,22 @@ pub struct Db {
     path: String,
     file: std::fs::File,
     index: HashMap<String, String>,
+    /// The B-tree index over this database's table rows, built from `index` the
+    /// first time a table builtin asks for it and then kept in step by the
+    /// table layer's own writes.
+    ///
+    /// **Not** serialized to the file, and rebuilt from the log on every open
+    /// rather than stored as a tree. That is the same trade the hash `index`
+    /// already makes, and the reason is the module note: an append-only log can
+    /// only lose its tail, while a half-written *interior* node would be a hole
+    /// in the middle of the file, and recovering from a hole is a repair rather
+    /// than a replay. The rows, the keys and the order are all in the file;
+    /// what is rebuilt is the arrangement.
+    ///
+    /// `None` means "not built yet", which is also what a database with no table
+    /// rows keeps — so a program that only ever calls `db-set` never pays for a
+    /// tree.
+    tables: Option<crate::dbtab::TableSet>,
 }
 
 impl std::fmt::Debug for Db {
@@ -290,7 +306,21 @@ impl Db {
             path: path.to_string(),
             file,
             index,
+            tables: None,
         })
+    }
+
+    /// The table-row index, building it from the replayed log on first use.
+    ///
+    /// `pub(crate)` rather than public because `dbtab` is the only caller and it
+    /// needs the `&mut` that the tree maintenance requires — the B-tree is
+    /// updated in step with every row write, so there is no read-only view to
+    /// hand out.
+    pub(crate) fn tables(&mut self) -> &mut crate::dbtab::TableSet {
+        if self.tables.is_none() {
+            self.tables = Some(crate::dbtab::TableSet::rebuild(&self.index));
+        }
+        self.tables.as_mut().expect("just built")
     }
 
     /// Append one record and index it.

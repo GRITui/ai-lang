@@ -138,6 +138,17 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("db-del", 74),
     ("db-keys", 75),
     ("db-count", 76),
+    // Tier 4 table layer. Appended for the same reason as every earlier group:
+    // each id keeps the value it has always had, and the `enum` in runtime.c is
+    // extended in exactly this order, with crates/ainl-cc/tests/aot_stdlib.rs
+    // checking both directions. These five add no name collision — the table
+    // layer rebinds nothing — which is why this block is the first one that can
+    // be read without also reading about an ordering constraint.
+    ("db-create-table", 77),
+    ("db-insert", 78),
+    ("db-select", 79),
+    ("db-delete-row", 80),
+    ("db-all-rows", 81),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).
