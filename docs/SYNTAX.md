@@ -108,6 +108,37 @@ counter                                    ; => 0
 
 **Strings / IO**: `(print v...)` space-joins and prints a line, returns `nil`. `(str v...)` concatenates to one string.
 
+**How a value renders** — the rule a `(test ...)` expectation is written against
+(§3d), so it is stated once here. A string printed on its own is shown **as it
+is**: no quotes, no escaping. A string *inside a container* — a list element, a
+hash key or value — is wrapped in double quotes and its own `"` and `\` are
+escaped, so the rendering is unambiguous:
+
+```
+(print "a\"b")                ; a"b
+(print (str (list "a\"b")))   ; ("a\"b")
+(print (str (hash "k\"" 1)))  ; {"k\"" 1}
+```
+
+Exactly five characters are escaped, and the escape is a property of the
+*rendering*, not of the value — `(len "a\"b")` is `3`:
+
+| in the string | rendered as |
+|---|---|
+| `"` | `\"` |
+| `\` | `\\` |
+| newline | `\n` |
+| tab | `\t` |
+| carriage return | `\r` |
+
+The backslash is escaped first, so a string holding the two characters `\` and
+`n` renders as `\\n` — three characters, not two. This is why a newline inside a
+string is printed as `\n` rather than a line break: a raw one would split the
+output into two lines and make a value's rendering depend on its content, which
+every backend in this repo compares byte for byte.
+`fixtures/string_repr_parity.ainl` and `scripts/check-string-repr-parity.sh` are
+the gate.
+
 **Lists**: `(list v...)` build. `(len list|str|hash)`. `(first list)`. `(rest list)`. `(nth list i)` (0-based, out-of-range → `nil`). `(cons v list)` prepend. `(push list v...)` append.
 
 **Maps**: `(hash k v k v ...)` build from key/value pairs — a repeated key keeps its *last* value at its *first* position. `(get h k)` look up, `nil` if absent. `(assoc h k v)` a *new* map with `k` bound to `v` (like `cons`/`push`, the original is untouched). `(has h k)` bool. `(keys h)` / `(vals h)` lists in insertion order. Any value can be a key — key comparison is the same `=` used everywhere else, so a quoted symbol and an equal-content string are different keys, same as they're different values. **Equality is insertion-order-sensitive**, exactly like `List` — `(= (hash "a" 1 "b" 2) (hash "b" 2 "a" 1))` is `false`. This is a deliberate simplification (not "real" set-of-pairs equality) that keeps a map's behavior — construction, lookup, equality — identical across the interpreter and all three transpiler targets, the same way it already is for lists.

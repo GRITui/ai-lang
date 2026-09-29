@@ -1038,9 +1038,19 @@ const RUNTIME: &[(&str, &str)] = &[
         "_disp",
         "def _disp(x)\n  return \"true\" if x == true\n  return \"false\" if x == false\n  return \"nil\" if x.nil?\n  return x.to_s if x.is_a?(Symbol)\n  return \"{\" + x.map { |p| _repr(p[0]) + \" \" + _repr(p[1]) }.join(\" \") + \"}\" if x.is_a?(AHash)\n  return \"(\" + x.map { |e| _repr(e) }.join(\" \") + \")\" if x.is_a?(Array)\n  x.to_s\nend",
     ),
+    // A string is rendered INSIDE double quotes, so a quote in the string's own
+    // content has to come back out escaped or the rendering is ambiguous: the
+    // interpreter (Rust's `{:?}`) and the C runtime's `value_repr` both escape
+    // `"`/`\`/newline/tab/CR, and this used to emit none of them. Backslash goes
+    // first, or the escapes the later passes introduce are escaped again.
+    //
+    // The BLOCK form of gsub is required, not stylistic: given a string
+    // replacement, `gsub` re-interprets backslashes in it, so `gsub('\\',
+    // '\\\\')` returns a single backslash and silently does nothing. A block's
+    // value is used literally, which is what `"\\"` has to mean here.
     (
         "_repr",
-        "def _repr(x)\n  x.is_a?(String) ? \"\\\"\" + x + \"\\\"\" : _disp(x)\nend",
+        "def _repr(x)\n  return _disp(x) unless x.is_a?(String)\n  # Escapes in the same order as the C runtime's value_repr: backslash first.\n  return '\"' + x.gsub('\\\\') { '\\\\\\\\' }.gsub('\"') { '\\\\\"' }.gsub(\"\\n\") { '\\\\n' }.gsub(\"\\t\") { '\\\\t' }.gsub(\"\\r\") { '\\\\r' } + '\"'\nend",
     ),
     ("_print", "def _print(*xs)\n  puts xs.map { |x| _disp(x) }.join(\" \")\nend"),
     (

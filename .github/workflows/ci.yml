@@ -245,6 +245,48 @@ jobs:
       - name: and/or returns operands + 5-backend parity
         run: ./scripts/check-and-or-parity.sh
 
+  string-repr-parity:
+    name: 'string rendering (repr escapes the quote and the backslash; 5-backend parity)'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: string-repr-parity-${{ hashFiles('Cargo.lock') }}
+          restore-keys: string-repr-parity-
+
+      - name: Install Python, Node and Ruby
+        # These three are the reason the job exists. A string rendered inside a
+        # container goes through `_repr`, which wraps it in double quotes — and
+        # all three transpiler helpers did that and nothing else, so
+        # `(str (list "a\"b"))` printed ("a"b") there and ("a\"b") on the
+        # interpreter and the AOT C runtime. Nothing caught it because no
+        # example or fixture put a quote or a backslash INSIDE a container: the
+        # escaping path is reachable only from a list or hash element.
+        # "It ran" is not the claim; "the bytes matched the interpreter" is.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # One fixture through five runners — interpreter/VM, AOT C, python3, node,
+      # ruby — diffed byte for byte, plus per-character assertions that pin the
+      # escape table and its ORDER (backslash first, or an escape introduced by
+      # a later pass is itself escaped). The AOT half needs `cc`, preinstalled
+      # on ubuntu runners.
+      - name: String rendering + 5-backend parity
+        run: ./scripts/check-string-repr-parity.sh
+
   try-catch:
     name: try/catch (4-backend parity on the error path)
     runs-on: ubuntu-latest
