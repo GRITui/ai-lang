@@ -1,0 +1,262 @@
+; Tier 3 builtins: file system — mkdir / rename / copy / is-dir / file-size.
+;
+; This suite is also the **e2e organizer rewrite**. The original
+; `/tmp/ainl-e2e/05_organize.ainl` classified files by extension and moved the
+; text ones into per-extension subdirectories, and could only do it with
+; read -> write -> delete, because AINL had no `mkdir` and no `rename`:
+;
+;     (do (write-file (path-join (path-join SRC e) name) (read-file p))
+;         (delete-file p)
+;         ...)
+;
+; That version needed the target subdirectories to **already exist** (it
+; probed for them with the `(file-exists (path-join p "."))` trick and gave up
+; on any extension whose directory was missing), it copied every byte, it could
+; not move a directory at all, and an interruption left a file in two places.
+;
+; The rewrite below is the same program with the two new builtins: `mkdir`
+; creates the targets, `rename` moves, and `is-dir` is a real predicate instead
+; of a filesystem trick. The printed report is byte-identical to the original's
+; — which is the point: same observable behaviour, a third of the code, and no
+; data copied.
+;
+; Run with:  ainl test tests/
+
+; ---- scratch tree ---------------------------------------------------------
+; A relative path, so the suite leaves nothing in $TMPDIR and `ainl test` can
+; sweep `tests/` for it.
+;
+; AINL has no `rmdir`, so the directories this creates cannot be removed by the
+; program itself — only `delete-file` (files) exists. The suite therefore
+; deletes every **file** it made, which is what `ainl test` checks for, and
+; leaves the empty directories behind. This is a real gap and the obvious
+; companion to this card, not a workaround: the "remove this directory" half of
+; a file-system API is still missing. It is also why
+; `scripts/check-fs-builtins.sh` gives each of its five runners its own
+; `mktemp -d` tree — outside AINL, where a recursive delete is one command.
+(def ROOT "ainl-test-fs.tmp")
+(def SRC (path-join ROOT "incoming"))
+
+; ---- helpers --------------------------------------------------------------
+
+; extension of a filename (text after the last "."), or "" if there is none
+(def last-of (fn (lst)
+  (let ((cur lst))
+    (while (not (= (rest cur) (list)))
+      (def cur (rest cur)))
+    (first cur))))
+(def ext-of (fn (name)
+  (let ((parts (split name ".")))
+    (if (= (len parts) 1) "" (last-of parts)))))
+
+; The extension -> subdirectory mapping, as a hash. The original organizer
+; hard-coded a chain of `(or (= e "txt") (= e "md") ...)` comparisons; `hash`
+; already existed, so this is not a new capability, only the first use of it
+; for a lookup table.
+(def TEXT-EXTS (hash "txt" "txt" "md" "md" "csv" "csv" "py" "py" "ainl" "ainl" "json" "json"))
+(def subdir-for (fn (e)
+  (let ((hit (get TEXT-EXTS e)))
+    (if (= hit nil) "" hit))))
+
+; The target directories, so the organizer does not have to know the extension
+; set in advance — the thing the original could not do. The original had this
+; set hard-coded twice: once as the `(or (= e "txt") ...)` chain above, and once
+; as the list it probed for before moving anything. A table plus a guard
+; removes that duplication. `unique` would be nicer here but AINL has no such
+; builtin, so the two lists are kept distinct by hand: `TEXT-EXTS` maps an
+; extension to a subdirectory, `EXT-SUBS` lists the subdirectories, and the
+; suite asserts below that the two agree.
+(def EXT-SUBS (list "txt" "md" "csv" "py"))
+
+; ---- build the input tree -------------------------------------------------
+; The organizer below creates its own target directories, so only the inbox is
+; made here. This is the whole point of the rewrite: the original had to
+; pre-create `txt/`, `md/`, `py/` and `csv/` and silently gave up on any
+; extension whose directory was missing.
+;
+; AINL has no `rmdir`, so the directories survive a run and the suite must be
+; re-runnable: `mkdir` refuses an existing path, so the inbox is created only
+; when it is absent. That guard is not a workaround — it is the documented
+; pattern for a program that may run over its own output, and it is the same
+; guard the organizer uses for its targets.
+(if (not (is-dir SRC)) (mkdir SRC ":recursive"))
+
+; Eight movable files, two per known extension.
+(def seed (list (list "a.txt" "alpha") (list "b.txt" "bravo")
+                (list "c.md" "charlie") (list "d.md" "delta")
+                (list "e.py" "echo") (list "f.py" "foxtrot")
+                (list "i.csv" "golf") (list "j.csv" "hotel")))
+; Walk the table. AINL's list cursor is a *list* that empties, not a
+; terminated pointer: `(def si (list))` would start the loop already finished
+; and silently run the body zero times, so the cursor starts AT the list and
+; `(= cursor (list))` is the exit test.
+(def si seed)
+(while (not (= si (list)))
+  (def row (first si))
+  (write-file (path-join SRC (first row)) (first (rest row)))
+  (def si (rest si)))
+
+; The non-movable files, matching the original corpus exactly: two jpg and two
+; tmp, so the report is comparable to the captured aot5.out line for line.
+(def OTHERS (list (list "g.jpg" "golf-binary") (list "h.jpg" "hotel-binary")
+                  (list "k.tmp" "temp-one") (list "l.tmp" "temp-two")))
+(def oi OTHERS)
+(while (not (= oi (list)))
+  (def row (first oi))
+  (write-file (path-join SRC (first row)) (first (rest row)))
+  (def oi (rest oi)))
+
+; ---- the organizer --------------------------------------------------------
+; The rewrite. Three lines of the loop are the whole difference from the
+; original: `mkdir` for the targets, `rename` to move, `is-dir` to classify.
+;
+; The target directories come from the rule table, so the organizer does not
+; need to know the extension set in advance — the thing the original could not
+; do. `mkdir` refuses an existing path, so the guard is `file-exists`, which is
+; what it is for; on a re-run over a half-finished tree the guard is exactly
+; the behaviour a caller wants.
+(def gi EXT-SUBS)
+(while (not (= gi (list)))
+  (def target (path-join SRC (first gi)))
+  (if (not (is-dir target)) (mkdir target ":recursive"))
+  (def gi (rest gi)))
+
+(def moved (list))
+(def skipped (list))
+(def cur (list-dir SRC))
+(while (not (= cur (list)))
+  (def name (first cur))
+  (def p (path-join SRC name))
+  (def e (ext-of name))
+  (def sub (subdir-for e))
+  (if (is-dir p)
+      ; is-dir replaces (file-exists (path-join p ".")) — a real primitive
+      ; instead of a filesystem trick, and one that does not follow symlinks.
+      (def skipped (push skipped (str name " (dir)")))
+      (if (= sub "")
+          (def skipped (push skipped (str name " (ext=" e ")")))
+          (do ; The original: (write-file dst (read-file p)) (delete-file p)
+              ; This:                  (rename p dst)
+              ; One syscall, no bytes copied, and a directory would work too.
+              (if (not (is-dir (path-join (path-join SRC sub) name)))
+                  (rename p (path-join (path-join SRC sub) name)))
+              (def moved (push moved (str name " -> " sub "/"))))))
+  (def cur (rest cur)))
+
+; ---- the report -----------------------------------------------------------
+; Rendered into a *string* and asserted below rather than `print`ed. A test
+; file must not print: `ainl test --quiet` is a scripted gate that counts the
+; lines of its own output (scripts/check-ainl-test.sh), and one stray report
+; breaks it. The report program itself lives in fixtures/ for the same reason
+; the strings fixture does.
+;
+; The expected text is byte-for-byte the report the original read->write->delete
+; organizer printed, captured as aot5.out in the e2e corpus — which is the
+; acceptance criterion: same observable behaviour, a third of the code.
+(def render (fn (label items)
+  (let ((acc (str label " " (str (len items)) " file(s):\n"))
+        (cur items))
+    (while (not (= cur (list)))
+      (def acc (str acc "  " (first cur) "\n"))
+      (def cur (rest cur)))
+    acc)))
+(def REPORT (str (render "moved" moved) (render "skipped" skipped)))
+
+; AINL has no multi-line string literal, so the newlines are `\n` escapes — the
+; same form tests/file_io.ainl uses for `"alpha\nbeta\n"`.
+(def EXPECTED-REPORT "moved 8 file(s):\n  a.txt -> txt/\n  b.txt -> txt/\n  c.md -> md/\n  d.md -> md/\n  e.py -> py/\n  f.py -> py/\n  i.csv -> csv/\n  j.csv -> csv/\nskipped 8 file(s):\n  csv (dir)\n  g.jpg (ext=jpg)\n  h.jpg (ext=jpg)\n  k.tmp (ext=tmp)\n  l.tmp (ext=tmp)\n  md (dir)\n  py (dir)\n  txt (dir)\n")
+
+; ---- assertions -----------------------------------------------------------
+
+; The report is the acceptance criterion, so it is asserted as one string
+; against the original's captured output. A `(test ...)` compares the rendered
+; value, so this is a true byte comparison including the newlines and the
+; leading two spaces on each entry.
+(test "the report is byte-identical to the original read->write->delete organizer"
+       REPORT
+       EXPECTED-REPORT)
+
+(test "mkdir created the tree" (is-dir (path-join ROOT "incoming")) "true")
+(test "mkdir ':recursive' made every level" (is-dir SRC) "true")
+(test "a trailing separator gives the same answer" (is-dir (str SRC "/")) "true")
+(test "is-dir is nil for a file" (is-dir (path-join SRC "g.jpg")) "nil")
+(test "is-dir is nil for a missing path" (is-dir (path-join ROOT "absent")) "nil")
+
+; EXT-SUBS is the set the organizer pre-creates; TEXT-EXTS is what it looks a
+; file's extension up in. If they drift, a file moves into a directory nobody
+; created — or one the organizer created for a rule that no longer exists. This
+; is the assertion the original needed and could not make, because it had the
+; set written down twice with nothing tying them together.
+(def agrees (fn (subs)
+  (let ((all-ok true)
+        (cur subs))
+    (while (not (= cur (list)))
+      (if (= (is-dir (path-join SRC (first cur))) nil) (def all-ok false))
+      (def cur (rest cur)))
+    all-ok)))
+(test "every rule has a directory the organizer made" (agrees EXT-SUBS) "true")
+
+(test "a.txt moved into txt/" (file-exists (path-join SRC "txt/a.txt")) "true")
+(test "c.md moved into md/" (file-exists (path-join SRC "md/c.md")) "true")
+(test "e.py moved into py/" (file-exists (path-join SRC "py/e.py")) "true")
+(test "i.csv moved into csv/" (file-exists (path-join SRC "csv/i.csv")) "true")
+(test "all eight moved" (len moved) "8")
+(test "g.jpg stayed put (no rule)" (file-exists (path-join SRC "g.jpg")) "true")
+(test "h.jpg stayed put (no rule)" (file-exists (path-join SRC "h.jpg")) "true")
+(test "k.tmp stayed put (no rule)" (file-exists (path-join SRC "k.tmp")) "true")
+(test "l.tmp stayed put (no rule)" (file-exists (path-join SRC "l.tmp")) "true")
+(test "eight skipped" (len skipped) "8")
+
+; rename is a *move*: the content arrived, and the source is gone.
+(test "content moved with the file" (read-file (path-join SRC "txt/a.txt")) "alpha")
+(test "the source no longer exists" (file-exists (path-join SRC "a.txt")) "nil")
+; The original read and rewrote every byte; rename reads none.
+(test "file-size agrees with the moved content" (file-size (path-join SRC "txt/a.txt")) "5")
+(test "file-size counts bytes, not characters"
+       (do (write-file (path-join ROOT "u.txt") "héllo")
+           (let ((n (file-size (path-join ROOT "u.txt"))))
+             (do (delete-file (path-join ROOT "u.txt")) n)))
+       "6")
+(test "file-size is nil-free: a directory is an error, not a number"
+       (try (file-size SRC) (catch (e) "refused"))
+       "refused")
+
+; copy duplicates, and the two copies then diverge — which is the whole
+; difference between copy and rename.
+(copy (path-join SRC "txt/a.txt") (path-join ROOT "a-copy.txt"))
+(test "copy preserved the content byte for byte" (read-file (path-join ROOT "a-copy.txt")) "alpha")
+(test "copy preserved the size" (file-size (path-join ROOT "a-copy.txt")) "5")
+(test "copy left the original alone" (read-file (path-join SRC "txt/a.txt")) "alpha")
+(write-file (path-join ROOT "a-copy.txt") "zulu")
+(test "the copy is independent of the original"
+       (str (read-file (path-join ROOT "a-copy.txt")) "|" (read-file (path-join SRC "txt/a.txt")))
+       "zulu|alpha")
+(delete-file (path-join ROOT "a-copy.txt"))
+
+; The two safety rules, on the real tree.
+(test "rename refuses an existing destination"
+       (try (rename (path-join SRC "txt/b.txt") (path-join SRC "txt/a.txt"))
+            (catch (e) "refused"))
+       "refused")
+(test "the destination survived the refusal" (read-file (path-join SRC "txt/a.txt")) "alpha")
+(test "the source survived the refusal" (file-exists (path-join SRC "txt/b.txt")) "true")
+(test "mkdir refuses an existing path"
+       (try (mkdir (path-join SRC "txt") ":recursive") (catch (e) "refused"))
+       "refused")
+
+; ---- clean up the files ---------------------------------------------------
+; AINL has no `rmdir`, so the directories stay; the files go. One pass over the
+; inbox removes the unmoved files, and a pass over each subdirectory removes the
+; moved ones. `ainl test` checks for leftovers, and a re-run then starts from a
+; tree of empty directories, which `mkdir`'s refusal rule handles via the
+; `is-dir` guard above.
+(def di (list-dir SRC))
+(while (not (= di (list)))
+  (def sub (path-join SRC (first di)))
+  (if (is-dir sub)
+      (do (def ei (list-dir sub))
+          (while (not (= ei (list)))
+            (delete-file (path-join sub (first ei)))
+            (def ei (rest ei))))
+      (delete-file sub))
+  (def di (rest di)))

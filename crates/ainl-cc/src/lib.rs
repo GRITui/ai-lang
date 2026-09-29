@@ -102,6 +102,16 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("starts-with", 59),
     ("ends-with", 60),
     ("index-of", 61),
+    /* Tier 3 file system. Appended for the same reason as every earlier group:
+     * each id keeps the value it has always had, and the `enum` in runtime.c is
+     * extended in exactly this order. crates/ainl-cc/tests/aot_stdlib.rs checks
+     * both directions, so a drift here fails the suite rather than producing a
+     * program that dispatches to the wrong builtin. */
+    ("mkdir", 62),
+    ("rename", 63),
+    ("copy", 64),
+    ("is-dir", 65),
+    ("file-size", 66),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

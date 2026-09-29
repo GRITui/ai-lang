@@ -621,6 +621,179 @@ fn aot_file_exists_and_delete_file_match_the_interpreter() {
     );
 }
 
+// ---- Tier 3 file system ---------------------------------------------------
+
+/// Run `program` under one backend, either the compiled binary or the
+/// interpreter, and return its stdout.
+///
+/// Split out because every file-system test here is *stateful* — they create
+/// directories, move files and delete — so each backend needs its own seeded
+/// tree and the two must be compared on their output, not on shared state.
+fn run_fs_backend(label: &str, program: &str, name: &str) -> String {
+    let out = if label == "aot" {
+        let bin = compile_aot(program, name);
+        Command::new(&bin).output().expect("run aot")
+    } else {
+        let (_, path) = run_interpreter(program);
+        let o = Command::new(ainl_bin())
+            .arg("run")
+            .arg(&path)
+            .output()
+            .expect("run ainl");
+        let _ = std::fs::remove_file(&path);
+        o
+    };
+    assert!(
+        out.status.success(),
+        "{label} file-system program failed: {}\nprogram was:\n{program}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn aot_file_system_builtins_match_the_interpreter() {
+    // The five new builtins in one program. `mkdir ":recursive"` builds a
+    // three-deep tree, `rename` moves a file and then a whole directory, `copy`
+    // duplicates one, and `is-dir`/`file-size` report on the result.
+    //
+    // The multi-byte file is the load-bearing part: "héllo" is 6 bytes and 5
+    // characters, so a `file-size` implemented in characters answers 5 and the
+    // gate fails. `copy` then has to preserve the 6 bytes.
+    let tmpl = r#"(do
+        (mkdir (path-join {d} "src/deep/deeper") ":recursive")
+        (print (is-dir (path-join {d} "src")) (is-dir (path-join {d} "src/deep/deeper")))
+        (write-file (path-join {d} "src/a.txt") "héllo")
+        (print (file-size (path-join {d} "src/a.txt")) (len (read-file (path-join {d} "src/a.txt"))))
+        (print (is-dir (path-join {d} "src/a.txt")) (is-dir (path-join {d} "src/a.txt/")))
+        (rename (path-join {d} "src/a.txt") (path-join {d} "src/deep/moved.txt"))
+        (print (read-file (path-join {d} "src/deep/moved.txt")) (file-exists (path-join {d} "src/a.txt")))
+        (rename (path-join {d} "src/deep") (path-join {d} "dst"))
+        (print (is-dir (path-join {d} "dst/deeper")) (list-dir (path-join {d} "dst")))
+        (copy (path-join {d} "dst/moved.txt") (path-join {d} "copy.txt"))
+        (print (file-size (path-join {d} "copy.txt")) (read-file (path-join {d} "copy.txt")))
+        (write-file (path-join {d} "copy.txt") "x")
+        (print (read-file (path-join {d} "dst/moved.txt")) (read-file (path-join {d} "copy.txt")))
+        (mkdir (path-join {d} "dst/deeper" "inner") ":recursive")
+        (print (is-dir (path-join {d} "dst/deeper/inner"))))"#;
+
+    let mut outputs = Vec::new();
+    for (label, name) in [("aot", "fsys_aot"), ("interp", "fsys_interp")] {
+        let dir = std::env::temp_dir().join(format!("ainl-aot-fsys-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let d = format!("{:?}", dir.to_str().unwrap());
+        let out = run_fs_backend(label, &tmpl.replace("{d}", &d), name);
+        // The documented answers, in order:
+        //  1. both directories were created           -> true true
+        //  2. 6 bytes but 5 characters                -> 6 5
+        //  3. a file is not a dir; trailing "/" too   -> nil nil
+        //  4. content moved; source gone              -> héllo nil
+        //  5. the whole subtree moved                 -> true ("deeper" "moved.txt")
+        //  6. the copy is 6 bytes with the same body  -> 6 héllo
+        //  7. the copies diverge after a write        -> héllo x
+        //  8. a nested ":recursive" mkdir works       -> true
+        assert_eq!(
+            out,
+            "true true\n6 5\nnil nil\nhéllo nil\ntrue (\"deeper\" \"moved.txt\")\n6 héllo\nhéllo x\ntrue\n",
+            "{label} file-system output differs from the contract"
+        );
+        outputs.push(out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "AOT and the interpreter disagree on the file-system builtins"
+    );
+}
+
+#[test]
+fn aot_file_system_error_messages_match_the_interpreter() {
+    // One shared message per failure mode, byte-identical between the
+    // interpreter and the compiled binary. Each program is self-contained and
+    // fails, so neither backend leaves state behind.
+    for (src, name) in [
+        (r#"(mkdir 1)"#, "fs_mkdir_type"),
+        (r#"(mkdir 1 ":recursive")"#, "fs_mkdir_opt_type"),
+        (r#"(mkdir "x" ":parents")"#, "fs_mkdir_bad_opt"),
+        (r#"(mkdir)"#, "fs_mkdir_arity"),
+        (r#"(mkdir "a" "b" "c")"#, "fs_mkdir_arity3"),
+        (r#"(rename 1 2)"#, "fs_rename_type"),
+        (r#"(rename "a")"#, "fs_rename_arity"),
+        (r#"(copy 1 2)"#, "fs_copy_type"),
+        (r#"(copy "a")"#, "fs_copy_arity"),
+        (r#"(is-dir 1)"#, "fs_isdir_type"),
+        (r#"(is-dir)"#, "fs_isdir_arity"),
+        (r#"(file-size 1)"#, "fs_size_type"),
+        (r#"(file-size)"#, "fs_size_arity"),
+    ] {
+        assert_error_parity(src, name);
+    }
+}
+
+#[test]
+fn aot_file_system_refuses_to_clobber_on_rename() {
+    // The one behaviour where a naive port silently destroys data: POSIX
+    // rename(2) refuses an existing destination, but os.rename, fs.renameSync
+    // and File.rename all overwrite it. AINL pins the refusal, and this test
+    // pins the pin — on both backends, and on the bytes on disk afterwards.
+    // `catch` binds the error *map*, not the bare message, so the report reads
+    // it back with `get` — the same shape a caller would use. What matters is
+    // that the message inside it is the shared one and that the destination
+    // still holds its original bytes.
+    let tmpl = r#"(do
+        (write-file {src} "SOURCE")
+        (write-file {dst} "DESTINATION")
+        (print (try (rename {src} {dst})
+                    (catch (e) (get e "message"))))
+        (print (read-file {dst}))
+        (print (read-file {src})))"#;
+
+    let mut outputs = Vec::new();
+    for (label, name) in [("aot", "clobber_aot"), ("interp", "clobber_interp")] {
+        let dir = std::env::temp_dir().join(format!("ainl-aot-clobber-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let d = dir.to_str().unwrap();
+        let program = tmpl
+            .replace("{src}", &format!("{:?}", format!("{d}/src.txt")))
+            .replace("{dst}", &format!("{:?}", format!("{d}/dst.txt")));
+        let out = run_fs_backend(label, &program, name);
+        // The message names the two paths the caller wrote, so it is built from
+        // `d` rather than hard-coded.
+        assert_eq!(
+            out,
+            format!(
+                "rename: cannot move '{d}/src.txt': '{d}/dst.txt' exists\nDESTINATION\nSOURCE\n"
+            ),
+            "{label} rename clobbered or reported differently than the contract"
+        );
+        outputs.push(out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Each backend gets its own directory, so the two outputs necessarily
+    // differ in the paths embedded in the message. The per-backend assert above
+    // already pins the exact text; this compares the *shape* — same three lines,
+    // and the two content lines identical on both.
+    fn lines(s: &str) -> Vec<&str> {
+        s.lines().collect()
+    }
+    for out in &outputs {
+        assert_eq!(
+            lines(out).len(),
+            3,
+            "expected message + destination + source"
+        );
+        assert_eq!(
+            lines(out)[0].split(": cannot move ").count(),
+            2,
+            "message shape"
+        );
+        assert_eq!(lines(out)[1], "DESTINATION", "destination must be intact");
+        assert_eq!(lines(out)[2], "SOURCE", "source must be intact");
+    }
+}
+
 #[test]
 fn aot_path_builtins_match_the_interpreter() {
     // The full edge-case table, not just the happy path: these are the inputs

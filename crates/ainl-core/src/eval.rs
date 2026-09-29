@@ -870,6 +870,18 @@ fn install_stdlib(env: &Env) {
     b!("path-join", builtin_path_join);
     b!("path-base", builtin_path_base);
     b!("path-dir", builtin_path_dir);
+    // Tier 3 file system. The same explicit-POSIX-rules rule as the six
+    // above: each backend implements the shared table in docs/SYNTAX.md §3h
+    // rather than deferring to its own runtime, because the hosts disagree
+    // about an existing destination (os.rename and File.rename clobber it
+    // silently, rename(2) does not), about a missing parent (create_dir vs
+    // create_dir_all vs Dir.mkdir's two arities), and about whether a
+    // trailing separator is legal against a file.
+    b!("mkdir", builtin_mkdir);
+    b!("rename", builtin_rename);
+    b!("copy", builtin_copy);
+    b!("is-dir", builtin_is_dir);
+    b!("file-size", builtin_file_size);
 
     // strings
     b!("split", builtin_split);
@@ -1477,6 +1489,314 @@ fn builtin_list_dir(args: &[Value]) -> Result<Value> {
     Ok(Value::List(ConsCell::from_values(
         names.into_iter().map(Value::str),
     )))
+}
+
+// ---- stdlib: Tier 3 file system -------------------------------------------
+//
+// The five builtins below are the operations a self-contained tool needs to
+// actually *organize* files, which the read/write/delete cluster above cannot
+// express: there was no way to make a directory and no way to move one.
+//
+// The rule that governs all five is the same one that governs the `path-*`
+// trio at the top of this section, and it is a *rule*, not an implementation
+// detail: the four host runtimes disagree on every edge case that matters, so
+// none of these may defer to `std::fs`, `os`, `fs` or `File`. The shared,
+// normative statement of the behavior is docs/SYNTAX.md §3h; each backend
+// implements that table and the parity gate scripts/check-fs-builtins.sh diffs
+// all five runners' stdout AND stderr on one program.
+//
+// The rules this pins, in brief:
+//
+// * **Separator is always `/`, and the path is never canonicalized.** A path
+//   is handed to the host syscall as written, minus a *trailing* separator (see
+//   `fs_probe_path`), because `"a/"` and `"a"` name the same entry and the hosts
+//   disagree about whether the trailing form is legal against a *file*.
+// * **`..` is not resolved** and there is no current-directory normalization,
+//   for the reason the `path-*` trio gives: resolving would make a documented
+//   pure operation touch the filesystem.
+// * **A decision that can be made on a symlink is made on the link.** `is-dir`
+//   and `file-size` use `lstat` like `file-exists` does, so a symlink to a
+//   directory is *not* a directory. This is the one place where "is this a
+//   directory" needs a stated answer, and it is the answer POSIX `lstat` gives.
+
+/// The path a filesystem *query* builtin probes, with a trailing separator
+/// stripped.
+///
+/// `(is-dir "notes.txt/")` must be `nil` and `(file-size "notes.txt/")` must
+/// measure `notes.txt`, but the four hosts split on whether the trailing form
+/// is even legal against a non-directory: `stat("f/")` is `ENOTDIR` on Linux,
+/// `os.stat("f/")` is `NotADirectoryError` in Python, `lstatSync("f/")` throws
+/// in Node, and Ruby's `File.lstat("f/")` raises `Errno::ENOTDIR`. Trimming here
+/// is what makes one answer possible.
+///
+/// A lone `"/"` is the root and must survive, so the strip is skipped when it
+/// would empty the string.
+fn fs_probe_path(path: &str) -> &str {
+    path.strip_suffix('/')
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+}
+
+/// `EXDEV`'s numeric value, spelled out rather than pulled from a libc crate.
+///
+/// AINL builds with no dependencies, so the constant is written here. It is
+/// part of the POSIX error ABI and is 18 on every platform AINL targets, which
+/// is what lets the C runtime name the same case without a libc header.
+const EXDEV: i32 = 18;
+
+/// `(mkdir path)` / `(mkdir path ":recursive")` → `nil`.
+///
+/// **The option is a positional string, not a keyword.** AINL has no
+/// keyword-argument syntax and has never had one — a bare `:recursive` is an
+/// ordinary symbol and fails at eval time with `unbound symbol ':recursive'`
+/// before `mkdir` is reached, identically on all five backends. So the option
+/// is spelled `":recursive"`, matching how `test` takes its positional extra
+/// argument. The token is unchanged; only its *position* is. See §3h.
+///
+/// An existing path is an **error**, never a silent success, in both modes.
+/// `mkdir` on an existing directory is the one case where the hosts really do
+/// agree (`os.mkdir` and `FileUtils.mkdir_p` both raise), but a caller that
+/// creates a directory and then writes into it needs to know whether *it*
+/// created it — returning `nil` for a directory that was already there would
+/// make a stale directory indistinguishable from a fresh one.
+///
+/// `:recursive` creates the missing parents, which is what an organizer needs.
+/// It is idempotent for a directory that already exists *only in the sense
+/// that the existence check above already refused it* — the check runs first,
+/// so `:recursive` is a no-op only for paths that do not exist yet. The mode
+/// differs from `mkdir -p` in exactly that way, and the reason is above: a
+/// stale target directory must not look like a freshly created one.
+///
+/// A missing parent in non-recursive mode is the same "cannot create" error,
+/// reported against the path the caller named rather than the parent that was
+/// missing, so the message is the same one on every host: naming a path the
+/// caller did not write would be worse.
+fn builtin_mkdir(args: &[Value]) -> Result<Value> {
+    // Arity is checked before the option is looked at, and the message names
+    // the two accepted shapes without quoting the option token: the transpiler
+    // targets' `repr` helpers do not escape a double quote inside a rendered
+    // string (verified at 76b4c5a, independent of this builtin), so a message
+    // containing `":recursive"` would render differently on python/js/ruby
+    // than on the interpreter and the C runtime. "option" is still exact —
+    // there is exactly one, and §3h names it.
+    let [p, opt @ ..] = args else {
+        return Err(Error::runtime(
+            "mkdir expects (mkdir path) or (mkdir path option)",
+        ));
+    };
+    if opt.len() > 1 {
+        return Err(Error::runtime(
+            "mkdir expects (mkdir path) or (mkdir path option)",
+        ));
+    }
+    let path = as_path_arg(p, "mkdir")?;
+    let mut recursive = false;
+    for o in opt {
+        let Value::Str(s) = o else {
+            return Err(Error::runtime(format!(
+                "mkdir expects a str option, got {}",
+                o.type_name()
+            )));
+        };
+        if s.as_str() != ":recursive" {
+            return Err(Error::runtime(format!("mkdir: unknown option '{s}'")));
+        }
+        recursive = true;
+    }
+
+    // A path that exists at all is the error case, in both modes, and it is
+    // checked before any host call so the message is the same everywhere.
+    if std::fs::symlink_metadata(fs_probe_path(path)).is_ok() {
+        return Err(Error::runtime(format!(
+            "mkdir: cannot create '{path}': it exists"
+        )));
+    }
+
+    let res = if recursive {
+        std::fs::create_dir_all(path)
+    } else {
+        std::fs::create_dir(path)
+    };
+    match res {
+        Ok(()) => Ok(Value::Nil),
+        // Every failure is the same message, deliberately: the hosts raise
+        // distinct ones (NotADirectoryError, Errno::EEXIST, ENOENT, EACCES,
+        // ENOSPC, EROFS, ENAMETOOLONG) and AINL has no way to let a caller
+        // handle a filesystem detail without reimplementing errno in four
+        // languages. "cannot create" plus the path is the honest common claim.
+        Err(_) => Err(Error::runtime(format!("mkdir: cannot create '{path}'"))),
+    }
+}
+
+/// `(rename from to)` → `nil`, moving a file or a directory.
+///
+/// `rename` is a **single** `rename(2)` on the same filesystem: atomic, and it
+/// moves a whole directory subtree without reading a byte of it. That is
+/// exactly what the read→write→delete dance it replaces cannot do — the dance
+/// copies content, so a large tree is fully buffered and a crash mid-move
+/// leaves two half-copies.
+///
+/// A missing `from` is an error, and so is an existing `to` — checked *before*
+/// the host call. `rename(2)` would itself refuse the second, but the hosts
+/// disagree about how: `os.rename` and `File.rename` both **silently clobber**
+/// an existing destination, while POSIX `rename(2)` fails with `EEXIST` only
+/// when `to` is a non-empty directory. Pinning the refusal here is the only way
+/// to stop a caller's `rename` from destroying a file on three of five backends
+/// and failing on the other two.
+///
+/// **A cross-device move is an error**, not a copy-and-delete fallback. POSIX
+/// `rename(2)` returns `EXDEV` across filesystems, and a silent copy+delete
+/// would change the builtin's contract from atomic to not, would consume
+/// unbounded memory for a large tree, and would be a different *algorithm* per
+/// backend. `copy` already exists for the caller who wants the data movement;
+/// composing the fallback is theirs to do.
+fn builtin_rename(args: &[Value]) -> Result<Value> {
+    let [from, to] = args else {
+        return Err(Error::runtime("rename expects (rename from to)"));
+    };
+    let from = as_path_arg(from, "rename")?;
+    let to = as_path_arg(to, "rename")?;
+    if std::fs::symlink_metadata(fs_probe_path(from)).is_err() {
+        return Err(Error::runtime(format!(
+            "rename: cannot move '{from}': it does not exist"
+        )));
+    }
+    if std::fs::symlink_metadata(fs_probe_path(to)).is_ok() {
+        return Err(Error::runtime(format!(
+            "rename: cannot move '{from}': '{to}' exists"
+        )));
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(Value::Nil),
+        // EXDEV lands here. The message names the cause, because "the paths
+        // are not both writable" and "these are on different filesystems" call
+        // for different fixes and the caller can only tell them apart from the
+        // text.
+        Err(e) if e.raw_os_error() == Some(EXDEV) => Err(Error::runtime(format!(
+            "rename: cannot move '{from}' to '{to}': different filesystems"
+        ))),
+        Err(_) => Err(Error::runtime(format!(
+            "rename: cannot move '{from}' to '{to}'"
+        ))),
+    }
+}
+
+/// `(copy from to)` → `nil`, a byte-for-byte copy of one **file**.
+///
+/// This is a full read + write of the contents, not a hardlink, not a reflink
+/// and not a rename: a copy of a 2 GB file is 2 GB read and 2 GB written, and
+/// the two files then diverge — writing to one does not touch the other. The
+/// alternative (a hardlink) shares the inode, so a later `write-file` on either
+/// path would silently change both, which is a far worse surprise than the I/O.
+/// `rename` is the cheap operation; `copy` is the duplicating one.
+///
+/// A **directory** source is an error, not a silent skip: there is no
+/// `copy -r` and no `delete-dir` to pair it with, so quietly refusing would
+/// leave a caller believing files had been moved.
+///
+/// The copy is not atomic — a `to` that already exists is truncated, exactly
+/// as `write-file` truncates — so a crash mid-copy leaves a partial `to`, the
+/// same exposure `write-file` has always had. A caller who needs
+/// all-or-nothing should `copy` to a temporary and `rename` it into place.
+fn builtin_copy(args: &[Value]) -> Result<Value> {
+    let [from, to] = args else {
+        return Err(Error::runtime("copy expects (copy from to)"));
+    };
+    let from = as_path_arg(from, "copy")?;
+    let to = as_path_arg(to, "copy")?;
+    // symlink_metadata, not metadata: copying the *link* is a different
+    // operation from copying what it points at, and silently following it would
+    // make `copy` mean two things depending on what the link happened to point
+    // at. Note that this also means a symlink's *contents* are never copied —
+    // std::fs::copy follows it, so the link is copied as a plain file of the
+    // target's bytes, which is the only behavior a zero-dep C runtime can match
+    // without link(2).
+    let st = match std::fs::symlink_metadata(fs_probe_path(from)) {
+        Err(_) => {
+            return Err(Error::runtime(format!(
+                "copy: cannot copy '{from}': it does not exist"
+            )))
+        }
+        Ok(st) => st,
+    };
+    if st.is_dir() {
+        return Err(Error::runtime(format!(
+            "copy: cannot copy '{from}': it is a directory"
+        )));
+    }
+    match std::fs::copy(fs_probe_path(from), to) {
+        Ok(_) => Ok(Value::Nil),
+        Err(_) => Err(Error::runtime(format!(
+            "copy: cannot copy '{from}' to '{to}'"
+        ))),
+    }
+}
+
+/// `(is-dir path)` → `true` for a directory, `nil` otherwise.
+///
+/// **This is the real primitive the old `(file-exists (path-join p "."))` trick
+/// was reaching for.** That trick was correct but obscure: it worked only
+/// because `path_canonical` keeps a trailing `.`, and it read as a hack to
+/// anyone who had not read that rule.
+///
+/// `nil`, not `false`, is the negative answer — the same choice `file-exists`
+/// makes and for the same reason: AINL's own `get` returns `nil` for a missing
+/// key, so `(= (is-dir p) nil)` is the absence test every AINL program already
+/// writes, and a printed value shows one kind of absence rather than two.
+///
+/// A missing path is `nil` rather than an error, matching `file-exists`:
+/// "is this a directory?" has exactly one negative answer, and AINL cannot
+/// distinguish `ENOENT` from `EACCES` without making the caller handle a
+/// filesystem detail.
+///
+/// **`lstat`, not `stat`.** A symlink to a directory is a symlink, so this is
+/// `nil` — the link itself is not a directory, and following it would make the
+/// builtin disagree with itself depending on what the link points at. This is
+/// the same reason `file-exists` uses `lstat`. A caller who wants the target
+/// asks about the resolved path.
+fn builtin_is_dir(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("is-dir expects (is-dir path)"));
+    };
+    let path = as_path_arg(p, "is-dir")?;
+    Ok(match std::fs::symlink_metadata(fs_probe_path(path)) {
+        Ok(st) if st.is_dir() => Value::Bool(true),
+        _ => Value::Nil,
+    })
+}
+
+/// `(file-size path)` → the size of `path` in **bytes**, as an int.
+///
+/// Bytes, not characters: a file is a sequence of bytes and there is no
+/// character encoding *in the file*. This is the deliberate companion to the
+/// byte-oriented string primitives in §3g — `(len (read-file p))` counts
+/// characters and would report 2 for a two-character string that is 4 bytes on
+/// disk, so it cannot be used to size a file.
+///
+/// A **directory** is an error. There is no portable size for one: POSIX
+/// reports the directory's own inode size (4096 on ext4, 60 on APFS, 0 on
+/// tmpfs) and each backend hands back that number for its own host. Reporting
+/// `4096` as "the size of this directory" would report a filesystem
+/// implementation detail as a language value, so the case is refused and the
+/// caller is told why.
+///
+/// A missing path is the same "cannot read" error `read-file` raises, for the
+/// same reason: sizing a typo'd path must not look like a zero-byte file.
+fn builtin_file_size(args: &[Value]) -> Result<Value> {
+    let [p] = args else {
+        return Err(Error::runtime("file-size expects (file-size path)"));
+    };
+    let path = as_path_arg(p, "file-size")?;
+    let st = match std::fs::symlink_metadata(fs_probe_path(path)) {
+        Err(_) => return Err(Error::runtime(format!("file-size: cannot read '{path}'"))),
+        Ok(st) => st,
+    };
+    if st.is_dir() {
+        return Err(Error::runtime(format!(
+            "file-size: cannot read '{path}': it is a directory"
+        )));
+    }
+    Ok(Value::Int(st.len() as i64))
 }
 
 // ---- stdlib: strings -------------------------------------------------------

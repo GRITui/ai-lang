@@ -220,6 +220,26 @@ impl Js {
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
+        // Tier 3 file system.
+        //
+        // `_error` is the shared-message mechanism: every failure has to raise
+        // AINL's own `_AinlError` so an AINL `catch` intercepts it and stderr
+        // stays byte-comparable. A raw host Error (EEXIST, ENOTDIR, EBUSY) is
+        // neither — it escapes `catch` and prints a Node stack trace.
+        //
+        // `_ainl_tname` renders AINL's type name for a wrong-typed path, so
+        // `got int` matches the interpreter rather than `got number`; it
+        // branches on _Hash and _Sym, so both come with it.
+        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_error");
+            self.needed.insert("_fs_probe");
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("_Hash");
+            self.needed.insert("_Sym");
+        }
         // Tier 1 JSON. The whole cluster is pulled in by either entry point,
         // because `_ainl_tname` (json-parse's type error, and the "keys must be
         // str, got t" message) branches on _Hash and _Sym, and _json_ser needs
@@ -577,6 +597,12 @@ impl Js {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 3 file system ----
+                "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rename" => return self.call_builtin("_rename", args, Some("_rename")),
+                "copy" => return self.call_builtin("_copy", args, Some("_copy")),
+                "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
+                "file-size" => return self.call_builtin("_file_size", args, Some("_file_size")),
                 // ---- Tier 1 JSON ----
                 "json-parse" => {
                     return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
@@ -1182,6 +1208,82 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_path_dir",
         "function _path_dir(path) {\n  if (typeof path !== \"string\") throw new TypeError(\"path-dir expects a str path\");\n  const c = _path_canonical(path);\n  const i = c.lastIndexOf(\"/\");\n  if (i === -1) return \".\";\n  if (i === 0) return \"/\";\n  return c.slice(0, i);\n}",
+    ),
+    // ---- Tier 3 file system ----
+    // Same explicit-rules rule as the six above. The two that would bite a
+    // naive port: fs.renameSync CLOBBERS an existing destination silently
+    // (where POSIX rename(2) refuses), and Node's mkdirSync takes the
+    // recursive flag as an *options object* rather than a bare second
+    // argument, so even the call shape differs from os.mkdir's.
+    (
+        "_fs_probe",
+        // The path a filesystem *query* builtin probes, with a trailing
+        // separator stripped. The hosts split on whether "f/" is a legal way
+        // to name a non-directory (a throw here, ENOTDIR in C, a
+        // NotADirectoryError in Python, Errno::ENOTDIR in Ruby), so it is
+        // trimmed. A lone "/" is the root and must survive.
+        "function _fs_probe(p) {\n  return p.length > 1 && p.endsWith(\"/\") ? p.slice(0, -1) : p;\n}",
+    ),
+    (
+        "_mkdir",
+        // The option is a positional string, not a keyword: AINL has no
+        // keyword-argument syntax, so \":recursive\" arrives as an ordinary
+        // string. See docs/SYNTAX.md §3h.
+        //
+        // Arity is checked here rather than left to a JS arity error, because
+        // a host TypeError is not an _AinlError: it would escape an AINL
+        // `catch` and print a Node stack trace to stderr. (Found by the parity
+        // gate, not by reading the code.)
+        //
+        // An existing path is an error in BOTH modes, checked before the host
+        // call so the message is the same on every backend. mkdirSync without
+        // {recursive:true} throws EEXIST and with it does not, so this explicit
+        // check is what pins the strict rule: a caller that creates a
+        // directory and then writes into it needs to know whether *it* created
+        // it.
+        "function _mkdir(...args) {\n  if (args.length < 1 || args.length > 2) _error(\"mkdir expects (mkdir path) or (mkdir path option)\");\n  const path = args[0];\n  const opt = args.length > 1 ? args[1] : null;\n  if (typeof path !== \"string\") _error(`mkdir expects a str path, got ${_ainl_tname(path)}`);\n  if (opt !== null) {\n    if (typeof opt !== \"string\") _error(`mkdir expects a str option, got ${_ainl_tname(opt)}`);\n    if (opt !== \":recursive\") _error(`mkdir: unknown option '${opt}'`);\n  }\n  const fs = require(\"fs\");\n  // lstatSync, not existsSync: the interpreter's symlink_metadata is an\n  // lstat, and a broken symlink is still a directory entry mkdir must refuse.\n  let exists = true;\n  try {\n    fs.lstatSync(_fs_probe(path));\n  } catch (e) {\n    exists = false;\n  }\n  if (exists) _error(`mkdir: cannot create '${path}': it exists`);\n  try {\n    fs.mkdirSync(path, opt === \":recursive\" ? { recursive: true } : undefined);\n  } catch (e) {\n    _error(`mkdir: cannot create '${path}'`);\n  }\n}",
+    ),
+    (
+        "_rename",
+        // Both pre-checks happen before the host call, and that is the whole
+        // point: fs.renameSync CLOBBERS an existing destination silently, just
+        // like os.rename in Python, where POSIX rename(2) refuses. Without the
+        // check, the same program would destroy a file under some backends and
+        // preserve it under others.
+        //
+        // EXDEV is named rather than collapsed into the generic message,
+        // because \"different filesystems\" and \"not writable\" need different
+        // fixes. Node surfaces the code as e.code, not e.errno.
+        "function _rename(...args) {\n  if (args.length !== 2) _error(\"rename expects (rename from to)\");\n  const src = args[0];\n  const dst = args[1];\n  if (typeof src !== \"string\") _error(`rename expects a str path, got ${_ainl_tname(src)}`);\n  if (typeof dst !== \"string\") _error(`rename expects a str path, got ${_ainl_tname(dst)}`);\n  const fs = require(\"fs\");\n  let ok = true;\n  try {\n    fs.lstatSync(_fs_probe(src));\n  } catch (e) {\n    ok = false;\n  }\n  if (!ok) _error(`rename: cannot move '${src}': it does not exist`);\n  let taken = true;\n  try {\n    fs.lstatSync(_fs_probe(dst));\n  } catch (e) {\n    taken = false;\n  }\n  if (taken) _error(`rename: cannot move '${src}': '${dst}' exists`);\n  try {\n    fs.renameSync(src, dst);\n  } catch (e) {\n    if (e && e.code === \"EXDEV\") _error(`rename: cannot move '${src}' to '${dst}': different filesystems`);\n    _error(`rename: cannot move '${src}' to '${dst}'`);\n  }\n}",
+    ),
+    (
+        "_copy",
+        // A full read + write, never fs.linkSync: a hardlink shares the inode,
+        // so a later write-file on either path would silently change both.
+        // copyFileSync does the byte copy with no hardlink, and it truncates an
+        // existing destination exactly as write-file does.
+        "function _copy(...args) {\n  if (args.length !== 2) _error(\"copy expects (copy from to)\");\n  const src = args[0];\n  const dst = args[1];\n  if (typeof src !== \"string\") _error(`copy expects a str path, got ${_ainl_tname(src)}`);\n  if (typeof dst !== \"string\") _error(`copy expects a str path, got ${_ainl_tname(dst)}`);\n  const fs = require(\"fs\");\n  const p = _fs_probe(src);\n  let st;\n  try {\n    st = fs.lstatSync(p);\n  } catch (e) {\n    _error(`copy: cannot copy '${src}': it does not exist`);\n  }\n  if (st.isDirectory()) _error(`copy: cannot copy '${src}': it is a directory`);\n  try {\n    fs.copyFileSync(p, dst);\n  } catch (e) {\n    _error(`copy: cannot copy '${src}' to '${dst}'`);\n  }\n}",
+    ),
+    (
+        "_is_dir",
+        // lstatSync, not statSync: a symlink to a directory is a symlink, so
+        // the link itself is not a directory — the same rule the interpreter's
+        // symlink_metadata gives, and the reason statSync (which follows) would
+        // be wrong here. nil, not false, so `(= (is-dir p) nil)` is the absence
+        // test, matching file-exists.
+        "function _is_dir(...args) {\n  if (args.length !== 1) _error(\"is-dir expects (is-dir path)\");\n  const path = args[0];\n  if (typeof path !== \"string\") _error(`is-dir expects a str path, got ${_ainl_tname(path)}`);\n  try {\n    return require(\"fs\").lstatSync(_fs_probe(path)).isDirectory() ? true : null;\n  } catch (e) {\n    return null;\n  }\n}",
+    ),
+    (
+        "_file_size",
+        // Bytes, not characters: a file is a sequence of bytes and there is no
+        // encoding in the file, which is what makes this the companion to the
+        // byte-indexed string primitives. lstatSync, not statSync, to keep the
+        // no-follow rule; a symlink's own size is the link's, not the target's.
+        //
+        // A directory is an error, not a number: POSIX reports the directory's
+        // own inode size (4096 on ext4, 60 on APFS, 0 on tmpfs), so answering
+        // would report a filesystem implementation detail as a language value.
+        "function _file_size(...args) {\n  if (args.length !== 1) _error(\"file-size expects (file-size path)\");\n  const path = args[0];\n  if (typeof path !== \"string\") _error(`file-size expects a str path, got ${_ainl_tname(path)}`);\n  let st;\n  try {\n    st = require(\"fs\").lstatSync(_fs_probe(path));\n  } catch (e) {\n    _error(`file-size: cannot read '${path}'`);\n  }\n  if (st.isDirectory()) _error(`file-size: cannot read '${path}': it is a directory`);\n  return st.size;\n}",
     ),
     // The AINL type name for a value, for the position-reporting type errors
     // `path-join` raises. Kept tiny and explicit: the interpreter's wording

@@ -185,6 +185,28 @@ impl Rb {
             self.needed.insert("_ainl_tname");
             self.needed.insert("AHash");
         }
+        // Tier 3 file system.
+        //
+        // `_error` is the shared-message mechanism: every failure raises
+        // AINL's own `_AinlError` so an AINL `catch` intercepts it and stderr
+        // stays byte-comparable. A bare `raise Errno::EEXIST` is neither — it
+        // escapes `catch` and prints a Ruby backtrace.
+        //
+        // `_ainl_tname` renders AINL's type name for a wrong-typed path, so
+        // `got int` matches the interpreter rather than `got Integer`; it
+        // branches on AHash, so that comes with it.
+        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_error");
+            self.needed.insert("_fs_probe");
+            // `_mkdir`'s recursive branch calls the hand-rolled `_fs_mkdir_p`
+            // by name, so it must be emitted with it.
+            self.needed.insert("_fs_mkdir_p");
+            self.needed.insert("_ainl_tname");
+            self.needed.insert("AHash");
+        }
         // Tier 1 JSON. The whole cluster is pulled in by either entry point,
         // because `_ainl_tname` (json-parse's type error and the "keys must be
         // str, got t" message) and `_json_ser` both branch on AHash, and
@@ -460,6 +482,12 @@ impl Rb {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 3 file system ----
+                "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rename" => return self.call_builtin("_rename", args, Some("_rename")),
+                "copy" => return self.call_builtin("_copy", args, Some("_copy")),
+                "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
+                "file-size" => return self.call_builtin("_file_size", args, Some("_file_size")),
                 // ---- Tier 1 JSON ----
                 "json-parse" => {
                     return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
@@ -1120,6 +1148,91 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_path_dir",
         "def _path_dir(path)\n  raise TypeError, 'path-dir expects a str path' unless path.is_a?(String)\n  c = _path_canonical(path)\n  i = c.rindex('/')\n  return '.' if i.nil?\n  return '/' if i.zero?\n  c[0...i]\nend",
+    ),
+    // ---- Tier 3 file system ----
+    // Same explicit-rules rule as the six above. The two that would bite a
+    // naive port: File.rename CLOBBERS an existing destination silently (where
+    // POSIX rename(2) refuses), and Ruby's mkdir takes NO second argument at
+    // all — the recursive form is FileUtils.mkdir_p, a different method in a
+    // module that is not loaded — so the two modes are genuinely different
+    // calls in this host.
+    (
+        "_fs_probe",
+        // The path a filesystem *query* builtin probes, with a trailing
+        // separator stripped. The hosts split on whether "f/" is a legal way
+        // to name a non-directory (Errno::ENOTDIR here, ENOTDIR in C, a throw
+        // in Node, a NotADirectoryError in Python), so it is trimmed. A lone
+        // "/" is the root and must survive.
+        "def _fs_probe(p)\n  (p.length > 1 && p.end_with?('/')) ? p[0..-2] : p\nend",
+    ),
+    (
+        "_mkdir",
+        // The option is a positional string, not a keyword: AINL has no
+        // keyword-argument syntax, so ":recursive" arrives as an ordinary
+        // string. See docs/SYNTAX.md §3h.
+        //
+        // Arity is checked here rather than left to a Ruby arity error,
+        // because a host ArgumentError/TypeError is not an _AinlError: it would
+        // escape an AINL `catch` and print a Ruby backtrace to stderr. (Found
+        // by the parity gate, not by reading the code.)
+        //
+        // An existing path is an error in BOTH modes, checked before the host
+        // call so the message is the same on every backend. Dir.mkdir raises
+        // Errno::EEXIST and FileUtils.mkdir_p returns quietly, so this explicit
+        // check is what pins the strict rule: a caller that creates a
+        // directory and then writes into it needs to know whether *it* created
+        // it.
+        "def _mkdir(*args)\n  _error('mkdir expects (mkdir path) or (mkdir path option)') if args.length < 1 || args.length > 2\n  path = args[0]\n  opt = args.length > 1 ? args[1] : nil\n  _error(\"mkdir expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  unless opt.nil?\n    _error(\"mkdir expects a str option, got #{_ainl_tname(opt)}\") unless opt.is_a?(String)\n    _error(\"mkdir: unknown option '#{opt}'\") unless opt == ':recursive'\n  end\n  # File.lstat, not File.exist?: the interpreter's symlink_metadata is an\n  # lstat, and a broken symlink is still a directory entry mkdir must refuse.\n  begin\n    File.lstat(_fs_probe(path))\n    _error(\"mkdir: cannot create '#{path}': it exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    if opt == ':recursive'\n      # The parents only, one component at a time. FileUtils is deliberately\n      # not used: it is a stdlib require, and mkdir -p there returns quietly\n      # on an existing leaf — which the check above has already excluded, so\n      # building the parents here is both stricter and dependency-free.\n      parent = File.dirname(path)\n      unless parent == '.' || File.directory?(parent)\n        begin\n          _fs_mkdir_p(parent)\n        rescue SystemCallError\n          # reported below as the same 'cannot create'\n        end\n      end\n    end\n    Dir.mkdir(path)\n  rescue SystemCallError\n    _error(\"mkdir: cannot create '#{path}'\")\n  end\nend",
+    ),
+    (
+        // A dependency-free mkdir -p for the one call site above. Kept as its
+        // own helper so the recursive body of _mkdir stays readable, and named
+        // distinctly so it cannot be confused with the Tier 1 rule set.
+        "_fs_mkdir_p",
+        "def _fs_mkdir_p(path)\n  parts = path.split('/')\n  cur = path.start_with?('/') ? '/' : ''\n  parts.each do |seg|\n    next if seg.empty?\n    cur = cur.empty? || cur == '/' ? cur + seg : cur + '/' + seg\n    begin\n      Dir.mkdir(cur)\n    rescue SystemCallError\n      raise unless File.directory?(cur)\n    end\n  end\n  true\nend",
+    ),
+    (
+        "_rename",
+        // Both pre-checks happen before the host call, and that is the whole
+        // point: File.rename CLOBBERS an existing destination silently, just
+        // like os.rename and fs.renameSync, where POSIX rename(2) refuses.
+        // Without the check, the same program would destroy a file under some
+        // backends and preserve it under others.
+        //
+        // EXDEV is named rather than collapsed into the generic message,
+        // because "different filesystems" and "not writable" need different
+        // fixes. Ruby carries it as Errno::EXDEV, whose `Errno` module is
+        // built in.
+        "def _rename(*args)\n  _error('rename expects (rename from to)') if args.length != 2\n  src, dst = args\n  _error(\"rename expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"rename expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  begin\n    File.lstat(_fs_probe(src))\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}': it does not exist\")\n  end\n  begin\n    File.lstat(_fs_probe(dst))\n    _error(\"rename: cannot move '#{src}': '#{dst}' exists\")\n  rescue SystemCallError\n    # absent, which is the only case that may proceed\n  end\n  begin\n    File.rename(src, dst)\n  rescue Errno::EXDEV\n    _error(\"rename: cannot move '#{src}' to '#{dst}': different filesystems\")\n  rescue SystemCallError\n    _error(\"rename: cannot move '#{src}' to '#{dst}'\")\n  end\nend",
+    ),
+    (
+        "_copy",
+        // A full read + write, never File.link: a hardlink shares the inode, so
+        // a later write-file on either path would silently change both. IO.copy_stream
+        // is the stdlib byte copy and truncates an existing destination
+        // exactly as write-file does. 'rb'/'wb' so no newline translation can
+        // change the bytes.
+        "def _copy(*args)\n  _error('copy expects (copy from to)') if args.length != 2\n  src, dst = args\n  _error(\"copy expects a str path, got #{_ainl_tname(src)}\") unless src.is_a?(String)\n  _error(\"copy expects a str path, got #{_ainl_tname(dst)}\") unless dst.is_a?(String)\n  p = _fs_probe(src)\n  begin\n    st = File.lstat(p)\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}': it does not exist\")\n  end\n  _error(\"copy: cannot copy '#{src}': it is a directory\") if st.directory?\n  begin\n    File.open(p, 'rb') do |i|\n      File.open(dst, 'wb') { |o| IO.copy_stream(i, o) }\n    end\n  rescue SystemCallError\n    _error(\"copy: cannot copy '#{src}' to '#{dst}'\")\n  end\nend",
+    ),
+    (
+        "_is_dir",
+        // File.lstat + .directory?, not File.directory?: the latter follows a
+        // symlink, so a link to a directory would read as a directory where
+        // the interpreter's lstat says nil. nil, not false, so
+        // `(= (is-dir p) nil)` is the absence test, matching file-exists.
+        "def _is_dir(*args)\n  _error('is-dir expects (is-dir path)') if args.length != 1\n  path = args[0]\n  _error(\"is-dir expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  begin\n    st = File.lstat(_fs_probe(path))\n  rescue SystemCallError\n    return nil\n  end\n  st.directory? ? true : nil\nend",
+    ),
+    (
+        "_file_size",
+        // Bytes, not characters: a file is a sequence of bytes and there is no
+        // encoding in the file, which is what makes this the companion to the
+        // byte-indexed string primitives. File.lstat, not File.stat, to keep
+        // the no-follow rule.
+        //
+        // A directory is an error, not a number: POSIX reports the directory's
+        // own inode size (4096 on ext4, 60 on APFS, 0 on tmpfs), so answering
+        // would report a filesystem implementation detail as a language value.
+        "def _file_size(*args)\n  _error('file-size expects (file-size path)') if args.length != 1\n  path = args[0]\n  _error(\"file-size expects a str path, got #{_ainl_tname(path)}\") unless path.is_a?(String)\n  begin\n    st = File.lstat(_fs_probe(path))\n  rescue SystemCallError\n    _error(\"file-size: cannot read '#{path}'\")\n  end\n  _error(\"file-size: cannot read '#{path}': it is a directory\") if st.directory?\n  st.size\nend",
     ),
     // The AINL type name for a value, for `path-join`'s positional type error.
     // Explicit because the interpreter's wording ("got int at position 2") is
