@@ -163,12 +163,11 @@ const RAISERS: &[(&str, &str)] = &[
     ("(rest 5)", "rest expects list, got int"),
     ("(push 5 1)", "push expects"),
     ("(nth 1 \"s\")", "nth expects"),
-    // `(keys 5)` and its `vals`/`has` siblings are deliberately absent: JS
-    // `_keys` has no type guard at all (`Array.from(h, p => p[0])` returns `()`
-    // for an int), so the program *succeeds* on JS and there is no error path
-    // to check. That is a missing-guard bug, not a missing-class one, and it
-    // reproduces on clean main. Filed separately; including it here would fail
-    // on a defect this card does not claim to fix.
+    // `keys`/`vals`/`has` are deliberately absent: JS `_keys` has no type guard
+    // at all (`Array.from(h, p => p[0])` returns `()` for an int), so the
+    // program *succeeds* on JS and there is no error path to check. That is a
+    // missing-guard bug, not a missing-class one, and it reproduces on clean
+    // main. See t_3f1fdac1 — add these three back when that lands.
     ("(hash 1)", "hash expects an even number"),
     // Tier 1 file I/O and Tier 3 fs: both clusters name `_error` from a rule
     // that runs near the bottom of `resolve_deps`. These are *type* errors on
@@ -189,11 +188,12 @@ const RAISERS: &[(&str, &str)] = &[
     // rather than merely mis-ordered.
     ("(sort (list 1 \"s\"))", "sort expects"),
     // `min`/`max` are deliberately absent. They raise a host `TypeError`
-    // ("min expects a number"), not AINL's `_error`, on all three targets —
-    // a pre-existing wording divergence, unrelated to the class-missing bug and
-    // tracked separately. They are listed here because they DID lose `_isnum`
-    // on JS, and the structural test below covers that; asserting a message
-    // they do not produce would fail for a reason that is not this card's.
+    // ("min/max expects a number"), not AINL's `_error`, on all three targets —
+    // a pre-existing wording divergence, unrelated to the class-missing bug,
+    // and it also means a `catch` cannot intercept them. See t_457f643f. They
+    // are relevant here because they DID lose `_isnum` on JS, and the
+    // structural test below covers that; asserting a message they do not
+    // produce would fail for a reason that is not this card's.
 ];
 
 #[test]
