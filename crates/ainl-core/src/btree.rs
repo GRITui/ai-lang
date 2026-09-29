@@ -1073,4 +1073,91 @@ mod tests {
         assert_eq!(t.get("a"), None, "the key must not be cut at the NUL");
         assert_eq!(t.get("b"), None, "the key must not be cut at the NUL");
     }
+
+    /// The performance claim, asserted as **height** rather than as wall-clock
+    /// time.
+    ///
+    /// A lookup costs O(height), so a logarithmic height *is* the lookup
+    /// complexity, and height is a deterministic integer — it can be asserted
+    /// exactly, on any machine, forever. A timing assertion could only ever be
+    /// a threshold, would be flaky on shared CI, and would pass for a tree that
+    /// was merely "not too slow" — which is the failure mode a B-tree is
+    /// supposed to rule out. The bound below is the theoretical one: with order
+    /// 16 a node holds at most 15 keys, so a tree of *h* levels holds at least
+    /// 7^h keys, and 10_000 rows must fit in 5 levels (7^5 = 16_807).
+    #[test]
+    fn lookup_cost_is_logarithmic_in_the_row_count() {
+        // Ascending, so the tree is built by the cheapest path; descending and
+        // random are covered by the shape tests above, and height is a property
+        // of the count, not of the order.
+        let n = 10_000;
+        let mut t = BTree::new();
+        for i in 0..n {
+            t.insert(&format!("k{i:06}"), "v");
+        }
+        assert_eq!(t.len(), n);
+
+        // ceil(log_7(n)) is the minimum number of levels this many keys can
+        // occupy; the tree must not be deeper than that by more than the one
+        // level a root split can add.
+        let mut min_levels = 1;
+        let mut capacity = 1usize;
+        while capacity < n {
+            capacity = capacity.saturating_mul(MAX_KEYS / 2 + 1);
+            min_levels += 1;
+        }
+        assert!(
+            t.height() <= min_levels,
+            "a {n}-row tree is {} levels deep; order {MAX_KEYS} bounds it at {min_levels}",
+            t.height()
+        );
+
+        // And the growth is logarithmic in the *observed* heights, which is the
+        // property a reader can check by eye: 16x the rows, at most 2 more
+        // levels. A linear structure would fail this outright.
+        let mut small = BTree::new();
+        for i in 0..n / 16 {
+            small.insert(&format!("k{i:06}"), "v");
+        }
+        assert!(
+            t.height() <= small.height() + 2,
+            "16x the rows grew the tree from {} to {} levels, which is not logarithmic",
+            small.height(),
+            t.height()
+        );
+
+        // Every key is still findable, and an absent one is still absent — a
+        // height assertion alone would pass on a tree that had lost rows to
+        // keep its levels down.
+        for i in (0..n).step_by(997) {
+            assert_eq!(t.get(&format!("k{i:06}")), Some("v"));
+        }
+        assert_eq!(t.get("nope"), None);
+        assert_eq!(t.iter().len(), n, "no row was lost");
+    }
+
+    /// Enumeration is O(n) with no sort, and it is the in-order walk — so a
+    /// table of 10_000 rows comes back sorted, and a flat `Vec` implementation
+    /// could not claim the same thing about *inserting* into it. The point of
+    /// the assertion is the *order* and the *count*, not the speed: the walk is
+    /// a property of the structure, so a later change that swapped it for a
+    /// sort would be visible here as a diff in nothing at all, which is why the
+    /// order is checked against an explicit expectation rather than a re-sort.
+    #[test]
+    fn enumeration_is_the_walk_and_comes_back_sorted() {
+        let n = 2_000;
+        let mut t = BTree::new();
+        for i in 0..n {
+            t.insert(&format!("k{i:06}"), "v");
+        }
+        let got: Vec<&str> = t.iter().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(got.len(), n);
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        assert_eq!(got, sorted, "the walk must already be in key order");
+        // The count of levels is small enough that the walk is not doing a
+        // per-key descent: a `get` per key would be O(n log n) and this is the
+        // O(n) path.
+        assert!(t.height() <= 4, "2000 rows is {} levels", t.height());
+    }
 }

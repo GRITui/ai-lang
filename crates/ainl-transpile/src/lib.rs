@@ -94,8 +94,20 @@ pub fn transpile(target: Target, forms: &[Node], src: &str) -> Result<String> {
         // literal list of names, so a builtin added to either layer without
         // being added here falls into the "interpreter-only" arm — which fails
         // the refusal test in db_refusal.rs, and so cannot land quietly.
+        //
+        // That safety net did *not* catch the five table builtins, and it is
+        // worth being precise about why, because the comment above would
+        // otherwise be read as stronger than it is. An unknown name that no
+        // transpiler knows how to emit is not necessarily reported at all: the
+        // Ruby emitter turned `db-all-rows` into `db_all_rows.call(1, "t")`,
+        // a method call on an object that does not exist. So the fallback is a
+        // wrong-answer generator, not an error path, and only
+        // scripts/check-refusal-kv.sh — which asserts the refusal for each name
+        // by hand — catches it. All three name lists are chained here, and
+        // `dbtab::TABLE_BUILTINS` is the third.
         let is_db = ainl_core::db::DB_BUILTINS.contains(&sym)
-            || ainl_core::dbkv::KV_BUILTINS.contains(&sym);
+            || ainl_core::dbkv::KV_BUILTINS.contains(&sym)
+            || ainl_core::dbtab::TABLE_BUILTINS.contains(&sym);
         let (what, because) = if is_db {
             (
                 "transpiler-only",

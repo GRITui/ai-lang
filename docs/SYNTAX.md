@@ -1671,6 +1671,138 @@ Since `db-*` is refused by the transpilers outright, that divergence is
 documented rather than papered over — the same way `json_parity.rs` pins its own
 JS exception explicitly instead of quietly filtering the comparison.
 
+## 3m. Tables: `db-create-table` / `db-insert` / `db-select` / `db-delete-row` / `db-all-rows`
+
+**Tables** on top of §3l's value store. A named set of rows, each row an AINL
+list, each table indexed on the row's first column by a B-tree — so a lookup is
+O(log n) and `db-all-rows` comes back in key order without sorting:
+
+```ainl
+(def h (db-open "people.ainl-db"))
+(def people (db-create-table h "people"))
+
+(db-insert h people (list "ada" 36 "math"))
+(db-insert h people (list "grace" 45 "navy"))
+(db-insert h people (list "bob" 41 "navy"))
+
+(print (db-select h people "grace"))   ; ("grace" 45 "navy")
+(print (db-select h people "nobody"))  ; nil
+(print (db-all-rows h people))
+; (("ada" 36 "math") ("bob" 41 "navy") ("grace" 45 "navy"))
+
+(print (db-delete-row h people "bob")) ; true
+(print (db-all-rows h people))
+; (("ada" 36 "math") ("grace" 45 "navy"))
+(db-close h)
+```
+
+### The rules
+
+- **`db-create-table handle name` → the name.** Idempotent: creating a table
+  that exists is not an error, so `(def t (db-create-table h "t"))` at the top
+  of a program is safe to re-run against an existing file. It returns the name
+  so one form binds it and the later calls read as `db-insert people`.
+- **`db-insert handle table row` → nil.** `row` is a non-empty list whose
+  **first element is the primary key**. Re-inserting an existing key
+  **replaces** the row — a primary key *identifies* a row, so there is never
+  more than one.
+- **`db-select handle table key` → the row, or nil.** `key` is the primary key
+  *value*, not a row: `(db-select h people "grace")`, not
+  `(db-select h people (list "grace" 45 "navy"))`. It is the same value you
+  passed as the row's first element.
+- **`db-delete-row handle table key` → true or false.** `true` if the row was
+  live. Deleting an absent row is not an error, so a cleanup pass is safe to
+  run twice — the same answer `db-del` gives, for the same reason.
+- **`db-all-rows handle table` → a list of every row, sorted by primary key.**
+- A table that does not exist is refused by name:
+  `db-insert: no table named 'nope' in this database`.
+- A row with no columns is refused: `a row needs a primary key, so it cannot be
+  empty`.
+- Every column type round-trips exactly, including the int/float distinction,
+  because the row is stored through §3l's JSON writer.
+
+### The primary key is the first column, stored as its text
+
+A row's first element is the key, and it is stored as its **JSON text**. That is
+what lets a table have an integer key, and it is why the order is *byte* order:
+
+```ainl
+(db-insert h t (list 2 "two"))
+(db-insert h t (list 10 "ten"))
+(db-insert h t (list 1 "one"))
+(print (db-all-rows h t))
+; ((1 "one") (10 "ten") (2 "two"))   -- 1, 10, 2
+```
+
+`10` comes before `2`. That is deliberate, and it is a real sharp edge: the key
+is compared as text so that **one** comparator works for every scalar type and
+both engines can agree on it with `memcmp`. A table with integer keys that a
+program wants walked *numerically* wants a different key type — a zero-padded
+string, or a second index. Both are later-tier problems, and neither is worth
+bolting on here behind an inconsistent comparison.
+
+Keys must be **scalars** — `int`, `float`, `str`, `bool` or `nil`. A list or a
+map is refused by name:
+
+```
+db-insert: primary key cannot be a list — a table is indexed on one column, and
+a composite or unordered key has no order to index by
+```
+
+because a composite key has no single byte form to order by, and an index that
+cannot be walked cannot answer `db-all-rows`. `nil` **is** a legal key — it is a
+legal AINL value, and a key is just "the first column".
+
+### `db-all-rows` order is the tree's, not a sort
+
+The order is the B-tree's own in-order walk, not a sort applied on the way out.
+That is the whole reason for the structure over a hash table: enumeration is
+O(n) and both engines produce it **without either one sorting**, so there is no
+comparison function that can disagree.
+
+The AOT C runtime carries a hand-port of the tree (`dbt_*` in `runtime.c`) with
+the same order, the same minimum fill and the same split median. There is no FFI
+in this project, so that is a second implementation, and
+`crates/ainl-cc/tests/dbtab_aot.rs` runs the same operations through both
+engines and asserts identical output. Agreement between two implementations that
+share no code is the evidence; a shared comment is not.
+
+### Why the tree is not written to the file
+
+The tree is **rebuilt** on open, not serialized. What the file holds is the log
+records the index is built from — the rows, the keys, and therefore the order —
+so a reopen reconstructs an identical tree.
+
+Writing the node structure into the file would be a second write path *and* a
+second recovery path: a half-written interior node is a hole in the middle of
+the file, which is precisely the failure the append-only log exists to make
+impossible. Deletion is a log record for the same reason §3l gives — a delete
+survives a crash through the same replay a write does.
+
+### The three layers, one file
+
+| you write | is a | primary key |
+|---|---|---|
+| `db-put` / `db-get-raw` | one string per key | — |
+| `db-set` / `db-get` | one value per key | — |
+| `db-insert` / `db-select` | a row in a named table | the row's first column |
+
+All three share one log, one handle table and one recovery path, and a program
+may keep `db-set` keys and table rows in the same file; both survive a reopen.
+That is what makes sharing the log safe rather than merely convenient: a row is
+written as a normal log record under a **reserved key** — `@t:<len>:<name><key>`,
+length-prefixed so no table name or key can make two pairs encode alike — and
+`rebuild` only ever reads keys that encoding produced.
+
+An **empty table still survives a reopen**, which is why `db-create-table`
+appends a marker record: a table with no rows would otherwise leave nothing in
+the log to rediscover it from. The marker is not a row, and `db-all-rows` does
+not return it.
+
+**Refused by the transpilers**, on the same terms and for the same reason as
+`db-*` below — a host file object has no append-only-log semantics, and a B-tree
+over one has no meaning it could keep.
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

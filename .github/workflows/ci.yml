@@ -472,9 +472,20 @@ jobs:
       - name: "Key-value parity: interpreter vs compiled AOT"
         run: cargo test -p ainl-cc --test db_kv_aot -- --nocapture
 
-      # The refusal matrix, asserted in both directions: all ten `db-*` names
-      # refused by python/js/ruby with the symbol named, and accepted by AOT.
-      # The second half is the one a blanket rule would break while every
+      # The same claim for the *table* layer, and it needs its own job-step
+      # because the bug class is different. `db_kv_aot.rs` checks a flat store,
+      # which cannot catch a disagreement about the *order* of a walk or about
+      # which row a delete left behind after a rebalance — those are only
+      # visible through `db-all-rows`. The C runtime carries a hand-port of the
+      # B-tree with no FFI behind it, so agreement is evidence rather than a
+      # tautology. Every bug this file found was invisible to a table of 15 keys
+      # or fewer, which is why the fixtures go to 40 rows.
+      - name: "Table parity: interpreter vs compiled AOT"
+        run: cargo test -p ainl-cc --test dbtab_aot -- --nocapture
+
+      # The refusal matrix, asserted in both directions: all fifteen `db-*`
+      # names refused by python/js/ruby with the symbol named, and accepted by
+      # AOT. The second half is the one a blanket rule would break while every
       # refusal test kept passing. This one wants the *release* binary, so it
       # runs after the release build above.
       - name: "db-* refusal matrix (transpilers refuse, AOT accepts)"
