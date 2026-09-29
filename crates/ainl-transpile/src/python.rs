@@ -71,7 +71,10 @@ impl Py {
         self.needed.insert(name);
     }
 
-    fn finish(mut self) -> String {
+    /// One pass of the dependency rules. `finish` calls this repeatedly until
+    /// the set stops growing, so the order of the rules below is a readability
+    /// matter and not a correctness one — see `finish`.
+    fn resolve_deps(&mut self) {
         // Tier 2 testing first: `_test` renders the actual value, so it is a
         // member of the display cluster below — naming it there is what pulls
         // in `_disp`, `_repr`, `_Hash` and `_Sym`.
@@ -246,9 +249,19 @@ impl Py {
         // loop would miss it, and the program would fail at RUN time with
         // `NameError: name '_AinlError' is not defined` — on the error path,
         // which is exactly the path `try` exists to exercise.
+        //
+        // (The loop no longer has to run before that rule: `finish` iterates to
+        // a fixed point, so ordering within this function is a readability
+        // matter only. The comment is kept because it names the failure this
+        // list is responsible for.)
+        //
+        // `_hash` belongs here for the same reason as the rest: it reports an
+        // odd key/value count through `_error`, so naming it without `_error`
+        // emitted a module that died with `NameError: name '_error' is not
+        // defined` — a host error where AINL's own message belongs.
         for n in [
             "_add", "_sub", "_mul", "_div", "_mod", "_alist", "_ahash", "_len", "_first", "_rest",
-            "_nth", "_cons", "_push", "_get", "_assoc", "_has", "_keys", "_vals",
+            "_nth", "_cons", "_push", "_hash", "_get", "_assoc", "_has", "_keys", "_vals",
         ] {
             if self.needed.contains(n) {
                 self.needed.insert("_error");
@@ -289,6 +302,40 @@ impl Py {
             self.needed.insert("_Sym");
             self.needed.insert("_disp");
         }
+    }
+
+    /// Resolve the runtime dependency set, then emit.
+    ///
+    /// The rules are a graph, not a list, and its depth is real (`_sort` ->
+    /// `_error` -> `_AinlError` is two hops; `_error` -> `_disp` -> `_Hash` is
+    /// two more), so running them in a fixed order misses any rule whose input
+    /// is inserted by a rule that happens to run later. That is not
+    /// hypothetical: `(read-file "nope")` pulls in `_error` from the file rule,
+    /// which runs after the `_error` -> `_AinlError` rule, so the generated
+    /// module raised `NameError: name '_AinlError' is not defined` instead of
+    /// AINL's own message. Running to a fixed point removes the ordering
+    /// requirement, so a new rule cannot reintroduce this class of bug by
+    /// being written above a rule it depends on.
+    ///
+    /// Terminates because `resolve_deps` only inserts into the finite `RUNTIME`
+    /// set; the bound is a backstop, not the termination argument.
+    fn finish(mut self) -> String {
+        let bound = RUNTIME.len() + 1;
+        for _ in 0..bound {
+            let before = self.needed.len();
+            self.resolve_deps();
+            if self.needed.len() == before {
+                break;
+            }
+        }
+        debug_assert_eq!(
+            self.needed.len(),
+            {
+                self.resolve_deps();
+                self.needed.len()
+            },
+            "dependency resolution did not reach a fixed point"
+        );
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to python`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");

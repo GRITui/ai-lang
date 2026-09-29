@@ -61,7 +61,10 @@ impl Rb {
         self.needed.insert(name);
     }
 
-    fn finish(mut self) -> String {
+    /// One pass of the dependency rules. `finish` calls this repeatedly, so
+    /// the order of the rules below is a readability matter and not a
+    /// correctness one — see the fixed-point loop in `finish`.
+    fn resolve_deps(&mut self) {
         // Tier 2 testing first: `_test` renders the actual value, so it is a
         // member of the display cluster below — naming it there is what pulls
         // in `_disp` and `_repr` — and it names a bad operand's type.
@@ -123,9 +126,14 @@ impl Rb {
         // first. RUNTIME is emitted in declaration order and the helper cluster
         // is declared ABOVE the type-name helper, so this ordering is what
         // keeps the generated file loadable.
+        //
+        // `_hash` belongs here for the same reason as the rest: it reports an
+        // odd key/value count through `_error`, so naming it without `_error`
+        // emitted a helper that died with `NameError: name '_error' is not
+        // defined` — a host error where AINL's own message belongs.
         for n in [
             "_add", "_sub", "_mul", "_div", "_mod", "_alist", "_ahash", "_len", "_first", "_rest",
-            "_nth", "_cons", "_push", "_get", "_assoc", "_has", "_keys", "_vals",
+            "_nth", "_cons", "_push", "_hash", "_get", "_assoc", "_has", "_keys", "_vals",
         ] {
             if self.needed.contains(n) {
                 self.needed.insert("_error");
@@ -233,6 +241,47 @@ impl Rb {
             self.needed.insert("_disp");
             self.needed.insert("AHash");
         }
+    }
+
+    /// Resolve the runtime dependency set, then emit.
+    ///
+    /// The rules above are a graph, not a list, and it is a DAG with real depth
+    /// (`_sort` -> `_error` -> `AinlError` -> `_disp` -> `AHash` is four hops).
+    /// Evaluating them in a fixed order is therefore wrong by construction: a
+    /// rule that runs before the rule which pulls in its own input sees a
+    /// `needed` set that is not yet complete and inserts nothing.
+    ///
+    /// That is not hypothetical. `_error` raises `AinlError`, and the rule
+    /// that pulls the class in checked `needed` for `_error` *before* the
+    /// loops that insert `_error` for the arithmetic, file and fs builtins — so
+    /// `(print (+ 1.0 "s"))`, which has no `try` and no `error` form, emitted
+    /// `def _error` naming a class it never defined, and died with
+    /// `uninitialized constant AinlError (NameError)` instead of AINL's
+    /// message. A fixed point removes the ordering requirement entirely: a new
+    /// rule cannot reintroduce this class of bug by being written above a rule
+    /// it depends on.
+    ///
+    /// The loop terminates because `resolve_deps` only ever inserts into a
+    /// finite set (`RUNTIME`), so a pass that adds nothing is the last one.
+    /// The bound is a belt-and-braces backstop, not the real termination
+    /// argument: it is the number of RUNTIME entries.
+    fn finish(mut self) -> String {
+        let bound = RUNTIME.len() + 1;
+        for _ in 0..bound {
+            let before = self.needed.len();
+            self.resolve_deps();
+            if self.needed.len() == before {
+                break;
+            }
+        }
+        debug_assert_eq!(
+            self.needed.len(),
+            {
+                self.resolve_deps();
+                self.needed.len()
+            },
+            "dependency resolution did not reach a fixed point"
+        );
         let mut out = String::new();
         out.push_str("# Transpiled from AINL by `ainl transpile --to ruby`.\n");
         out.push_str("# Generated code: edit the .ainl source, not this file.\n\n");
@@ -999,7 +1048,13 @@ const RUNTIME: &[(&str, &str)] = &[
     ("_push", "def _push(t, *xs)\n  _alist('push', t)\n  t + xs\nend"),
     (
         "_hash",
-        "def _hash(*kvs)\n  out = AHash.new\n  i = 0\n  while i < kvs.length\n    k, v = kvs[i], kvs[i + 1]\n    pair = out.find { |p| p[0] == k }\n    if pair\n      pair[1] = v\n    else\n      out << [k, v]\n    end\n    i += 2\n  end\n  out\nend",
+        // The odd-arity guard is AINL's, not Ruby's. Without it, `(hash 1)`
+        // reached `kvs[1]` as nil and quietly built `{1 => nil}`, exiting 0
+        // where the interpreter exits 1 with `hash expects an even number of
+        // key/value arguments, got 1` — a program that fails on four backends
+        // silently succeeding on the fifth, the worst shape of divergence
+        // because nothing looks wrong. Python and JS both carry the guard.
+        "def _hash(*kvs)\n  _error('hash expects an even number of key/value arguments, got ' + kvs.length.to_s) if kvs.length % 2 != 0\n  out = AHash.new\n  i = 0\n  while i < kvs.length\n    k, v = kvs[i], kvs[i + 1]\n    pair = out.find { |p| p[0] == k }\n    if pair\n      pair[1] = v\n    else\n      out << [k, v]\n    end\n    i += 2\n  end\n  out\nend",
     ),
     (
         "_get",

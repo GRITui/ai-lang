@@ -63,7 +63,10 @@ impl Js {
         self.needed.insert(name);
     }
 
-    fn finish(mut self) -> String {
+    /// One pass of the dependency rules. `finish` calls this repeatedly until
+    /// the set stops growing, so the order of the rules below is a readability
+    /// matter and not a correctness one — see `finish`.
+    fn resolve_deps(&mut self) {
         // Tier 2 testing first: `_test` renders the actual value, so it is a
         // member of the display cluster below — naming it there is what pulls
         // in `_disp`, `_repr`, `_Hash` and `_Sym`.
@@ -72,10 +75,17 @@ impl Js {
         }
         // Tier 3 collections: `_sort` names AINL types in its errors and
         // delegates the comparator's sign to `_cmp_sign`.
+        //
+        // It also *raises* through `_error` — a mixed list, a non-list, a
+        // non-fn comparator and a bad arity all report that way — so it needs
+        // the edge. Without it, `(sort (list 1 "s"))` emitted `_sort` calling
+        // a function that was never defined and died with
+        // `ReferenceError: _error is not defined` instead of AINL's message.
         if self.needed.contains("_sort") {
             self.needed.insert("_typename");
             self.needed.insert("_cmp_sign");
             self.needed.insert("_sort_key");
+            self.needed.insert("_error");
         }
         let disp_used = self.needed.iter().any(|n| {
             matches!(
@@ -104,10 +114,16 @@ impl Js {
         }
         // Stage 3.1 stdlib dependencies: `_min`/`_max` share one fold helper and
         // `_sleep`/`_abs`/`_floor`/`_sqrt` share the number check.
+        //
+        // `_minmax` is the odd one out: unlike the four, it *calls* `_isnum`
+        // rather than using it, so it needs the edge too. Without it,
+        // `(min 1 "s")` emitted a `_minmax` naming a function that was never
+        // defined and died with `ReferenceError: _isnum is not defined`
+        // instead of AINL's `min expects a number, got str`.
         if self.needed.contains("_min") || self.needed.contains("_max") {
             self.needed.insert("_minmax");
         }
-        for dep in ["_sleep", "_abs", "_floor", "_sqrt"] {
+        for dep in ["_sleep", "_abs", "_floor", "_sqrt", "_minmax"] {
             if self.needed.contains(dep) {
                 self.needed.insert("_isnum");
             }
@@ -271,6 +287,41 @@ impl Js {
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
         }
+    }
+
+    /// Resolve the runtime dependency set, then emit.
+    ///
+    /// The rules are a graph, not a list, and its depth is real
+    /// (`_sort` -> `_error` -> `_AinlError` is two hops; `_error` -> `_disp` ->
+    /// `_Hash` is two more), so running them in a fixed order misses any rule
+    /// whose input is inserted by a rule that happens to run later. That is not
+    /// hypothetical: `(mkdir "d")` pulls in `_error` from the fs rule at the
+    /// bottom of this function, which runs *after* the `_error` -> `_AinlError`
+    /// rule, so the generated file called `throw new _AinlError(...)` with no
+    /// `_AinlError` in scope and died with `ReferenceError: _AinlError is not
+    /// defined`. Running to a fixed point removes the ordering requirement, so
+    /// a new rule cannot reintroduce this class of bug by being written above a
+    /// rule it depends on.
+    ///
+    /// Terminates because `resolve_deps` only inserts into the finite `RUNTIME`
+    /// set; the bound is a backstop, not the termination argument.
+    fn finish(mut self) -> String {
+        let bound = RUNTIME.len() + 1;
+        for _ in 0..bound {
+            let before = self.needed.len();
+            self.resolve_deps();
+            if self.needed.len() == before {
+                break;
+            }
+        }
+        debug_assert_eq!(
+            self.needed.len(),
+            {
+                self.resolve_deps();
+                self.needed.len()
+            },
+            "dependency resolution did not reach a fixed point"
+        );
         let mut out = String::new();
         out.push_str("// Transpiled from AINL by `ainl transpile --to js`.\n");
         out.push_str("// Generated code: edit the .ainl source, not this file.\n\n");
