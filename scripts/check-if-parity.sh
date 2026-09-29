@@ -45,10 +45,18 @@ check_all_five() {
     fi
   fi
 
+  # Transpile to a REAL FILE, then run it. Piping the program in (e.g.
+  # `node <(...)`) works on macOS, where /dev/fd resolves, but on an ubuntu
+  # runner node opens the path as a regular file and fails with
+  # ENOENT: '/proc/PID/fd/pipe:[...]'. Every program therefore goes through a
+  # file on disk — the convention the other CI parity scripts already use.
   local py_out="" js_out="" rb_out=""
-  py_out=$(python3 <("$B" transpile "$D/t.ainl" --to python) 2>&1); py_rc=$?
-  js_out=$(node     <("$B" transpile "$D/t.ainl" --to js)     2>&1); js_rc=$?
-  rb_out=$(ruby     <("$B" transpile "$D/t.ainl" --to ruby)   2>&1); rb_rc=$?
+  "$B" transpile "$D/t.ainl" --to python > "$D/t.py" 2>/dev/null
+  py_out=$(python3 "$D/t.py" 2>&1); py_rc=$?
+  "$B" transpile "$D/t.ainl" --to js     > "$D/t.js" 2>/dev/null
+  js_out=$(node     "$D/t.js" 2>&1); js_rc=$?
+  "$B" transpile "$D/t.ainl" --to ruby   > "$D/t.rb" 2>/dev/null
+  rb_out=$(ruby     "$D/t.rb" 2>&1); rb_rc=$?
 
   if [ "$vm_rc" -ne 0 ]; then
     echo "FAIL $label: the VM errored (exit $vm_rc)"
