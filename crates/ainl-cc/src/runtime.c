@@ -148,6 +148,13 @@ enum {
    * BUILTIN_IDS in ainl-cc's lib.rs are extended in exactly this order, and
    * crates/ainl-cc/tests/aot_stdlib.rs checks both directions. */
   B_MKDIR, B_RENAME, B_COPY, B_IS_DIR, B_FILE_SIZE,
+  /* Tier 4 storage. Appended last for the same reason: the five ids and
+   * BUILTIN_IDS in ainl-cc's lib.rs are extended in exactly this order. Unlike
+   * `import` and the HTTP pair, these are NOT refused here — the engine is a
+   * header, an append-only log and a CRC per record, which is all libc. The
+   * implementation is the `db_*` block further down, a hand-port of
+   * ainl-core/src/db.rs. */
+  B_DB_OPEN, B_DB_PUT, B_DB_GET, B_DB_FLUSH, B_DB_CLOSE,
   B_COUNT
 };
 
@@ -2809,6 +2816,481 @@ static Value builtin_json_serialize(Value *args, int nargs);
 static Value builtin_test(Value *args, int nargs);
 static Value builtin_sort(Value *args, int nargs);
 
+/* ---- Tier 4 storage: the AINL database ---------------------------------- *
+ *
+ * A hand-port of ainl-core/src/db.rs, which is the normative definition. Read
+ * the two side by side: every rule below has a counterpart there, and the
+ * reason the port exists at all is written in that file's header. The short
+ * version: the engine is a 16-byte header followed by an append-only log, each
+ * record is `key_len u32 | val_len u32 | crc32 u32 | key | value`, and `open`
+ * replays it — discarding a torn or corrupt tail and truncating the file back
+ * to the last good record, so the next append lands on a clean boundary.
+ *
+ * The CRC is the standard reflected IEEE 0xEDB88320, and the table below is
+ * checked against zlib's own test vector (crc32("123456789") == 0xCBF43926) in
+ * a unit test — a "checksum" that only round-trips between this file and the
+ * Rust engine would not be a crash-recovery mechanism at all.
+ *
+ * libc only: open/read/write/ftruncate/fsync and the existing utf8_valid. No
+ * dependency is added, so the `aot-standalone` job's musl-static link still
+ * proves the property that the whole project sells.
+ */
+#define AINL_DB_MAGIC "AINLDB"
+#define AINL_DB_VERSION 1
+#define AINL_DB_HEADER_LEN 16
+#define AINL_DB_REC_HEADER_LEN 12
+/* Must match MAX_OPEN in ainl-core/src/db.rs: a program that opens the 65th
+ * database has to be refused identically on both sides. */
+#define AINL_DB_MAX_OPEN 64
+
+/* Bucket count for the in-memory index. A prime so a key set of consecutive
+ * integers (or of zero-padded names) does not pile into one chain — the
+ * classic way a "hash table" ends up O(n) per lookup in practice. */
+#define DB_BUCKETS 257
+
+typedef struct DbEntry DbEntry;
+struct DbEntry {
+  char *key;
+  char *val;
+  DbEntry *next;
+};
+
+typedef struct Db Db;
+struct Db {
+  char *path;  /* owned; only for error messages */
+  FILE *f;     /* positioned at the end, ready to append */
+  DbEntry *buckets[DB_BUCKETS];
+  int nkeys; /* records indexed, not distinct keys: an overwritten key counts
+             * twice. Nothing reads it yet, but it is the number a future
+             * compaction would need and it costs one int. */
+};
+
+/* Open handles, indexed by handle number minus one. A fixed table rather than
+ * a growing array, for the same reason MAX_OPEN is: the generated binary
+ * links against libc alone and has no allocator accounting to grow from. */
+static Db *g_dbs[AINL_DB_MAX_OPEN];
+
+/* CRC-32 table for the reflected IEEE polynomial, built at compile time. The
+ * same construction as CRC_TABLE in db.rs — shift right, conditionally XOR
+ * 0xEDB88320 — so the two cannot drift in *form*, and the test vector pins
+ * that they do not drift in *value*. */
+static uint32_t db_crc_table[256];
+static void db_crc_init(void) {
+  static int done = 0;
+  if (done)
+    return;
+  done = 1;
+  for (uint32_t i = 0; i < 256; i++) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; k++)
+      c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+    db_crc_table[i] = c;
+  }
+}
+
+/* The CRC of the key followed by the value — the record's body, not its
+ * header. Matches crc32_body in db.rs exactly. */
+static uint32_t db_crc(const unsigned char *key, size_t klen, const unsigned char *val,
+                       size_t vlen) {
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < klen; i++)
+    c = db_crc_table[(c ^ key[i]) & 0xFF] ^ (c >> 8);
+  for (size_t i = 0; i < vlen; i++)
+    c = db_crc_table[(c ^ val[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+
+static uint32_t db_rd32(const unsigned char *b) {
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+         ((uint32_t)b[3] << 24);
+}
+
+static void db_wr32(unsigned char *b, uint32_t v) {
+  b[0] = (unsigned char)(v & 0xFF);
+  b[1] = (unsigned char)((v >> 8) & 0xFF);
+  b[2] = (unsigned char)((v >> 16) & 0xFF);
+  b[3] = (unsigned char)((v >> 24) & 0xFF);
+}
+
+static void db_entry_free(Db *db) {
+  for (int b = 0; b < DB_BUCKETS; b++) {
+    DbEntry *e = db->buckets[b];
+    while (e) {
+      DbEntry *next = e->next;
+      free(e->key);
+      free(e->val);
+      free(e);
+      e = next;
+    }
+    db->buckets[b] = NULL;
+  }
+  db->nkeys = 0;
+}
+
+static void db_close_raw(Db *db) {
+  if (!db)
+    return;
+  db_entry_free(db);
+  if (db->f)
+    fclose(db->f);
+  free(db->path);
+  free(db);
+}
+
+/* A key is usable if it is well-formed UTF-8 with no NUL. The NUL rule is not
+ * cosmetic: the value travels as a `char *` through the whole C runtime, so an
+ * embedded NUL would truncate it here while the Rust engine kept it. Both sides
+ * drop such a record so the same file recovers identically on each. */
+static int db_usable(const unsigned char *b, size_t len) {
+  if (!utf8_valid((const char *)b, len))
+    return 0;
+  return memchr(b, 0, len) == NULL;
+}
+
+/* The in-memory index: a chained hash table over the key bytes.
+ *
+ * Chaining, and newest-first within a bucket, is what makes "last write wins"
+ * fall out for free — a lookup that finds a duplicate key stops at the most
+ * recent record for it, which is exactly the answer replay-in-order gives. A
+ * map that kept one entry per key would have to *replace* the value on every
+ * put instead, which is the same amount of code for a worse failure mode: an
+ * index that can only lose the older of two duplicates cannot report them at
+ * all, and a program that reads back a key it overwrote gets the wrong answer
+ * with no way to tell. The bucket count is a prime, so a key set of
+ * consecutive integers does not pile into one chain — see DB_BUCKETS above.
+ */
+
+/* FNV-1a over the key. A different hash from the CRC on purpose: the CRC is
+ * the *format's* integrity check and must never change, while this one only
+ * picks a bucket, and the simplest thing that spreads bytes well is the right
+ * amount of machinery. */
+static uint32_t db_hash(const char *s) {
+  uint32_t h = 2166136261u;
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    h ^= *p;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static void db_index_put(Db *db, const char *key, const char *val) {
+  DbEntry *e = malloc(sizeof(DbEntry));
+  if (!e) {
+    set_err("db-open: out of memory");
+    return;
+  }
+  e->key = strdup(key);
+  e->val = strdup(val);
+  if (!e->key || !e->val) {
+    free(e->key);
+    free(e->val);
+    free(e);
+    set_err("db-open: out of memory");
+    return;
+  }
+  DbEntry **slot = &db->buckets[db_hash(key) % DB_BUCKETS];
+  e->next = *slot;
+  *slot = e;
+  db->nkeys++;
+}
+
+static const char *db_index_get(Db *db, const char *key) {
+  for (DbEntry *e = db->buckets[db_hash(key) % DB_BUCKETS]; e; e = e->next)
+    if (strcmp(e->key, key) == 0)
+      return e->val;
+  return NULL;
+}
+
+/* Replay the log into the index, then truncate any torn tail. Returns 0 and
+ * sets g_err on a refusal (foreign file, wrong version); a torn *tail* is not
+ * an error — it is the case this function exists to handle. */
+static int db_replay(Db *db) {
+  db_crc_init();
+  long size;
+  if (fseek(db->f, 0, SEEK_END) != 0)
+    return 0;
+  size = ftell(db->f);
+  if (size < 0)
+    return 0;
+  if (size == 0) {
+    /* A new file: write the header and there is nothing to replay. */
+    unsigned char h[AINL_DB_HEADER_LEN];
+    memset(h, 0, sizeof(h));
+    memcpy(h, AINL_DB_MAGIC, 6);
+    h[6] = AINL_DB_VERSION;
+    db_wr32(h + 8, AINL_DB_HEADER_LEN);
+    rewind(db->f);
+    if (fwrite(h, 1, sizeof(h), db->f) != sizeof(h))
+      return 0;
+    fflush(db->f);
+    return 1;
+  }
+  if (size < AINL_DB_HEADER_LEN) {
+    set_err("db-open: '%s' is not an AINL database", db->path);
+    return 0;
+  }
+  unsigned char *raw = malloc((size_t)size);
+  if (!raw) {
+    set_err("db-open: out of memory");
+    return 0;
+  }
+  rewind(db->f);
+  size_t got = fread(raw, 1, (size_t)size, db->f);
+  if (got != (size_t)size) {
+    free(raw);
+    set_err("db-open: cannot read '%s'", db->path);
+    return 0;
+  }
+  if (memcmp(raw, AINL_DB_MAGIC, 6) != 0) {
+    free(raw);
+    set_err("db-open: '%s' is not an AINL database", db->path);
+    return 0;
+  }
+  if (raw[6] != AINL_DB_VERSION) {
+    unsigned char v = raw[6];
+    free(raw);
+    set_err("db-open: '%s' is database version %u, but this AINL reads version %d",
+            db->path, (unsigned)v, AINL_DB_VERSION);
+    return 0;
+  }
+
+  size_t off = AINL_DB_HEADER_LEN;
+  while (off + AINL_DB_REC_HEADER_LEN <= (size_t)size) {
+    uint32_t klen = db_rd32(raw + off);
+    uint32_t vlen = db_rd32(raw + off + 4);
+    uint32_t want = db_rd32(raw + off + 8);
+    size_t body = off + AINL_DB_REC_HEADER_LEN;
+    /* The lengths are crash-controlled: bound them by what is actually in the
+     * file *before* slicing, so a corrupt 0xFFFFFFFF cannot drive a giant
+     * copy. Same rule as the Rust replay. */
+    if ((size_t)klen > (size_t)size - body)
+      break;
+    if ((size_t)vlen > (size_t)size - body - klen)
+      break;
+    size_t end = body + klen + vlen;
+    const unsigned char *kb = raw + body;
+    const unsigned char *vb = raw + body + klen;
+    if (db_crc(kb, klen, vb, vlen) != want)
+      break;
+    if (!db_usable(kb, klen) || !db_usable(vb, vlen))
+      break;
+    char *key = malloc(klen + 1);
+    char *val = malloc(vlen + 1);
+    if (!key || !val) {
+      free(key);
+      free(val);
+      free(raw);
+      set_err("db-open: out of memory");
+      return 0;
+    }
+    memcpy(key, kb, klen);
+    key[klen] = 0;
+    memcpy(val, vb, vlen);
+    val[vlen] = 0;
+    db_index_put(db, key, val);
+    free(key);
+    free(val);
+    if (g_err) {
+      free(raw);
+      return 0;
+    }
+    off = end;
+  }
+  free(raw);
+
+  /* Drop the torn tail *on disk*, not just in memory — see the module note in
+   * db.rs: a recovery that leaves the garbage in place makes the next open the
+   * one that loses data. */
+  if (off != (size_t)size) {
+    if (ftruncate(fileno(db->f), (off_t)off) != 0) {
+      set_err("db-open: cannot truncate '%s'", db->path);
+      return 0;
+    }
+  }
+  if (fseek(db->f, 0, SEEK_END) != 0) {
+    set_err("db-open: cannot seek '%s'", db->path);
+    return 0;
+  }
+  return 1;
+}
+
+static Db *db_lookup(int64_t h, const char *who) {
+  if (h < 1 || h > AINL_DB_MAX_OPEN || !g_dbs[h - 1]) {
+    set_err("%s: handle %lld is not open", who, (long long)h);
+    return NULL;
+  }
+  return g_dbs[h - 1];
+}
+
+/* A handle operand, reported under the builtin's own name. */
+static int64_t as_handle_arg(Value *v, const char *who) {
+  if (v->tag == V_INT)
+    return v->u.i;
+  set_err("%s expects a db handle, got %s", who, type_name(v));
+  return 0;
+}
+
+/* (db-open path) -> int handle. The capacity check runs BEFORE the file is
+ * created: opening a database is a filesystem side effect, and a refused open
+ * must not leave behind a file the caller never asked for. */
+static Value builtin_db_open(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("db-open expects (db-open path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "db-open");
+  if (!path)
+    return v_nil();
+  int slot = -1;
+  for (int i = 0; i < AINL_DB_MAX_OPEN; i++) {
+    if (!g_dbs[i]) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    set_err("db-open: too many open databases (max %d)", AINL_DB_MAX_OPEN);
+    return v_nil();
+  }
+  /* "r+b" not "w+b": the log being replayed must not be truncated. A missing
+   * file is created — "a+b" appends, but seek-to-end before every read is
+   * then the caller's problem, so create-then-open is clearer. */
+  FILE *f = fopen(path, "r+b");
+  if (!f)
+    f = fopen(path, "w+b");
+  if (!f) {
+    set_err("db-open: cannot open '%s'", path);
+    return v_nil();
+  }
+  Db *db = calloc(1, sizeof(Db));
+  if (!db) {
+    fclose(f);
+    set_err("db-open: out of memory");
+    return v_nil();
+  }
+  db->path = strdup(path);
+  db->f = f;
+  if (!db->path) {
+    db_close_raw(db);
+    set_err("db-open: out of memory");
+    return v_nil();
+  }
+  if (!db_replay(db)) {
+    db_close_raw(db);
+    return v_nil();
+  }
+  g_dbs[slot] = db;
+  return v_int(slot + 1);
+}
+
+/* (db-put handle key value) -> nil. Appends a record to the log. */
+static Value builtin_db_put(Value *args, int nargs) {
+  if (nargs != 3) {
+    set_err("db-put expects (db-put handle key value)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-put");
+  if (!h)
+    return v_nil();
+  const char *key = as_str_arg(&args[1], "db-put");
+  if (!key)
+    return v_nil();
+  const char *val = as_str_arg(&args[2], "db-put");
+  if (!val)
+    return v_nil();
+  Db *db = db_lookup(h, "db-put");
+  if (!db)
+    return v_nil();
+  size_t klen = strlen(key), vlen = strlen(val);
+  unsigned char hdr[AINL_DB_REC_HEADER_LEN];
+  db_wr32(hdr, (uint32_t)klen);
+  db_wr32(hdr + 4, (uint32_t)vlen);
+  db_wr32(hdr + 8, db_crc((const unsigned char *)key, klen, (const unsigned char *)val, vlen));
+  if (fwrite(hdr, 1, sizeof(hdr), db->f) != sizeof(hdr) ||
+      (klen && fwrite(key, 1, klen, db->f) != klen) ||
+      (vlen && fwrite(val, 1, vlen, db->f) != vlen)) {
+    set_err("db-put: cannot write '%s'", db->path);
+    return v_nil();
+  }
+  db_index_put(db, key, val);
+  return v_nil();
+}
+
+/* (db-get handle key) -> str, or nil if absent. The value comes from the
+ * in-memory index, so a get never touches the file. */
+static Value builtin_db_get(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("db-get expects (db-get handle key)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-get");
+  if (!h)
+    return v_nil();
+  const char *key = as_str_arg(&args[1], "db-get");
+  if (!key)
+    return v_nil();
+  Db *db = db_lookup(h, "db-get");
+  if (!db)
+    return v_nil();
+  const char *val = db_index_get(db, key);
+  return val ? v_str(val) : v_nil();
+}
+
+/* (db-flush handle) -> nil. fsync, not just fflush: "on disk" for a crash test
+ * means the device, not the process's buffer. */
+static Value builtin_db_flush(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("db-flush expects (db-flush handle)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-flush");
+  if (!h)
+    return v_nil();
+  Db *db = db_lookup(h, "db-flush");
+  if (!db)
+    return v_nil();
+  if (fflush(db->f) != 0 || fsync(fileno(db->f)) != 0) {
+    set_err("db-flush: cannot flush '%s'", db->path);
+    return v_nil();
+  }
+  return v_nil();
+}
+
+/* (db-close handle) -> nil. Flushes, then releases the slot — the slot is
+ * freed even if the flush failed, because the error is already reported and
+ * holding the slot would leak the only handle a caller could retry with. */
+static Value builtin_db_close(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("db-close expects (db-close handle)");
+    return v_nil();
+  }
+  int64_t h = as_handle_arg(&args[0], "db-close");
+  if (!h)
+    return v_nil();
+  Db *db = db_lookup(h, "db-close");
+  if (!db)
+    return v_nil();
+  g_dbs[h - 1] = NULL;
+  if (fflush(db->f) != 0 || fsync(fileno(db->f)) != 0)
+    set_err("db-close: cannot flush '%s'", db->path);
+  db_close_raw(db);
+  return v_nil();
+}
+
+/* Release every open database at exit. A program that never called db-close
+ * has still written a valid log (each put is appended and the OS flushes on
+ * close), but leaving the table populated would be a leak in any host that
+ * embeds this runtime; the generated main calls this on the success path. */
+static void db_close_all(void) {
+  for (int i = 0; i < AINL_DB_MAX_OPEN; i++) {
+    if (g_dbs[i]) {
+      fflush(g_dbs[i]->f);
+      db_close_raw(g_dbs[i]);
+      g_dbs[i] = NULL;
+    }
+  }
+}
+
 /* ---- call dispatch ----------------------------------------------------- */
 static Value v_call(Value callee, Value *args, int nargs) {
   tick(); /* bounds recursion / runaway calls */
@@ -2954,6 +3436,17 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_is_dir(args, nargs);
     case B_FILE_SIZE:
       return builtin_file_size(args, nargs);
+    /* Tier 4 storage */
+    case B_DB_OPEN:
+      return builtin_db_open(args, nargs);
+    case B_DB_PUT:
+      return builtin_db_put(args, nargs);
+    case B_DB_GET:
+      return builtin_db_get(args, nargs);
+    case B_DB_FLUSH:
+      return builtin_db_flush(args, nargs);
+    case B_DB_CLOSE:
+      return builtin_db_close(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -4144,6 +4637,9 @@ static void scope_install_prelude(Scope *env) {
       /* Tier 3 file system */
       {"mkdir", B_MKDIR}, {"rename", B_RENAME}, {"copy", B_COPY},
       {"is-dir", B_IS_DIR}, {"file-size", B_FILE_SIZE},
+      /* Tier 4 storage */
+      {"db-open", B_DB_OPEN}, {"db-put", B_DB_PUT}, {"db-get", B_DB_GET},
+      {"db-flush", B_DB_FLUSH}, {"db-close", B_DB_CLOSE},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

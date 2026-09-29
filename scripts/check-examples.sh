@@ -281,6 +281,51 @@ sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)
     continue
   fi
 
+  # ---- an `aot` example: the AOT binary runs it, the transpilers refuse ---
+  # Added with the storage tier (docs/SYNTAX.md §3k), and the reason it needs
+  # its own branch is that the two halves assert *opposite* things from the
+  # `interpreter-only` case above. There, AOT is allowed to refuse. Here it must
+  # NOT: the C runtime carries a hand-port of the storage engine, so an AOT
+  # refusal would mean the port was lost — and every refusal test in the suite
+  # would still pass, because they only assert that the transpilers refuse.
+  #
+  # So the AOT half is a *parity* check against the interpreter's own output,
+  # which is the only evidence that "it compiled" means "it works". The
+  # transpiler half asserts refusal with the word `transpiler-only`, not
+  # `interpreter-only`: a storage program is genuinely runnable by `ainl
+  # compile`, and a message saying otherwise sends the reader to the wrong
+  # runner. That exact wording is part of the documented contract, so it is
+  # asserted rather than left to inspection.
+  if [ "$scope" = "aot" ]; then
+    if ! "$BIN" compile "$ex" -o "$WORK/a.aot" 2> "$WORK/a.err"; then
+      echo "FAIL $name — ainl compile refused an @scope aot program:"
+      sed 's/^/    /' "$WORK/a.err" | head -3
+      fail=1
+    elif ! "$WORK/a.aot" > "$WORK/a.out" 2>&1; then
+      echo "FAIL $name — the AOT binary failed at run time:"
+      sed 's/^/    /' "$WORK/a.out" | head -3
+      fail=1
+    elif ! diff -q "$WORK/a.out" "$WORK/out" > /dev/null 2>&1; then
+      echo "FAIL $name — the AOT binary's output differs from the interpreter's:"
+      diff "$WORK/out" "$WORK/a.out" | head -6 | sed 's/^/    /'
+      fail=1
+    else
+      echo "ok   $name — AOT builds it and its output matches the interpreter"
+    fi
+    for target in python js ruby; do
+      if "$BIN" transpile "$ex" --to "$target" > /dev/null 2> "$WORK/a.err"; then
+        echo "FAIL $name — transpile --to $target accepted an @scope aot program"
+        fail=1
+      elif ! grep -q "transpiler-only" "$WORK/a.err"; then
+        echo "FAIL $name — $target refused, but not for the documented reason:"
+        sed 's/^/    /' "$WORK/a.err" | head -3
+        fail=1
+      fi
+    done
+    echo "ok   $name — python, js and ruby refuse it as transpiler-only"
+    continue
+  fi
+
   # ---- a portable example must agree across all backends ---------------
   # Not "should" agree: `scope` is the example's own claim about where it runs,
   # and the README and SYNTAX.md both repeat that claim to a reader. An example

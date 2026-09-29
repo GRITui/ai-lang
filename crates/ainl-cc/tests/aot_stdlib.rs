@@ -1017,76 +1017,79 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     // asserted as absent just below, so adding one to the prelude without
     // deciding its backend status fails here instead of silently passing.
     let names: Vec<String> = [
-        "+",
+        // Tier 0-2: the core language, collections, strings, JSON.
         "*",
+        "+",
         "-",
         "/",
-        "=",
         "<",
-        ">",
         "<=",
+        "=",
+        ">",
         ">=",
-        "not",
-        "mod",
-        "print",
-        "str",
-        "list",
-        "len",
-        "first",
-        "rest",
-        "nth",
-        "cons",
-        "push",
-        "hash",
-        "get",
-        "assoc",
-        "has",
-        "keys",
-        "vals",
-        "error",
-        "read-file",
-        "write-file",
-        "append-file",
-        "split",
-        "join",
-        "trim",
-        "replace",
-        "upcase",
-        "downcase",
-        "contains",
-        "env-get",
-        "exit",
-        "now",
-        "sleep",
         "abs",
-        "min",
-        "max",
-        "floor",
-        "sqrt",
-        "file-exists",
-        "delete-file",
-        "list-dir",
-        "path-join",
-        "path-base",
-        "path-dir",
-        "json-parse",
-        "json-serialize",
-        "test",
-        // Tier 3 collections. `map` / `filter` / `reduce` are special forms
-        // lowered to loops before codegen (see ainl_core::collection_forms), so
-        // they are deliberately absent: there is no builtin to emit, and adding
-        // an arm for them here would only invite the question of what a
-        // `map`-as-builtin would do with a `fn` it cannot call.
-        "sort",
-        // Tier 3 byte-oriented string primitives. All six are real builtins
-        // (unlike map/filter/reduce, which are special forms), so all six need
-        // an id and a name here.
-        "substring",
+        "append-file",
+        "assoc",
         "char",
         "code",
-        "starts-with",
+        "cons",
+        "contains",
+        "copy",
+        "db-close",
+        "db-flush",
+        "db-get",
+        "db-open",
+        "db-put",
+        "delete-file",
+        "downcase",
         "ends-with",
+        "env-get",
+        "error",
+        "exit",
+        "file-exists",
+        "file-size",
+        "first",
+        "floor",
+        "get",
+        "has",
+        "hash",
         "index-of",
+        "is-dir",
+        "join",
+        "json-parse",
+        "json-serialize",
+        "keys",
+        "len",
+        "list",
+        "list-dir",
+        "max",
+        "min",
+        "mkdir",
+        "mod",
+        "not",
+        "now",
+        "nth",
+        "path-base",
+        "path-dir",
+        "path-join",
+        "print",
+        "push",
+        "read-file",
+        "rename",
+        "replace",
+        "rest",
+        "sleep",
+        "sort",
+        "split",
+        "sqrt",
+        "starts-with",
+        "str",
+        "substring",
+        "test",
+        "trim",
+        "upcase",
+        "vals",
+        "write-file",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1109,13 +1112,18 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 62, "update this list when the prelude changes");
+    assert_eq!(names.len(), 72, "update this list when the prelude changes");
 
     // The other direction, which is the one that actually catches drift: every
     // name the prelude binds must be either in the table above (reachable by
     // codegen) or listed here as interpreter-only. A builtin that is in
     // neither is the silent failure this whole test exists to prevent — it
     // compiles to a `scope_lookup` and only fails when a program runs it.
+    // `import` is deliberately absent from both lists. It is not a prelude
+    // builtin at all: the parser turns it into a loader directive, and the AOT
+    // refusal is about the single-file path having no directory to resolve it
+    // against (see `import_refusal.rs`). Listing it here would assert a binding
+    // that does not exist.
     const INTERPRETER_ONLY: &[&str] = &["http-get", "http-post"];
     let listed: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
     for name in INTERPRETER_ONLY {
@@ -1136,7 +1144,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        64,
+        74,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),

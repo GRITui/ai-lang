@@ -62,19 +62,55 @@ impl Target {
 ///   would produce a transpiled program that builds cleanly and does something
 ///   subtly different from the interpreter's — the one failure mode a
 ///   four-backend language cannot have.
+/// - `db-open`/`db-put`/`db-get`/`db-flush`/`db-close`, because the storage
+///   engine's contract *is* the file format: a header, an append-only log, and
+///   a CRC per record so a torn tail from a crash is rejected on replay. A
+///   host `open()` cannot append to a file another writer may also hold, has
+///   no log to replay, and no way to reproduce the recovery — and the three
+///   hosts disagree about durability (`fsync` vs `fdatasync` vs nothing at
+///   all). A transpiled database that silently diverged from the interpreter's
+///   would be worse than no database, so these refuse too.
+///
+/// The AOT C backend does **not** fall in that last group: it carries a
+/// hand-port of the engine in its own runtime, so a compiled AINL binary opens
+/// the same `.ainl-db` and recovers from the same torn tail. That asymmetry is
+/// why the restricted set is a table keyed by backend rather than one list —
+/// see [`ainl_core::interpreter_only::RESTRICTED`].
 ///
 /// A program that transpiles to the wrong thing is far worse than one that
 /// refuses, so the transpilers refuse, and `ainl_cc::generate` refuses for the
-/// same programs.
+/// programs that *it* cannot run.
 pub fn transpile(target: Target, forms: &[Node], src: &str) -> Result<String> {
-    if let Some((at, sym)) = ainl_core::interpreter_only::find_interpreter_only(forms) {
+    if let Some((at, sym)) = ainl_core::interpreter_only::find_restricted(
+        forms,
+        ainl_core::interpreter_only::Backend::Transpilers,
+    ) {
+        // The reason differs by symbol, and the label differs by target. Saying
+        // "interpreter-only" for `db-open` would be a lie in both directions:
+        // `ainl compile` runs it, and the message used to point at `--to
+        // python` even for `--to ruby`.
+        let (what, because) = match sym {
+            ainl_core::db::DB_OPEN
+            | ainl_core::db::DB_PUT
+            | ainl_core::db::DB_GET
+            | ainl_core::db::DB_FLUSH
+            | ainl_core::db::DB_CLOSE => (
+                "transpiler-only",
+                "this backend emits one source file for one host language, and a host \
+                 file API has no append-only log, no per-record checksum, and no \
+                 crash-tail recovery — a program that ran here would read a different \
+                 file than the one the interpreter wrote",
+            ),
+            _ => (
+                "interpreter-only",
+                "this backend emits one source file for one host language, which has no \
+                 phase that can resolve modules or speak AINL's HTTP semantics",
+            ),
+        };
         return Err(ainl_core::Error::runtime(format!(
-            "ainl transpile --to {}: `{sym}` is interpreter-only (found at byte {}) — \
-             this backend emits one source file for one host language, which has no phase \
-             that can resolve modules or speak AINL's HTTP semantics. \
-             Run the program with `ainl run` instead.",
+            "ainl transpile --to {}: `{sym}` is {what} (found at byte {at}) — {because}. \
+             Run the program with `ainl run` instead, or `ainl compile` for the AOT C binary.",
             target.label(),
-            at,
         )));
     }
     match target {

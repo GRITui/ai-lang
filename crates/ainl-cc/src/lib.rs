@@ -112,6 +112,22 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     ("copy", 64),
     ("is-dir", 65),
     ("file-size", 66),
+    /* Tier 4 storage. Appended for the same reason as every earlier group: each
+     * id keeps the value it has always had, and the `enum` in runtime.c is
+     * extended in exactly this order. crates/ainl-cc/tests/aot_stdlib.rs checks
+     * both directions, so a drift here fails the suite rather than producing a
+     * program that dispatches to the wrong builtin.
+     *
+     * These five ARE supported here, unlike `import` and the HTTP pair: the
+     * engine is a header plus an append-only log plus a CRC per record, and all
+     * three are libc. The hand-port lives in the `db_*` block of runtime.c and
+     * is read side-by-side with the normative Rust in ainl-core/src/db.rs —
+     * the same relationship json_value.rs has to its C port. */
+    ("db-open", 67),
+    ("db-put", 68),
+    ("db-get", 69),
+    ("db-flush", 70),
+    ("db-close", 71),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).
@@ -1035,7 +1051,14 @@ impl Gen {
         self.emit("  scope_install_prelude(g_env);\n");
         self.emit("  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n");
         self.emit(main_code);
-        self.emit("  if (g_err) { fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n");
+        self.emit(
+            "  if (g_err) { db_close_all(); fprintf(stderr, \"%s\\n\", g_errmsg); return 1; }\n",
+        );
+        // A program that ends while a database is still open has still written
+        // a valid log — every `db-put` is appended, and the OS flushes on
+        // close — but closing here makes the durability explicit rather than
+        // incidental, and it is the same guarantee `db-close` gives.
+        self.emit("  db_close_all();\n");
         self.emit("  scope_unref(g_env);\n");
         self.emit("  return 0;\n");
         self.emit("}\n");

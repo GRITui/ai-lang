@@ -938,6 +938,16 @@ fn install_stdlib(env: &Env) {
     // C-transitive dependency tree. `https://` is refused with an error that
     // names the fix rather than attempted. See http.rs and docs/HTTP_TLS.md.
     crate::http::install(env);
+
+    // Storage. One file, an append-only log, replayed on open, with a CRC per
+    // record so a torn tail from a crash is rejected rather than served. The
+    // interpreter and the VM share this one implementation — it is installed in
+    // the shared prelude rather than in either evaluator — so their behaviour is
+    // identical by construction; the AOT C runtime carries a hand-port (see the
+    // `db_*` block in ainl-cc's runtime.c) and the three transpiler targets
+    // refuse it, because a host file object has no append-only-log semantics and
+    // no way to reproduce the recovery. See db.rs and docs/SYNTAX.md §3k.
+    crate::db::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------
