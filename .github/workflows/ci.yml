@@ -434,6 +434,13 @@ jobs:
 
       - run: cargo build --release
 
+      # `cargo test` compiles a *debug* test binary, and `db_kv_aot.rs` finds the
+      # `ainl` CLI by walking up from its own executable — so it needs
+      # `target/debug/ainl`, not the release one this job just built. Without
+      # this the whole file fails at its first `ainl()` call with "the ainl CLI
+      # was not found", which reads like a parity failure and is not one.
+      - run: cargo build
+
       # The same program, the interpreter and a *compiled* binary, diffed byte
       # for byte on stdout AND stderr. This job exists because the value layer
       # in `runtime.c` is a hand-port, not a binding — there is no FFI in this
@@ -451,7 +458,8 @@ jobs:
       # The refusal matrix, asserted in both directions: all ten `db-*` names
       # refused by python/js/ruby with the symbol named, and accepted by AOT.
       # The second half is the one a blanket rule would break while every
-      # refusal test kept passing.
+      # refusal test kept passing. This one wants the *release* binary, so it
+      # runs after the release build above.
       - name: "db-* refusal matrix (transpilers refuse, AOT accepts)"
         run: ./scripts/check-refusal-kv.sh
 
