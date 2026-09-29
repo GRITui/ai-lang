@@ -955,6 +955,22 @@ fn install_stdlib(env: &Env) {
     // the byte layer's `db-get` is the one in the environment before the value
     // layer could ever have rebound it. See dbkv.rs and docs/SYNTAX.md §3l.
     crate::dbkv::install(env);
+    // The table layer (Tier 4 card 3): `db-create-table` / `db-insert` /
+    // `db-select` / `db-delete-row` / `db-all-rows`, each a named set of rows
+    // indexed on its first column by a B-tree, all of it riding the same
+    // append-only log. It adds five new names and rebinds none, so its position
+    // in this list cannot affect what any earlier call resolved to — stated
+    // explicitly because it is the opposite of `dbkv`'s situation, where the
+    // order is load-bearing (dbkv *replaces* `db-get`). See dbtab.rs and
+    // docs/SYNTAX.md §3m.
+    crate::dbtab::install(env);
+    // The query layer (Tier 4 card 4): `db-query` / `db-query-count`, a small
+    // SQL subset over the tables above. It is a **reader**: it parses a query,
+    // runs it against the same B-tree and never appends a record, so it adds no
+    // write path and no new recovery case. It adds two new names and rebinds
+    // none, so like the table layer its position in this list cannot matter to
+    // a program. See dbquery.rs and docs/SYNTAX.md §3n.
+    crate::dbquery::install(env);
 }
 
 // ---- stdlib: shared argument coercion --------------------------------------

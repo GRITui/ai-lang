@@ -18,11 +18,17 @@ fail=0
 
 # name, program
 #
-# All ten, including `db-get-raw`. That name is the one most likely to be
+# All fifteen, including `db-get-raw`. That name is the one most likely to be
 # missing from a list like this: it was added in card 2 by *renaming* §3k's
 # reader rather than by adding a symbol, so nothing in the refusal path
 # announces it, and a list written from the original five would silently skip
 # the only builtin whose name is not mentioned in either section's heading.
+#
+# The five table names are the same kind of trap in a new place. They are the
+# first names this project has added that no *earlier* section mentions at all,
+# and they are a coherent-looking group, so a list written from the value layer
+# alone would skip all five and still pass every assertion below — which is why
+# the count is printed at the end and read by CI.
 CASES=(
   "db-set|(db-set 1 \"k\" 2)"
   "db-get|(db-get 1 \"k\")"
@@ -34,6 +40,11 @@ CASES=(
   "db-put|(db-put 1 \"k\" \"v\")"
   "db-flush|(db-flush 1)"
   "db-close|(db-close 1)"
+  "db-create-table|(db-create-table 1 \"t\")"
+  "db-insert|(db-insert 1 \"t\" (list \"a\" 1))"
+  "db-select|(db-select 1 \"t\" \"a\")"
+  "db-delete-row|(db-delete-row 1 \"t\" \"a\")"
+  "db-all-rows|(db-all-rows 1 \"t\")"
 )
 
 for c in "${CASES[@]}"; do

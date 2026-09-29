@@ -431,6 +431,17 @@ jobs:
       - name: Documented key-value semantics
         run: ./scripts/check-docs-kv.sh
 
+      # And for §3n (queries). §3n's claims are the ones an SQL layer cannot be
+      # assumed to have: WHERE applying before ORDER BY, ORDER BY naming a
+      # column the projection drops, a *stable* sort in both directions so DESC
+      # does not reverse ties, nil in a projection but an error in an ORDER BY,
+      # a clause order that is enforced rather than documented, and every
+      # out-of-scope keyword refused *by name* with the supported subset
+      # attached. A dropped GROUP BY is how a query engine answers confidently
+      # and wrongly, and none of that is visible from a host SQL library.
+      - name: Documented query semantics
+        run: ./scripts/check-docs-query.sh
+
   kv-aot:
     name: "key-value (3-backend parity + cross-process persistence)"
     runs-on: ubuntu-latest
@@ -472,9 +483,20 @@ jobs:
       - name: "Key-value parity: interpreter vs compiled AOT"
         run: cargo test -p ainl-cc --test db_kv_aot -- --nocapture
 
-      # The refusal matrix, asserted in both directions: all ten `db-*` names
-      # refused by python/js/ruby with the symbol named, and accepted by AOT.
-      # The second half is the one a blanket rule would break while every
+      # The same claim for the *table* layer, and it needs its own job-step
+      # because the bug class is different. `db_kv_aot.rs` checks a flat store,
+      # which cannot catch a disagreement about the *order* of a walk or about
+      # which row a delete left behind after a rebalance — those are only
+      # visible through `db-all-rows`. The C runtime carries a hand-port of the
+      # B-tree with no FFI behind it, so agreement is evidence rather than a
+      # tautology. Every bug this file found was invisible to a table of 15 keys
+      # or fewer, which is why the fixtures go to 40 rows.
+      - name: "Table parity: interpreter vs compiled AOT"
+        run: cargo test -p ainl-cc --test dbtab_aot -- --nocapture
+
+      # The refusal matrix, asserted in both directions: all fifteen `db-*`
+      # names refused by python/js/ruby with the symbol named, and accepted by
+      # AOT. The second half is the one a blanket rule would break while every
       # refusal test kept passing. This one wants the *release* binary, so it
       # runs after the release build above.
       - name: "db-* refusal matrix (transpilers refuse, AOT accepts)"

@@ -137,6 +137,42 @@ pub const RESTRICTED: &[Restricted] = &[
         sym: crate::dbkv::DB_COUNT,
         refused_by: &[Backend::Transpilers],
     },
+    // The table layer. Same reasoning as the two above and the same ordering
+    // rule: reported after the byte- and value-layer names, so a program that
+    // uses a `db-open` plus a `db-insert` is refused on `db-open` first, which
+    // is the name that actually explains the problem.
+    Restricted {
+        sym: crate::dbtab::DB_CREATE_TABLE,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbtab::DB_INSERT,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbtab::DB_SELECT,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbtab::DB_DELETE_ROW,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbtab::DB_ALL_ROWS,
+        refused_by: &[Backend::Transpilers],
+    },
+    // The query layer. Same reasoning as the table layer, and the same ordering
+    // rule: reported last, so a program that also uses `db-open` is refused on
+    // `db-open` first — the name that actually explains the problem, rather than
+    // the name that happened to be added most recently.
+    Restricted {
+        sym: crate::dbquery::DB_QUERY,
+        refused_by: &[Backend::Transpilers],
+    },
+    Restricted {
+        sym: crate::dbquery::DB_QUERY_COUNT,
+        refused_by: &[Backend::Transpilers],
+    },
 ];
 
 /// The first use of any of `syms` anywhere in `forms`, as a byte offset.
