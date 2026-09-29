@@ -4,6 +4,19 @@ fn py(src: &str) -> String {
     transpile_python_src(src).unwrap_or_else(|e| panic!("transpile failed for `{src}`: {e}"))
 }
 
+/// The emitted `_print(...)` CALL, as one line.
+///
+/// A plain `lines().find(|l| l.contains("_print("))` finds the runtime helper's
+/// own `def _print(...)` definition first, so an assertion written against it
+/// reads a line that has nothing to do with the program. This matches a line
+/// that *calls* it.
+fn print_call(out: &str) -> String {
+    out.lines()
+        .find(|l| l.contains("_print(") && !l.contains("def _print"))
+        .expect("no _print call in the emitted program")
+        .to_string()
+}
+
 #[test]
 fn function_becomes_def() {
     let out = py("(def sq (fn (x) (* x x)))");
@@ -119,17 +132,73 @@ fn and_or_return_an_operand_not_a_boolean() {
     // *last* one it evaluates and never with AINL's truthiness: `(or 0 "")` is
     // `0` in AINL (`0` is truthy) and `False` in Python (`0` is falsey). So the
     // chain is a host conditional — `b if c else a` — with every operand but
-    // the first guarded by `_truthy`.
+    // the last guarded by `_truthy` and bound so it is evaluated once.
     let out = py(r#"(print (or 0 ""))"#);
     assert!(
-        out.contains(r#"_print((0 if _truthy(0) else ""))"#),
+        out.contains(r#"(lambda _ainl_t1: (_ainl_t1 if _truthy(_ainl_t1) else (lambda _ainl_t0: (_ainl_t0 if _truthy(_ainl_t0) else False))("")))(0))"#),
         "got:\n{out}"
     );
     // `(and nil false 3)` is `nil`, not `False`: the first falsey operand wins.
     let out = py("(print (and nil false 3))");
     assert!(
-        out.contains("_print(((3 if _truthy(False) else False) if _truthy(None) else None))"),
+        out.contains("(lambda _ainl_t1: ((lambda _ainl_t0: (3 if _truthy(_ainl_t0) else _ainl_t0))(False) if _truthy(_ainl_t1) else _ainl_t1))(None))"),
         "got:\n{out}"
+    );
+}
+
+#[test]
+fn an_all_falsy_or_ends_on_the_false_identity() {
+    // SYNTAX.md 2: `or` returns the first truthy operand, and `false` when
+    // there is none. The tail of the chain is therefore `False` — in PYTHON's
+    // spelling, since `false` would be a `NameError` at run time on precisely
+    // the case the identity exists to answer.
+    let out = py("(print (or nil nil))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains("else False)"),
+        "an all-falsy `or` must fall through to `False`, got:\n{expr}"
+    );
+    // A lone falsey operand is the same case with no chain: `(or nil)` is
+    // `false` on the interpreter, not `nil`.
+    let out = py("(print (or nil))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains("else False)"),
+        "`(or nil)` must be `false`, got:\n{expr}"
+    );
+    // A lone TRUTHY operand still comes back unchanged — 0 is truthy in AINL.
+    let out = py("(print (or 0))");
+    let expr = print_call(&out);
+    assert!(
+        expr.contains("(0))") && expr.contains("else False)"),
+        "`(or 0)` must answer 0, got:\n{expr}"
+    );
+}
+
+#[test]
+fn an_operand_is_evaluated_once() {
+    // Each operand's text is needed twice — once in the `_truthy` test and once
+    // as the value it yields — so repeating it evaluates it twice. The fold
+    // binds the operand and uses only the name. A value-only assertion cannot
+    // see a doubled evaluation; this counts the occurrences instead.
+    let out = py("(print (or (f 1) 2))");
+    let expr = print_call(&out);
+    assert_eq!(
+        expr.matches("f(1)").count(),
+        1,
+        "the operand's text appears more than once, so it runs more than once: {expr}"
+    );
+}
+
+#[test]
+fn a_logic_temp_cannot_shadow_a_user_binding() {
+    // The chain is a nest of real closures, so a generated name that collided
+    // with a program binding would shadow it. `_ainl_t0` is a legal AINL
+    // identifier, so the counter has to step past one a program chose.
+    let out = py("(def _ainl_t0 9)\n(print (or _ainl_t0 1))");
+    assert!(
+        out.contains("_ainl_t1:"),
+        "the fold must not reuse a name the program bound, got:\n{out}"
     );
 }
 

@@ -35,6 +35,8 @@ pub fn transpile_ruby(forms: &[Node], src: &str) -> Result<String> {
         body: String::new(),
         indent: 0,
         needed: BTreeSet::new(),
+        temps: 0,
+        used: shared::used_symbols(forms, sanitize),
     };
     for form in forms {
         rb.top_form(form, &idx)?;
@@ -46,6 +48,12 @@ struct Rb {
     body: String,
     indent: usize,
     needed: BTreeSet<&'static str>,
+    /// Counter behind `logic_temp`, so two `and`/`or` chains in one expression
+    /// cannot name their operand the same thing.
+    temps: usize,
+    /// Every name the program already uses, so a generated temp cannot shadow
+    /// one. See `shared::used_symbols`.
+    used: BTreeSet<String>,
 }
 
 impl Rb {
@@ -864,6 +872,41 @@ impl Rb {
 impl ExprEmit for Rb {
     fn need_truthy(&mut self) {
         self.need("_truthy");
+    }
+
+    /// A Ruby lambda, called with `.call` — the same shape `expr_let` already
+    /// emits, and what makes the `and`/`or` chain a nest of thunks.
+    fn bind_once(&mut self, n: &str, val: &str, body: &str) -> String {
+        format!("lambda {{ |{n}| {body} }}.call({val})")
+    }
+
+    /// Ruby spells the conditional condition-first, as JS does.
+    fn cond(&mut self, cond: &str, then: &str, els: &str) -> String {
+        format!("({cond} ? {then} : {els})")
+    }
+
+    fn false_lit(&self) -> &'static str {
+        "false"
+    }
+
+    fn true_lit(&self) -> &'static str {
+        "true"
+    }
+
+    fn logic_temp(&mut self) -> String {
+        // Ruby reserves `$` for global variables (`$stdout`, `$!`), so a `$` in
+        // a local name is a SyntaxError — and even where it parses it would be
+        // global state, not the per-binding local this needs. The name is
+        // therefore plain, which makes it COLLIDABLE with a program that bound
+        // `_ainl_t0` itself, so it is stepped past on a hit.
+        loop {
+            let n = self.temps;
+            self.temps += 1;
+            let name = format!("_ainl_t{n}");
+            if !self.used.contains(&name) {
+                return name;
+            }
+        }
     }
 
     fn expr(&mut self, node: &Node) -> Result<String> {
