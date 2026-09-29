@@ -115,16 +115,20 @@ corpus existed — and says so rather than failing.
 Both were found by writing the examples and running them, not by reading the
 documentation, and both are now pinned by a test or a gate.
 
-**1. The JS int/float collapse is wider than `docs/SYNTAX.md` records.** The
-docs describe it for `json-serialize` inside a container: a JS `Number` is one
-type, so `{"a":1}` prints as `{"a":1.0}`. Measured on this head, the same
+**1. The JS int/float collapse is wider than `docs/SYNTAX.md` recorded.** The
+docs used to describe it for `json-serialize` inside a container: a JS `Number`
+is one type, so `{"a":1}` prints as `{"a":1.0}`. Measured on this head, the same
 collapse happens at top level — `(print 3.0)` prints `3` in JavaScript and
-`3.0` on every other backend, and so does `(print (/ 4 2))`. `check-examples.sh`
-recognizes exactly this divergence and nothing else; a blanket "strip `.0`"
-rule would also hide a genuine arithmetic difference between backends, which
-is the one class of bug the gate exists to catch. **The docs should be
-corrected** — this card did not change them, because the right fix belongs with
-whoever owns the numeric model.
+`3.0` on every other backend, and so does `(print (/ 4 2))`. It is also not only
+a display rule: a float index is *accepted* where every other backend rejects
+it, and a whole float is *named* an int in error text. `check-examples.sh`
+recognizes exactly the top-level display divergence and nothing else; a blanket
+"strip `.0`" rule would also hide a genuine arithmetic difference between
+backends, which is the one class of bug the gate exists to catch.
+
+**Resolved in `docs/SYNTAX.md` §3j**, which now states the true scope, plus
+`crates/ainl-transpile/tests/js_number_collapse.rs` pinning every measurement.
+The code is unchanged: the fix belongs to the numeric model, not a print rule.
 
 **2. A nested `let` inside a `while` body silently discards every `def` in
 it.** This is documented (`docs/SYNTAX.md` §2a) and it is in
