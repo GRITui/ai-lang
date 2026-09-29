@@ -142,6 +142,39 @@ impl Py {
                 self.needed.insert("_Sym");
             }
         }
+        // Tier 3 file system. Two kinds of dependency, and the second is the
+        // one that is easy to miss.
+        //
+        // 1. `_Sym` — every helper rejects a quoted symbol the way the
+        //    interpreter's `as_path_arg` rejects a non-str, and they reference
+        //    `_Sym` *before* the RUNTIME table has emitted it unless it is
+        //    named here. `_mkdir` rejects a non-str option for the same
+        //    reason.
+        //
+        // 2. `_error` + `_fs_probe` — the shared-message rule. A host exception
+        //    (FileExistsError, IsADirectoryError, shutil's SameFileError) would
+        //    put host text on stderr, and the 4-backend rule compares stderr
+        //    byte-for-byte, so every failure must be routed through `_error`,
+        //    which raises AINL's own `_AinlError` and therefore stays
+        //    catchable by an AINL `catch` instead of leaking the host's type.
+        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
+            .iter()
+            .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_Sym");
+            self.needed.insert("_error");
+            self.needed.insert("_fs_probe");
+            // `_ainl_tname` renders the *AINL* type name for a wrong-typed
+            // path ("got int"), not Python's ("got <class 'int'>"). The
+            // interpreter's as_path_arg says `got {type_name}` and the
+            // 4-backend rule compares that text, so the name has to come from
+            // the shared helper rather than from isinstance.
+            self.needed.insert("_ainl_tname");
+        }
+        // `errno` is a module, not a helper: `_rename` compares against
+        // errno.EXDEV to name the cross-device case. It is imported lazily
+        // inside the helper (like `os` and `shutil` above) so a program that
+        // only calls the pure query builtins loads nothing.
         // Tier 1 JSON. Both entry points pull in the whole cluster, because
         // `_ainl_tname` (needed for json-parse's type error) branches on
         // `_Sym` and `_Hash`, and the RUNTIME table is emitted in declaration
@@ -608,6 +641,12 @@ impl Py {
                 "path-join" => return self.call_builtin("_path_join", args, Some("_path_join")),
                 "path-base" => return self.call_builtin("_path_base", args, Some("_path_base")),
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
+                // ---- Tier 3 file system ----
+                "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rename" => return self.call_builtin("_rename", args, Some("_rename")),
+                "copy" => return self.call_builtin("_copy", args, Some("_copy")),
+                "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
+                "file-size" => return self.call_builtin("_file_size", args, Some("_file_size")),
                 // ---- Tier 1 JSON ----
                 "json-parse" => {
                     return self.call_builtin("_json_parse_b", args, Some("_json_parse_b"))
@@ -1403,6 +1442,91 @@ const RUNTIME: &[(&str, &str)] = &[
     (
         "_path_dir",
         "def _path_dir(path):\n    if not isinstance(path, str) or isinstance(path, _Sym): raise TypeError('path-dir expects a str path')\n    c = _path_canonical(path)\n    if '/' not in c: return '.'\n    if c == '/': return '/'\n    # rsplit on a top-level name leaves an empty head ('/x' -> ['', 'x']),\n    # which is the root, not the empty string.\n    head = c.rsplit('/', 1)[0]\n    return head or '/'",
+    ),
+    // ---- Tier 3 file system ----
+    // The same explicit-rules rule as the six above: the hosts disagree on
+    // every edge case that matters, so none of these may delegate. The two
+    // that would actually bite a naive port are os.rename/os.replace, which
+    // CLOBBER an existing destination silently where POSIX rename(2) refuses,
+    // and os.makedirs(exist_ok=True), which is the one host knob that matches
+    // AINL's "an existing path is an error" rule — it is used *only* to
+    // create missing parents, never to excuse an existing leaf.
+    (
+        "_fs_probe",
+        // The path a filesystem *query* builtin probes, with a trailing
+        // separator stripped. The hosts split on whether "f/" is a legal way
+        // to name a non-directory (NotADirectoryError here, ENOTDIR in C, a
+        // throw in Node, Errno::ENOTDIR in Ruby), so it is trimmed. A lone "/"
+        // is the root and must survive.
+        "def _fs_probe(path):\n    return path[:-1] if len(path) > 1 and path.endswith('/') else path",
+    ),
+    (
+        "_mkdir",
+        // The option is a positional string, not a keyword: AINL has no
+        // keyword-argument syntax, so ":recursive" arrives as an ordinary
+        // string. See docs/SYNTAX.md §3h.
+        //
+        // An existing path is an error in BOTH modes, checked before the host
+        // call so the message is the same on every backend. os.mkdir raises
+        // FileExistsError and os.makedirs(exist_ok=True) returns quietly, and
+        // this pins the strict one: a caller that creates a directory and then
+        // writes into it needs to know whether *it* created it.
+        // The arity guard is *inside* the helper and uses _error, not a Python
+        // signature error, for the shared-message rule: `(mkdir)` with no
+        // argument must raise AINL's own text so an AINL `catch` intercepts
+        // it. A host TypeError is not an _AinlError, so it would escape
+        // `catch` entirely and print a Python traceback to stderr — which the
+        // byte comparison would then fail on, and a `catch` in the user's
+        // program would silently not catch. (Found by the parity gate, not by
+        // reading the code.) _ainl_tname renders the *AINL* type name, so
+        // `got int` matches the interpreter rather than `<class 'int'>`.
+        "def _mkdir(*args):\n    import os\n    if len(args) < 1 or len(args) > 2: _error('mkdir expects (mkdir path) or (mkdir path option)')\n    path, opt = (list(args) + [None])[:2]\n    if not isinstance(path, str) or isinstance(path, _Sym): _error('mkdir expects a str path, got %s' % _ainl_tname(path))\n    if opt is not None:\n        if not isinstance(opt, str) or isinstance(opt, _Sym): _error('mkdir expects a str option, got %s' % _ainl_tname(opt))\n        if opt != ':recursive': _error(\"mkdir: unknown option '%s'\" % opt)\n    # lexists, not exists: the interpreter's symlink_metadata is an lstat, and a\n    # broken symlink is still a directory entry that mkdir must refuse.\n    if os.path.lexists(_fs_probe(path)):\n        _error(\"mkdir: cannot create '%s': it exists\" % path)\n    try:\n        if opt == ':recursive':\n            # The parents only. A missing parent would raise, but AINL reports\n            # every failure as the same 'cannot create', and a caller that\n            # asked for recursive creation means it.\n            parent = os.path.dirname(path)\n            if parent and not os.path.isdir(parent):\n                try:\n                    os.makedirs(parent, exist_ok=True)\n                except OSError:\n                    pass\n        os.mkdir(path)\n    except OSError:\n        _error(\"mkdir: cannot create '%s'\" % path)",
+    ),
+    (
+        "_rename",
+        // Both pre-checks happen before the host call, and that is the whole
+        // point: os.rename (and File.rename in Ruby) CLOBBER an existing
+        // destination silently, while POSIX rename(2) refuses. Without the
+        // check, the same program would destroy a file under three backends
+        // and preserve it under the other two.
+        //
+        // os.rename across filesystems raises OSError with errno EXDEV (it
+        // does not fall back to copy+delete), which is the same answer the C
+        // runtime gets from rename(2), so the cross-device case needs no
+        // special handling beyond naming the cause.
+        "def _rename(*args):\n    import os, errno\n    if len(args) != 2: _error('rename expects (rename from to)')\n    src, dst = args\n    if not isinstance(src, str) or isinstance(src, _Sym): _error('rename expects a str path, got %s' % _ainl_tname(src))\n    if not isinstance(dst, str) or isinstance(dst, _Sym): _error('rename expects a str path, got %s' % _ainl_tname(dst))\n    if not os.path.lexists(_fs_probe(src)):\n        _error(\"rename: cannot move '%s': it does not exist\" % src)\n    if os.path.lexists(_fs_probe(dst)):\n        _error(\"rename: cannot move '%s': '%s' exists\" % (src, dst))\n    try:\n        os.rename(src, dst)\n    except OSError as e:\n        if e.errno == errno.EXDEV:\n            _error(\"rename: cannot move '%s' to '%s': different filesystems\" % (src, dst))\n        _error(\"rename: cannot move '%s' to '%s'\" % (src, dst))",
+    ),
+    (
+        "_copy",
+        // A full read + write, never os.link: a hardlink shares the inode, so
+        // a later write-file on either path would silently change both. The
+        // 1MB chunk is shutil.copyfileobj's default for a reason — a whole-file
+        // read would buffer the entire file, which is the cost docs/SYNTAX.md
+        // §3h documents. 'rb'/'wb' so no newline translation can change bytes
+        // on a Windows host.
+        "def _copy(*args):\n    import os, shutil\n    if len(args) != 2: _error('copy expects (copy from to)')\n    src, dst = args\n    if not isinstance(src, str) or isinstance(src, _Sym): _error('copy expects a str path, got %s' % _ainl_tname(src))\n    if not isinstance(dst, str) or isinstance(dst, _Sym): _error('copy expects a str path, got %s' % _ainl_tname(dst))\n    if not os.path.lexists(_fs_probe(src)):\n        _error(\"copy: cannot copy '%s': it does not exist\" % src)\n    if os.path.isdir(_fs_probe(src)):\n        _error(\"copy: cannot copy '%s': it is a directory\" % src)\n    try:\n        with open(_fs_probe(src), 'rb') as fsrc, open(dst, 'wb') as fdst:\n            shutil.copyfileobj(fsrc, fdst)\n    except OSError:\n        _error(\"copy: cannot copy '%s' to '%s'\" % (src, dst))",
+    ),
+    (
+        "_is_dir",
+        // lexists + isdir rather than os.path.isdir alone, because the answer
+        // must be nil (not False) for a missing path so that
+        // `(= (is-dir p) nil)` is the absence test. os.path.isdir already
+        // answers False for a missing path, but the three-way explicit form
+        // makes the lstat semantics (a symlink to a directory is not one)
+        // visible rather than incidental.
+        "def _is_dir(*args):\n    import os\n    if len(args) != 1: _error('is-dir expects (is-dir path)')\n    path = args[0]\n    if not isinstance(path, str) or isinstance(path, _Sym): _error('is-dir expects a str path, got %s' % _ainl_tname(path))\n    # islink first: os.path.isdir follows a symlink, so a link to a directory\n    # would read as a directory where the interpreter's lstat says nil.\n    p = _fs_probe(path)\n    if not os.path.lexists(p) or os.path.islink(p): return None\n    return True if os.path.isdir(p) else None",
+    ),
+    (
+        "_file_size",
+        // Bytes, not characters: a file is a sequence of bytes and there is no
+        // encoding in the file, which is what makes this the companion to the
+        // byte-indexed string primitives. os.path.getsize follows a symlink, so
+        // islink is checked first to keep the lstat rule.
+        //
+        // A directory is an error, not a number: POSIX reports the directory's
+        // own inode size (4096 on ext4, 60 on APFS, 0 on tmpfs), so answering
+        // would report a filesystem implementation detail as a language value.
+        "def _file_size(*args):\n    import os\n    if len(args) != 1: _error('file-size expects (file-size path)')\n    path = args[0]\n    if not isinstance(path, str) or isinstance(path, _Sym): _error('file-size expects a str path, got %s' % _ainl_tname(path))\n    p = _fs_probe(path)\n    if not os.path.lexists(p): _error(\"file-size: cannot read '%s'\" % path)\n    if os.path.islink(p):\n        try: return os.path.getsize(p)\n        except OSError: _error(\"file-size: cannot read '%s'\" % path)\n    if os.path.isdir(p): _error(\"file-size: cannot read '%s': it is a directory\" % path)\n    try: return os.path.getsize(p)\n    except OSError: _error(\"file-size: cannot read '%s'\" % path)",
     ),
     (
         "_split",

@@ -932,6 +932,225 @@ implementation. (The parity program is a *print* program rather than a test
 file, so it lives in `fixtures/` — `ainl test` sweeps `tests/` and would count
 its output as suite noise.)
 
+## 3h. File system: `mkdir` / `rename` / `copy` / `is-dir` / `file-size`
+
+The Tier 3 file-system operations, completing the cluster that
+`read-file`/`write-file`/`delete-file`/`list-dir` started. They exist because the
+existing file builtins can only *inspect* and *rewrite*: moving a file meant
+read → write → delete, which copies every byte, cannot move a directory at all,
+and leaves two half-copies if it is interrupted.
+
+```
+(mkdir path)                    ; create one directory
+(mkdir path ":recursive")        ; create it and every missing parent
+(rename from to)                ; move a file or a directory tree
+(copy from to)                   ; duplicate a file
+(is-dir path)                    ; true for a directory, nil otherwise
+(file-size path)                 ; the size in bytes
+```
+
+Each returns `nil` on success. `is-dir` returns `true` for a directory and `nil`
+for anything else — including a path that does not exist. `nil`, not `false`, so
+that `(= (is-dir p) nil)` is a usable test, which is the same convention
+`file-exists` and `list-dir` already follow.
+
+### The option is a string, not a keyword
+
+`":recursive"` is a **string literal**, not a bare word. AINL has no
+keyword-argument syntax, and a bare `:recursive` is an ordinary symbol, so:
+
+```
+(mkdir "a/b/c" :recursive)
+; runtime error: unbound symbol ':recursive' at line 1, col 16 (byte 15)
+```
+
+The call fails before `mkdir` is ever reached. The option is therefore the
+second positional argument, and an unknown one is an error rather than ignored —
+a silently-ignored `:recursive` would be a `FileNotFoundError` three calls later
+with nothing pointing at the cause:
+
+```
+(mkdir "a/b/c" ":parents")
+; mkdir: unknown option ':parents'
+```
+
+### mkdir refuses an existing path, in both modes
+
+```
+(mkdir "d")                    ; ok
+(mkdir "d")                    ; mkdir: cannot create 'd': it exists
+(mkdir "d" ":recursive")       ; mkdir: cannot create 'd': it exists
+```
+
+This is **stricter** than `mkdir -p`, `os.makedirs(exist_ok=True)`,
+`fs.mkdirSync(path, {recursive: true})` and `FileUtils.mkdir_p`, all of which
+return quietly on an existing path. It is the right default for a language where
+the alternative failure — silently succeeding — means a caller that created a
+directory and then wrote into it cannot tell whether *it* created it. The
+consequence is that a program which re-runs over its own output must guard the
+call, and `file-exists` is what it uses:
+
+```
+(if (not (file-exists d)) (mkdir d ":recursive"))
+```
+
+Without `":recursive"`, a missing parent is an error. The message names the path
+the *caller* wrote, not the parent that was missing — the caller never named it,
+and guessing which component was missing would be a worse error message than the
+one AINL gives:
+
+```
+(mkdir "absent/child")
+; mkdir: cannot create 'absent/child'
+```
+
+### rename refuses an existing destination
+
+```
+(write-file "a.txt" "A")
+(rename "a.txt" "b.txt")                          ; nil
+(write-file "a.txt" "A")
+(write-file "b.txt" "B")
+(rename "a.txt" "b.txt")
+; rename: cannot move 'a.txt': 'b.txt' exists
+(rename "missing.txt" "b.txt")
+; rename: cannot move 'missing.txt': it does not exist
+```
+
+POSIX `rename(2)` refuses an existing destination. `os.rename`,
+`fs.renameSync` and `File.rename` all **overwrite it silently**. AINL pins the
+refusal so the same program cannot destroy a file on some backends and preserve
+it on others — the worst class of portability bug, because it is invisible until
+the data is gone.
+
+`rename` moves a **directory tree**, which read → write → delete cannot express
+at all, and does it without reading a byte, so the cost is one syscall rather
+than a full copy and an interrupted move cannot leave two half-copies.
+
+A cross-device move is a distinct error, not the generic one, because
+`rename(2)` reports `EXDEV` when the source and destination are on different
+filesystems (a separate volume, a tmpfs mount, a container boundary) and the fix
+is a copy, not a retry:
+
+```
+(rename "/mnt/a" "/tmp/b")
+; rename: cannot move '/mnt/a' to '/tmp/b': different filesystems
+```
+
+### copy refuses a directory
+
+```
+(write-file "a.txt" "A")
+(copy "a.txt" "b.txt")                            ; nil
+(copy "a.txt" "b.txt")                            ; nil — copy DOES overwrite
+(mkdir "src")
+(copy "src" "dst")
+; copy: cannot copy 'src': it is a directory
+```
+
+`copy` is the one operation here that *does* overwrite an existing destination,
+matching `cp` and every host. That is intentional and consistent: copying is
+explicitly a "make another one" operation, so a pre-existing destination is not
+data loss. The asymmetry with `rename` is the point — `rename` refuses because
+the destination is a thing the caller still has, and `copy` does not.
+
+A recursive directory copy is deliberately **not** offered. It is a different
+operation from copying a file, it needs its own rules about what happens to
+symlinks and permissions, and `rename` covers the case a program usually wants
+(it moves a tree, and costs one syscall). A program that genuinely wants a copy
+can walk the tree.
+
+### file-size counts bytes
+
+`(file-size path)` is the size in **bytes**, not characters. For ASCII they
+agree; for anything else they do not, and a character-based answer would make
+every non-ASCII file the wrong size:
+
+```
+(write-file "u.txt" "héllo")   ; 6 bytes, 5 characters
+(file-size "u.txt")            ; 6
+```
+
+A directory is an **error**, not a number. POSIX reports a directory's *inode*
+size, which is 4096 on ext4, 60 on APFS and 0 on tmpfs — three different answers
+for the same directory, none of them meaningful:
+
+```
+(file-size "d")
+; file-size: cannot read 'd': it is a directory
+```
+
+### Symlinks are not followed
+
+All five probe with `lstat`, not `stat`. A symlink to a directory is therefore
+**not** a directory as far as AINL is concerned:
+
+```
+(is-dir "link-to-dir")   ; nil  — the link itself is not a directory
+```
+
+This is the one rule that needed care to keep portable. `os.path.isdir`,
+`fs.statSync` and `File.directory?` all follow the link and would answer `true`;
+only `lstat`/`symlink_metadata` matches. A broken symlink is still a directory
+entry, so it exists for `file-exists` and blocks `mkdir`.
+
+A trailing separator is trimmed before the query, because `"f/"` is not a legal
+way to name a non-directory on any of the four hosts:
+
+```
+(is-dir "d/")   ; true — the same answer as (is-dir "d")
+```
+
+The trim is guarded on length so a lone `"/"` survives.
+
+### Error messages
+
+One message per failure mode, byte-identical on every backend, and every one of
+them is a `try`/`catch`-able AINL error:
+
+```
+(mkdir 1)                        ; mkdir expects a str path, got int
+(mkdir)                          ; mkdir expects (mkdir path) or (mkdir path option)
+(mkdir "a" "b" "c")              ; mkdir expects (mkdir path) or (mkdir path option)
+(rename 1 2)                     ; rename expects a str path, got int
+(rename "a")                     ; rename expects (rename from to)
+(copy 1 2)                       ; copy expects a str path, got int
+(copy "a")                       ; copy expects (copy from to)
+(is-dir 1)                       ; is-dir expects a str path, got int
+(is-dir)                         ; is-dir expects (is-dir path)
+(file-size 1)                    ; file-size expects a str path, got int
+(file-size)                      ; file-size expects (file-size path)
+```
+
+The type name is AINL's, not the host's: a Python port that rendered
+`<class 'int'>`, or a Ruby one that rendered `Integer`, would be a message the
+program could not match on.
+
+### Backend scope: all four
+
+All five are supported on **all four backends** — the interpreter, the bytecode
+VM, the AOT C runtime, and the Python, JS and Ruby transpilers — byte-identical
+on stdout, on stderr and on return codes.
+
+Every backend implements the rules above explicitly rather than delegating to
+its host, because on each of the three the delegation would be *wrong* in a way
+that shows up as data loss or as a host-specific number. Python checks the
+destination before `os.rename` and uses `os.makedirs` only for the parents;
+JavaScript checks before `fs.renameSync` and omits the `recursive` flag rather
+than passing `false`; Ruby builds the parents one component at a time with a
+local `_fs_mkdir_p` rather than requiring `fileutils`, which would also be quiet
+on an existing leaf. All three use `lstat` throughout, and each catches its
+host's exception class to re-raise an AINL error — a `TypeError`, `ArgumentError`
+or `SystemCallError` is not an `_AinlError`, so it would escape an AINL `catch`
+and print a host backtrace to stderr.
+
+`scripts/check-fs-builtins.sh` runs `fixtures/fs_builtins_parity.ainl` through
+all five runners and diffs them against the interpreter, which is the normative
+implementation. Each runner gets a **fresh scratch tree**, because the program
+creates, moves and deletes files and is not idempotent. (The parity program is a
+*print* program rather than a test file, so it lives in `fixtures/` — `ainl test`
+sweeps `tests/` and would count its output as suite noise.)
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

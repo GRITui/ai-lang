@@ -235,6 +235,56 @@ jobs:
       - name: Documented byte-string behavior + 4-backend parity
         run: ./scripts/check-byte-strings.sh
 
+  file-system:
+    name: file system (mkdir/rename/copy/is-dir/file-size; 4-backend parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: file-system-${{ hashFiles('Cargo.lock') }}
+          restore-keys: file-system-
+
+      - name: Install Python, Node and Ruby
+        # These three are the reason the job exists. All five builtins are the
+        # first where a host's *natural* implementation is actively dangerous:
+        # os.rename, fs.renameSync and File.rename all OVERWRITE an existing
+        # destination where POSIX rename(2) refuses, so a naive port silently
+        # destroys a file on three backends and preserves it on the fourth. "It
+        # ran" is not the claim; "the bytes matched the interpreter, and the
+        # destination survived" is.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 nodejs ruby
+
+      - run: cargo build --release
+
+      # One program through five runners — interpreter, AOT C, python3, node,
+      # ruby — diffed byte for byte on stdout AND stderr and on return code.
+      # Every runner gets a private scratch tree, because the program creates,
+      # moves and deletes files and is not idempotent; sharing one would make
+      # the diff noise. The AOT half needs `cc`, which is preinstalled on
+      # ubuntu runners.
+      - name: Documented file-system behavior + 4-backend parity
+        run: ./scripts/check-fs-builtins.sh
+
+      # The documentation half: every snippet in SYNTAX.md §3h is run and
+      # compared to the answer written beside it, so §3h cannot drift from the
+      # language. This section is almost entirely about behavior that is *not*
+      # what a host library does by default, which is exactly the kind of claim
+      # that rots silently.
+      - name: Documented file-system semantics
+        run: ./scripts/check-docs-fs.sh
+
   http:
     name: http (client works locally; TLS + backends refuse)
     runs-on: ubuntu-latest

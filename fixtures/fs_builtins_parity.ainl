@@ -1,0 +1,116 @@
+; Parity program for the Tier 3 file-system builtins (Tier 3, card 4/6).
+;
+; scripts/check-fs-builtins.sh runs this ONE program through five runners —
+; the interpreter, the AOT C runtime, python3, node and ruby — and diffs their
+; combined stdout AND stderr. The interpreter is the normative implementation,
+; so every other backend is compared against its bytes.
+;
+; Every line below is chosen because the five hosts would otherwise answer
+; something different, or because the answer is not obvious:
+;
+;   * mkdir ":recursive" builds a three-deep tree in one call, which is what
+;     the organizers of the e2e corpus needed and what create_dir / Dir.mkdir's
+;     two arities / mkdir -p each spell differently.
+;   * Each error case is printed via `try`, so the MESSAGE is on stdout and can
+;     be diffed. An uncaught error would also be compared (the gate captures
+;     stderr), but catching it keeps the rest of the program running.
+;   * The bytes are compared, not the characters: "héllo" is 6 bytes and 5
+;     characters, so file-size and copy both have to agree on which they mean.
+;   * A trailing separator appears once, because the hosts disagree about
+;     whether "f/" is a legal way to name a *file*.
+;
+; The scratch root comes from argv-free environment: AINL has no argv, so the
+; program uses a fixed relative path under a directory the gate creates. Every
+; runner executes in its own copy of that directory, so no runner can see
+; another's leftovers.
+
+(def BASE "ainl-fs-parity")
+
+; A fresh tree per run. The gate removes BASE before each runner, so this
+; starts empty every time; `mkdir ":recursive"` is the one call that makes the
+; whole layout.
+(mkdir (path-join BASE "src/deep/deeper") ":recursive")
+(mkdir (path-join BASE "dst") ":recursive")
+
+; ---- is-dir: the primitive the old (file-exists (path-join p ".")) trick
+; ---- was reaching for. Four answers, all of which must agree.
+(print (str "is-dir dir        " (str (is-dir (path-join BASE "src")))))
+(print (str "is-dir deep       " (str (is-dir (path-join BASE "src/deep/deeper")))))
+(print (str "is-dir file       " (str (is-dir (path-join BASE "src/a.txt")))))
+(print (str "is-dir missing    " (str (is-dir (path-join BASE "nope")))))
+; A trailing separator names the same entry, and the hosts disagree about
+; whether it is legal against a non-directory — so this is where a naive port
+; to stat("f/") breaks.
+(print (str "is-dir file+slash " (str (is-dir (path-join BASE "src/a.txt/")))))
+
+; ---- file-size: bytes, not characters.
+(write-file (path-join BASE "src/a.txt") "héllo")
+(write-file (path-join BASE "src/empty.txt") "")
+; 5 characters, 6 bytes. `(len (read-file p))` would say 5; file-size says 6.
+(print (str "size bytes        " (str (file-size (path-join BASE "src/a.txt")))))
+(print (str "size chars        " (str (len (read-file (path-join BASE "src/a.txt"))))))
+(print (str "size empty        " (str (file-size (path-join BASE "src/empty.txt")))))
+
+; ---- rename: one rename(2), atomic, moves a subtree. A directory move is the
+; ---- case read->write->delete cannot express at all.
+(rename (path-join BASE "src/a.txt") (path-join BASE "src/deep/moved.txt"))
+(print (str "after rename      " (str (read-file (path-join BASE "src/deep/moved.txt")))))
+(print (str "old gone          " (str (file-exists (path-join BASE "src/a.txt")))))
+(rename (path-join BASE "src/deep") (path-join BASE "dst/deep"))
+(print (str "dir move is-dir   " (str (is-dir (path-join BASE "dst/deep")))))
+(print (str "dir move contents " (str (list-dir (path-join BASE "dst/deep")))))
+; A trailing separator on the source names the same entry.
+(rename (path-join BASE "dst/deep/moved.txt/") (path-join BASE "dst/moved.txt"))
+(print (str "rename+slash      " (str (read-file (path-join BASE "dst/moved.txt")))))
+
+; ---- copy: a full read + write, not a hardlink. The two files must then
+; ---- diverge, which is the documented difference from rename.
+(copy (path-join BASE "dst/moved.txt") (path-join BASE "dst/copy.txt"))
+(print (str "copy size         " (str (file-size (path-join BASE "dst/copy.txt")))))
+(print (str "copy content      " (str (read-file (path-join BASE "dst/copy.txt")))))
+(write-file (path-join BASE "dst/copy.txt") "x")
+(print (str "copy diverges     " (str (read-file (path-join BASE "dst/moved.txt")))))
+(print (str "orig after edit   " (str (read-file (path-join BASE "dst/copy.txt")))))
+; An empty file must copy to an empty file, not vanish.
+(copy (path-join BASE "src/empty.txt") (path-join BASE "dst/empty.txt"))
+(print (str "copy empty        " (str (file-size (path-join BASE "dst/empty.txt")))))
+
+; ---- the shared error messages. Each is ONE string across all five runners,
+; ---- which is the point of the whole card: the hosts raise six different
+; ---- exceptions for these six situations.
+;
+; `thunk` is a zero-argument fn, not a `do` block: AINL allows only a single
+; expression in expression position, and the transpilers reject a
+; multi-statement `do` there with a runtime error, so `(do (mkdir ...) "NO
+; ERROR")` would transpile to nothing at all. Calling a one-expression fn is
+; the form every backend agrees on.
+(def show (fn (label thunk)
+  (print (str label
+               (try (thunk)
+                    (catch (e) (str "-> " e)))))))
+
+(show "err mkdir exists  " (fn () (mkdir (path-join BASE "src"))))
+(show "err mkdir parent  " (fn () (mkdir (path-join BASE "absent/child"))))
+(show "err mkdir option  " (fn () (mkdir (path-join BASE "zz") ":nope")))
+(show "err mkdir noarg   " (fn () (mkdir)))
+(show "err rename missing" (fn () (rename (path-join BASE "ghost") (path-join BASE "x"))))
+(show "err rename exists " (fn () (rename (path-join BASE "dst/moved.txt")
+                                           (path-join BASE "dst/copy.txt"))))
+(show "err copy missing  " (fn () (copy (path-join BASE "ghost") (path-join BASE "x"))))
+(show "err copy isdir    " (fn () (copy (path-join BASE "dst") (path-join BASE "x"))))
+(show "err size isdir    " (fn () (file-size (path-join BASE "dst"))))
+(show "err size isdir sl " (fn () (file-size (path-join BASE "dst/"))))
+(show "err size missing  " (fn () (file-size (path-join BASE "ghost"))))
+(show "err is-dir noarg  " (fn () (is-dir)))
+(show "err bad type      " (fn () (mkdir 5)))
+
+; ---- a rename that would clobber must not have clobbered. os.rename and
+; ---- File.rename both destroy the destination silently; if a backend got that
+; ---- wrong, the content here would be the *source*'s, not "kept".
+(print (str "clobber refused   " (str (read-file (path-join BASE "dst/copy.txt")))))
+
+; ---- the final layout, so a divergence in what actually landed on disk (not
+; ---- just what was printed) is visible in the diff.
+(print (str "final layout      " (str (list-dir BASE))))
+(print (str "final src         " (str (list-dir (path-join BASE "src")))))
+(print (str "final dst         " (str (list-dir (path-join BASE "dst")))))

@@ -144,6 +144,10 @@ enum {
   /* Byte-oriented string primitives (Tier 3). Appended last for the same
    * reason. */
   B_SUBSTRING, B_CHAR, B_CODE, B_STARTS_WITH, B_ENDS_WITH, B_INDEX_OF,
+  /* Tier 3 file system. Appended last for the same reason: the five ids and
+   * BUILTIN_IDS in ainl-cc's lib.rs are extended in exactly this order, and
+   * crates/ainl-cc/tests/aot_stdlib.rs checks both directions. */
+  B_MKDIR, B_RENAME, B_COPY, B_IS_DIR, B_FILE_SIZE,
   B_COUNT
 };
 
@@ -1884,6 +1888,343 @@ static Value builtin_list_dir(Value *args, int nargs) {
   return v_list_from_array(items, (int)n);
 }
 
+/* ---- Tier 3 file system -------------------------------------------------
+ * Byte-for-byte twins of the five builtins in ainl-core/src/eval.rs,
+ * including every error string and every decision about which syscall to make.
+ * The rules are pinned in docs/SYNTAX.md §3h rather than delegated to the
+ * host, for the same reason the path trio above is: the hosts disagree on
+ * every edge case that matters. The two sharpest are an existing rename
+ * destination (os.rename and File.rename clobber it silently; rename(2) does
+ * not) and a missing parent directory (mkdir's arity differs in all three
+ * hosts). */
+
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* EXDEV's value, spelled out rather than taken from <errno.h>.
+ *
+ * The interpreter cannot include a libc header either, so it hardcodes the
+ * same 18 (see the EXDEV constant in eval.rs). POSIX fixes this number in its
+ * error ABI and it is 18 on every platform AINL targets, which is what lets the
+ * two backends name the same case without sharing a header. */
+#define AINL_EXDEV 18
+
+/* The path a filesystem *query* builtin probes, with a trailing separator
+ * stripped — the same helper the interpreter's `fs_probe_path` describes. The
+ * hosts split on whether the trailing form is legal against a non-directory
+ * (ENOTDIR on Linux, NotADirectoryError in Python, a throw in Node,
+ * Errno::ENOTDIR in Ruby), so it is trimmed here.
+ *
+ * Returns a malloc'd string the caller frees, or NULL on allocation failure
+ * (which the runtime cannot report any better than "out of memory"). The
+ * common no-strip case still allocates, so every caller has exactly one free. */
+static char *fs_probe_path(const char *path) {
+  size_t n = strlen(path);
+  /* A lone "/" is the root and must survive, so the strip is skipped when it
+   * would empty the string. */
+  if (n > 1 && path[n - 1] == '/') {
+    char *trimmed = malloc(n);
+    if (!trimmed)
+      return NULL;
+    memcpy(trimmed, path, n - 1);
+    trimmed[n - 1] = 0;
+    return trimmed;
+  }
+  char *copy = malloc(n + 1);
+  if (!copy)
+    return NULL;
+  memcpy(copy, path, n + 1);
+  return copy;
+}
+
+/* mkdir, with the option as a positional string rather than a keyword — AINL
+ * has no keyword-argument syntax, so ":recursive" arrives as an ordinary
+ * string. See docs/SYNTAX.md §3h.
+ *
+ * An existing path is an error in *both* modes, checked before the host call
+ * so the message is the same everywhere. The hosts do agree that an existing
+ * directory is a failure, but they express it differently (EEXIST, Errno::EEXIST,
+ * and Python's FileExistsError) and this keeps the text identical.
+ *
+ * The recursive case is a hand-rolled create_dir_all: the C runtime has no
+ * mkdir -p, and every failure collapses to the same "cannot create" message
+ * because AINL does not surface errno (see the same comment in eval.rs). */
+static Value builtin_mkdir(Value *args, int nargs) {
+  if (nargs < 1 || nargs > 2) {
+    set_err("mkdir expects (mkdir path) or (mkdir path option)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "mkdir");
+  if (!path)
+    return v_nil();
+  int recursive = 0;
+  if (nargs == 2) {
+    if (args[1].tag != V_STR) {
+      set_err("mkdir expects a str option, got %s", type_name(&args[1]));
+      return v_nil();
+    }
+    if (strcmp(args[1].u.s->data, ":recursive") != 0) {
+      set_err("mkdir: unknown option '%s'", args[1].u.s->data);
+      return v_nil();
+    }
+    recursive = 1;
+  }
+  char *probe = fs_probe_path(path);
+  if (!probe) {
+    set_err("mkdir: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  int exists = lstat(probe, &st) == 0;
+  free(probe);
+  if (exists) {
+    set_err("mkdir: cannot create '%s': it exists", path);
+    return v_nil();
+  }
+  if (!recursive) {
+    if (mkdir(path, 0777) != 0) {
+      set_err("mkdir: cannot create '%s'", path);
+    }
+    return v_nil();
+  }
+  /* Recursive: create each missing ancestor in turn, keeping the caller's
+   * spelling. A leading "/" is preserved, so the first component is the empty
+   * string and the loop starts at the separator. A ".." segment is created as
+   * a literal directory name rather than resolved — AINL never resolves ".."
+   * (see the path-* trio), and mkdir(2) on a path containing it is an error
+   * anyway, so a caller who wrote one gets the honest "cannot create". */
+  size_t len = strlen(path);
+  for (size_t i = 1; i <= len; i++) {
+    if (i != len && path[i] != '/')
+      continue;
+    if (i == 0)
+      continue;
+    char *prefix = malloc(i + 1);
+    if (!prefix) {
+      set_err("mkdir: out of memory");
+      return v_nil();
+    }
+    memcpy(prefix, path, i);
+    prefix[i] = 0;
+    /* Skip an empty prefix (a leading "/" on its own is the root, which
+     * always exists) and anything that already exists. */
+    if (prefix[0] != 0 && lstat(prefix, &st) != 0)
+      mkdir(prefix, 0777);
+    free(prefix);
+  }
+  /* The loop is best-effort, so success is decided by looking again: a
+   * concurrent creator, a permission failure on a parent, and a ".."
+   * component must all report the same error rather than a silent nil. */
+  char *final_probe = fs_probe_path(path);
+  if (!final_probe) {
+    set_err("mkdir: out of memory");
+    return v_nil();
+  }
+  int ok = lstat(final_probe, &st) == 0 && S_ISDIR(st.st_mode);
+  free(final_probe);
+  if (!ok)
+    set_err("mkdir: cannot create '%s'", path);
+  return v_nil();
+}
+
+/* (rename from to) -> nil. A single rename(2): atomic, and it moves a whole
+ * subtree without reading it, which is the whole point over read->write->
+ * delete.
+ *
+ * Both pre-checks happen before the syscall because the hosts disagree about
+ * an existing destination: os.rename and File.rename clobber it silently,
+ * while rename(2) only fails for a non-empty directory target. Refusing here
+ * is what stops a compiled AINL program from silently destroying a file that
+ * the same program running under the interpreter would have preserved.
+ *
+ * EXDEV is named rather than collapsed into the generic message, because
+ * "different filesystems" and "not writable" need different fixes and the
+ * caller can only tell them apart from the text. There is no copy-and-delete
+ * fallback: it would change the contract from atomic to not and would be a
+ * different algorithm per backend. `copy` is there for the caller who wants
+ * the data movement. */
+static Value builtin_rename(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("rename expects (rename from to)");
+    return v_nil();
+  }
+  const char *from = as_path_arg(&args[0], "rename");
+  if (!from)
+    return v_nil();
+  const char *to = as_path_arg(&args[1], "rename");
+  if (!to)
+    return v_nil();
+  char *pfrom = fs_probe_path(from);
+  if (!pfrom) {
+    set_err("rename: out of memory");
+    return v_nil();
+  }
+  char *pto = fs_probe_path(to);
+  if (!pto) {
+    free(pfrom);
+    set_err("rename: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  if (lstat(pfrom, &st) != 0) {
+    set_err("rename: cannot move '%s': it does not exist", from);
+    free(pfrom);
+    free(pto);
+    return v_nil();
+  }
+  if (lstat(pto, &st) == 0) {
+    set_err("rename: cannot move '%s': '%s' exists", from, to);
+    free(pfrom);
+    free(pto);
+    return v_nil();
+  }
+  /* The syscall gets the caller's spelling, not the trimmed probe: renaming
+   * "a/b/" is legal POSIX and the trailing separator is part of the name the
+   * caller wrote. Only the *queries* above needed trimming. */
+  if (rename(from, to) != 0) {
+    if (errno == AINL_EXDEV)
+      set_err("rename: cannot move '%s' to '%s': different filesystems", from, to);
+    else
+      set_err("rename: cannot move '%s' to '%s'", from, to);
+  }
+  free(pfrom);
+  free(pto);
+  return v_nil();
+}
+
+/* (copy from to) -> nil. A byte-for-byte copy of one file: read and write the
+ * contents, never link(2), so the two files diverge afterwards. A hardlink
+ * would share the inode, and a later write-file on either path would silently
+ * change both — a worse surprise than the I/O. For a large file this is a full
+ * read + write, which is the documented cost.
+ *
+ * "rb"/"wb" so no CRLF translation can change the bytes on a Windows host,
+ * matching read-file's mode. A directory source is refused rather than
+ * silently skipped: there is no copy -r and no delete-dir to pair it with. */
+static Value builtin_copy(Value *args, int nargs) {
+  if (nargs != 2) {
+    set_err("copy expects (copy from to)");
+    return v_nil();
+  }
+  const char *from = as_path_arg(&args[0], "copy");
+  if (!from)
+    return v_nil();
+  const char *to = as_path_arg(&args[1], "copy");
+  if (!to)
+    return v_nil();
+  char *probe = fs_probe_path(from);
+  if (!probe) {
+    set_err("copy: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  if (lstat(probe, &st) != 0) {
+    set_err("copy: cannot copy '%s': it does not exist", from);
+    free(probe);
+    return v_nil();
+  }
+  if (S_ISDIR(st.st_mode)) {
+    set_err("copy: cannot copy '%s': it is a directory", from);
+    free(probe);
+    return v_nil();
+  }
+  FILE *in = fopen(probe, "rb");
+  if (!in) {
+    set_err("copy: cannot copy '%s' to '%s'", from, to);
+    free(probe);
+    return v_nil();
+  }
+  /* "wb" truncates an existing destination, exactly as write-file does. */
+  FILE *out = fopen(to, "wb");
+  if (!out) {
+    fclose(in);
+    set_err("copy: cannot copy '%s' to '%s'", from, to);
+    free(probe);
+    return v_nil();
+  }
+  char buf[8192];
+  size_t n;
+  int bad = 0;
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) {
+      bad = 1;
+      break;
+    }
+  }
+  if (ferror(in) || fflush(out) != 0)
+    bad = 1;
+  fclose(in);
+  if (fclose(out) != 0)
+    bad = 1;
+  free(probe);
+  if (bad)
+    set_err("copy: cannot copy '%s' to '%s'", from, to);
+  return v_nil();
+}
+
+/* (is-dir p) -> true, or nil. lstat, not stat: a symlink to a directory is a
+ * symlink, so the link itself is not a directory. This is the real primitive
+ * the old (file-exists (path-join p ".")) trick was reaching for, and it
+ * returns nil (not false) so that (= (is-dir p) nil) is the absence test every
+ * AINL program already writes — the same choice file-exists makes. */
+static Value builtin_is_dir(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("is-dir expects (is-dir path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "is-dir");
+  if (!path)
+    return v_nil();
+  char *probe = fs_probe_path(path);
+  if (!probe) {
+    set_err("is-dir: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  int ok = lstat(probe, &st) == 0 && S_ISDIR(st.st_mode);
+  free(probe);
+  return ok ? v_bool(1) : v_nil();
+}
+
+/* (file-size p) -> int, the size in *bytes*. Bytes, not characters: a file is
+ * a sequence of bytes and there is no encoding in the file, which is what
+ * makes this the companion to the byte-indexed string primitives.
+ *
+ * A directory is an error, not a number: POSIX reports the directory's own
+ * inode size (4096 on ext4, 60 on APFS, 0 on tmpfs), so answering would report
+ * a filesystem implementation detail as a language value. A missing path is
+ * the same "cannot read" read-file raises, so sizing a typo does not look like
+ * a zero-byte file. */
+static Value builtin_file_size(Value *args, int nargs) {
+  if (nargs != 1) {
+    set_err("file-size expects (file-size path)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "file-size");
+  if (!path)
+    return v_nil();
+  char *probe = fs_probe_path(path);
+  if (!probe) {
+    set_err("file-size: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  if (lstat(probe, &st) != 0) {
+    set_err("file-size: cannot read '%s'", path);
+    free(probe);
+    return v_nil();
+  }
+  if (S_ISDIR(st.st_mode)) {
+    set_err("file-size: cannot read '%s': it is a directory", path);
+    free(probe);
+    return v_nil();
+  }
+  off_t size = st.st_size;
+  free(probe);
+  return v_int((int64_t)size);
+}
+
 /* (split str sep) -> list of str. An empty separator is rejected, as in the
  * interpreter. */
 static Value builtin_split(Value *args, int nargs) {
@@ -2602,6 +2943,17 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_ends_with(args, nargs);
     case B_INDEX_OF:
       return builtin_index_of(args, nargs);
+    /* Tier 3 file system */
+    case B_MKDIR:
+      return builtin_mkdir(args, nargs);
+    case B_RENAME:
+      return builtin_rename(args, nargs);
+    case B_COPY:
+      return builtin_copy(args, nargs);
+    case B_IS_DIR:
+      return builtin_is_dir(args, nargs);
+    case B_FILE_SIZE:
+      return builtin_file_size(args, nargs);
     default:
       set_err("unknown builtin");
       return v_nil();
@@ -3789,6 +4141,9 @@ static void scope_install_prelude(Scope *env) {
       {"substring", B_SUBSTRING}, {"char", B_CHAR}, {"code", B_CODE},
       {"starts-with", B_STARTS_WITH}, {"ends-with", B_ENDS_WITH},
       {"index-of", B_INDEX_OF},
+      /* Tier 3 file system */
+      {"mkdir", B_MKDIR}, {"rename", B_RENAME}, {"copy", B_COPY},
+      {"is-dir", B_IS_DIR}, {"file-size", B_FILE_SIZE},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;
