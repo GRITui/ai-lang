@@ -7,6 +7,7 @@
 //!   eval <code>    evaluate a snippet passed on the command line
 //!   compile <file> AOT-compile to a standalone C binary (AINL -> C -> cc)
 //!   transpile <f>  project AINL into Python / JS / Ruby
+//!   pkg <cmd>       package manager: init / get / install / list / verify
 //!   grammar        print the AINL grammar (GBNF, for constrained decoding)
 //!   doctor         verify this install end to end (exit 0 only if all pass)
 //!   version        print version, build target, and source commit
@@ -15,6 +16,7 @@ mod doctor;
 mod gbnf;
 mod gen;
 mod gen_api;
+mod pkg_cmd;
 mod repl;
 mod test_runner;
 
@@ -49,6 +51,7 @@ fn main() -> ExitCode {
         Some("grammar") => cmd_grammar(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         Some("test") => cmd_test(&args[1..]),
+        Some("pkg") => pkg_cmd::run(&args[1..]),
         Some("gen") => gen::run(&args[1..]),
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("version") | Some("--version") | Some("-v") => {
@@ -81,8 +84,9 @@ fn print_help() {
          ainl transpile <file>    project AINL to another language (--to python|js|ruby)\n  \
          ainl grammar             print the AINL grammar (GBNF; --ebnf for EBNF)\n  \
          ainl repl                interactive REPL (multi-line input, --stdin for a script)\n  \
-         ainl test [path]         run AINL test files; exit non-zero on failure\n  \
-         ainl gen <spec>          generate AINL from a spec, then validate/compile/run\n  \
+         ainl test [path]         run AINL test files; exit non-zero on failure\n\
+         ainl pkg <cmd>          packages: init | get | install | list | verify\n\
+         ainl gen <spec>          generate AINL from a spec, then validate/compile/run\n\
          ainl gen --help          the full gen contract: flags, env vars, exit codes\n  \
          ainl doctor              self-test this install (exit 0 only if all pass)\n\
          ainl version             print version, build target, and source commit\n"
@@ -305,10 +309,12 @@ fn cmd_compile(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // `generate` can now refuse a program (an `import` it cannot lower), so
-    // the refusal is surfaced here rather than becoming a confusing failure
-    // further down the C pipeline.
-    let c = match ainl_cc::generate(&forms) {
+    // `generate_program`, not `generate`: the file's own directory is the base
+    // for its `import` specifiers, so passing the path down is what lets the
+    // compiler resolve the graph and inline it. That is also what keeps the
+    // emitted binary standalone — the module's code is in the C, and the
+    // program never reads a .ainl file (or a .ainl-vendor/ dir) at run time.
+    let c = match ainl_cc::generate_program(&forms, Some(std::path::Path::new(path)), Some(&src)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");

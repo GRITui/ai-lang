@@ -228,17 +228,38 @@ sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)
 
   if [ "$scope" = "interpreter-only" ]; then
     echo "ok   $name (interpreter-only)"
-    # An interpreter-only example is only honest if the backends that cannot
-    # run it actually REFUSE it. Asserted rather than skipped: the whole
-    # reason to mark a program interpreter-only is that the alternative is a
-    # backend that builds it and then does the wrong thing — `import` is a
-    # keyword in Python, Ruby and JavaScript, so an unhandled directive would
-    # lower to a call into the host's own import machinery. A program marked
-    # interpreter-only that the AOT backend quietly accepts is a bug in the
-    # marking, and this is where it shows up.
+    # An interpreter-only example is only honest if NO backend that can build it
+    # then produces the wrong answer.
+    #
+    # Each backend has exactly one acceptable outcome, and the assertion differs
+    # by backend because the *reason* it was interpreter-only differs too:
+    #
+    # - AOT either REFUSES (the honest answer when the program needs something
+    #   the C runtime has no way to provide), or BUILDS IT AND GETS IT RIGHT.
+    #   Building is not a failure: `import` used to make AOT refuse, and AOT now
+    #   resolves and inlines the graph, so a program that only needed modules is
+    #   legitimately no longer interpreter-only. What must never happen is a
+    #   binary that builds and then misbehaves — so a successful compile is
+    #   checked by RUNNING it against the interpreter's own output, which is
+    #   the only evidence that "it compiled" means "it works".
+    # - The transpilers must REFUSE. `import` is a keyword in Python, Ruby and
+    #   JavaScript, so an unhandled directive would lower to a call into the
+    #   host's own import machinery — a program that builds cleanly and does the
+    #   wrong thing. They have no way to inline a graph into a single output
+    #   file, so they are the backends that still say no.
     if "$BIN" compile "$ex" -o "$WORK/io.aot" 2> "$WORK/io.err"; then
-      echo "FAIL $name — ainl compile accepted a program declaring @scope interpreter-only"
-      fail=1
+      # It compiled. Now it has to be RIGHT, which is the real claim.
+      if ! "$WORK/io.aot" > "$WORK/io.out" 2>&1; then
+        echo "FAIL $name — ainl compile accepted it, but the binary failed at run time:"
+        sed 's/^/    /' "$WORK/io.out" | head -3
+        fail=1
+      elif ! diff -q "$WORK/io.out" "$WORK/out" > /dev/null 2>&1; then
+        echo "FAIL $name — the AOT binary's output differs from the interpreter's:"
+        diff "$WORK/out" "$WORK/io.out" | head -6 | sed 's/^/    /'
+        fail=1
+      else
+        echo "ok   $name — AOT builds it and its output matches the interpreter"
+      fi
     elif ! grep -q "interpreter-only" "$WORK/io.err"; then
       echo "FAIL $name — AOT refused, but not for the documented reason:"
       sed 's/^/    /' "$WORK/io.err" | head -3
@@ -256,7 +277,7 @@ sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)
         fail=1
       fi
     done
-    echo "ok   $name — python, js and ruby refuse it too"
+    echo "ok   $name — python, js and ruby refuse it"
     continue
   fi
 
