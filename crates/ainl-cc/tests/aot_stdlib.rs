@@ -726,8 +726,134 @@ fn aot_file_system_error_messages_match_the_interpreter() {
         (r#"(is-dir)"#, "fs_isdir_arity"),
         (r#"(file-size 1)"#, "fs_size_type"),
         (r#"(file-size)"#, "fs_size_arity"),
+        (r#"(rmdir 1)"#, "fs_rmdir_type"),
+        (r#"(rmdir 1 ":recursive")"#, "fs_rmdir_opt_type"),
+        (r#"(rmdir "x" ":parents")"#, "fs_rmdir_bad_opt"),
+        (r#"(rmdir)"#, "fs_rmdir_arity"),
+        (r#"(rmdir "a" "b" "c")"#, "fs_rmdir_arity3"),
+        (r#"(rmdir "surely-not-here")"#, "fs_rmdir_missing"),
+        (
+            r#"(rmdir "surely-not-here" ":recursive")"#,
+            "fs_rmdir_missing_r",
+        ),
     ] {
         assert_error_parity(src, name);
+    }
+}
+
+/// The two `rmdir` modes, on both backends.
+///
+/// The load-bearing parts, in order of how badly a naive port gets them:
+///
+/// 1. **The non-empty refusal names an entry.** `rmdir(2)` says only
+///    `ENOTEMPTY`, and the hosts raise `ENOTEMPTY` / `ENOTEMPTY` /
+///    `ENOTEMPTY` / `Errno::ENOTEMPTY` — so a delegation produces four
+///    different messages (or none, if it swallows the error). AINL's message
+///    names the first entry in byte order, so it is checkable and identical
+///    everywhere.
+/// 2. **`:recursive` is a real subtree delete**, not a rename and not a
+///    soft delete: the files and the nested directories are gone afterwards,
+///    which is asserted on the filesystem, not just on the printed `nil`.
+/// 3. **`rmdir` on a file is an error**, so a caller who reached for the wrong
+///    builtin is told rather than silently ignored.
+#[test]
+fn aot_rmdir_removes_empty_and_recursive_directories() {
+    // The path is already inside AINL string quotes in the template, so `{d}`
+    // is substituted raw — `format!("{d:?}")` would close the string before
+    // the "/empty" and produce a program that fails to parse.
+    let tmpl = r#"(do
+        (mkdir "{d}/empty")
+        (print (str "empty     " (rmdir "{d}/empty")))
+        (print (str "gone      " (is-dir "{d}/empty")))
+        (mkdir "{d}/full")
+        (write-file "{d}/full/a.txt" "A")
+        (print (str "refused   " (try (rmdir "{d}/full") (catch (e) (get e "message")))))
+        (print (str "survived  " (read-file "{d}/full/a.txt")))
+        (print (str "on a file " (try (rmdir "{d}/full/a.txt") (catch (e) (get e "message")))))
+        (print (str "file kept " (read-file "{d}/full/a.txt")))
+        (mkdir "{d}/tree/x/y" ":recursive")
+        (write-file "{d}/tree/x/y/deep.txt" "deep")
+        (print (str "recursive " (rmdir "{d}/tree" ":recursive")))
+        (print (str "tree gone " (is-dir "{d}/tree"))))"#;
+
+    for (label, name) in [("aot", "rmdir_aot"), ("interp", "rmdir_interp")] {
+        let dir = std::env::temp_dir().join(format!("ainl-aot-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let d = dir.to_str().unwrap();
+        let out = run_fs_backend(label, &tmpl.replace("{d}", d), name);
+        let want = format!(
+            "empty     nil\n\
+             gone      nil\n\
+             refused   rmdir: cannot remove '{d}/full': it is not empty (a.txt)\n\
+             survived  A\n\
+             on a file rmdir: cannot remove '{d}/full/a.txt': it is not a directory\n\
+             file kept A\n\
+             recursive nil\n\
+             tree gone nil\n"
+        );
+        assert_eq!(out, want, "{label} rmdir output differs from the contract");
+        // The claims that matter are on the *filesystem*, not in the output: a
+        // recursive delete that only removed the top directory would still
+        // print nil for the last two lines if `is-dir` were checked on a path
+        // that had been created twice.
+        assert!(
+            !dir.join("empty").exists(),
+            "{label}: the empty directory should be gone"
+        );
+        assert!(
+            dir.join("full/a.txt").is_file(),
+            "{label}: the refusal must not have deleted anything"
+        );
+        assert!(
+            !dir.join("tree").exists(),
+            "{label}: ':recursive' must remove the whole subtree"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A `rmdir` that must NOT delete: a symlink to a directory, recursively.
+///
+/// The single worst thing a recursive delete can do is follow a link and take
+/// the target's contents with it. Every host's recursive delete disagrees here
+/// — `shutil.rmtree` refuses a symlinked *top* directory but not a link inside
+/// the tree, `fs.rmSync` follows by default, `FileUtils.rm_rf` does not — so
+/// this is exactly the case that needs an explicit rule rather than a
+/// delegation. The target lives OUTSIDE the tree being removed, and the
+/// assertion is that it is still there afterwards.
+#[test]
+fn aot_rmdir_recursive_unlinks_a_symlink_instead_of_following_it() {
+    // The AOT binary and the interpreter, each against its own copy of the
+    // tree, because the delete is not idempotent. The template carries the
+    // path inside AINL quotes, so it is substituted raw.
+    let program = r#"(print (rmdir "{d}/tree" ":recursive"))"#;
+    for (label, name) in [("aot", "rmdir_link_aot"), ("interp", "rmdir_link_interp")] {
+        let run_dir = std::env::temp_dir().join(format!("ainl-aot-{name}"));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(run_dir.join("tree")).expect("mkdir");
+        // The precious data: a sibling of the tree being deleted, reachable
+        // only through a link *inside* it.
+        std::fs::create_dir_all(run_dir.join("precious")).expect("mkdir");
+        std::fs::write(run_dir.join("precious/keep.txt"), "keep").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(run_dir.join("precious"), run_dir.join("tree/link"))
+            .expect("symlink");
+        let r = run_dir.to_str().unwrap();
+        let out = run_fs_backend(label, &program.replace("{d}", r), name);
+        assert_eq!(
+            out, "nil\n",
+            "{label} recursive rmdir returned something else"
+        );
+        assert!(
+            !run_dir.join("tree").exists(),
+            "{label}: the tree itself must be gone"
+        );
+        assert!(
+            run_dir.join("precious/keep.txt").is_file(),
+            "{label}: recursive rmdir followed the symlink and deleted the target"
+        );
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }
 
@@ -1078,6 +1204,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
         "rename",
         "replace",
         "rest",
+        "rmdir",
         "sleep",
         "sort",
         "split",
@@ -1112,7 +1239,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
             "`{name}` did not compile to a builtin call:\n{c}"
         );
     }
-    assert_eq!(names.len(), 72, "update this list when the prelude changes");
+    assert_eq!(names.len(), 73, "update this list when the prelude changes");
 
     // The other direction, which is the one that actually catches drift: every
     // name the prelude binds must be either in the table above (reachable by
@@ -1144,7 +1271,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        74,
+        75,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),

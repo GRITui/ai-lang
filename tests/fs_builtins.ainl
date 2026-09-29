@@ -26,14 +26,13 @@
 ; A relative path, so the suite leaves nothing in $TMPDIR and `ainl test` can
 ; sweep `tests/` for it.
 ;
-; AINL has no `rmdir`, so the directories this creates cannot be removed by the
-; program itself — only `delete-file` (files) exists. The suite therefore
-; deletes every **file** it made, which is what `ainl test` checks for, and
-; leaves the empty directories behind. This is a real gap and the obvious
-; companion to this card, not a workaround: the "remove this directory" half of
-; a file-system API is still missing. It is also why
-; `scripts/check-fs-builtins.sh` gives each of its five runners its own
-; `mktemp -d` tree — outside AINL, where a recursive delete is one command.
+; Now that rmdir exists, the suite removes its own directories too: the files
+; first (rmdir is empty-only by design), then each subdirectory, then the root.
+; Before rmdir the files went and the empty directories stayed, which `ainl test`
+; tolerated — and which is why a "no leftovers" check could never pass here.
+; That is also why `scripts/check-fs-builtins.sh` gives each of its five runners
+; its own `mktemp -d` tree: outside AINL a recursive delete is one command, and
+; inside it there is none.
 (def ROOT "ainl-test-fs.tmp")
 (def SRC (path-join ROOT "incoming"))
 
@@ -244,12 +243,49 @@
        (try (mkdir (path-join SRC "txt") ":recursive") (catch (e) "refused"))
        "refused")
 
+(test "rmdir refuses a non-empty directory and names the entry"
+       (do (mkdir (path-join SRC "full") ":recursive")
+           (write-file (path-join SRC "full/zzz.txt") "z")
+           (write-file (path-join SRC "full/aaa.txt") "a")
+           (def msg (try (rmdir (path-join SRC "full")) (catch (e) (get e "message"))))
+           (do (delete-file (path-join SRC "full/zzz.txt"))
+               (delete-file (path-join SRC "full/aaa.txt"))
+               (rmdir (path-join SRC "full"))
+               msg))
+       (str "rmdir: cannot remove '" (path-join SRC "full") "': it is not empty (aaa.txt)"))
+
+(test "rmdir refuses a missing path"
+       (try (rmdir (path-join SRC "nope")) (catch (e) (get e "message")))
+       (str "rmdir: cannot remove '" (path-join SRC "nope") "': it does not exist"))
+
+(test "rmdir refuses a file"
+       (do (write-file (path-join SRC "a-file.txt") "A")
+           (def msg (try (rmdir (path-join SRC "a-file.txt")) (catch (e) (get e "message"))))
+           (delete-file (path-join SRC "a-file.txt"))
+           msg)
+       (str "rmdir: cannot remove '" (path-join SRC "a-file.txt") "': it is not a directory"))
+
+(test "rmdir \" :recursive\" removes a whole tree"
+       (do (mkdir (path-join SRC "deep/x/y") ":recursive")
+           (write-file (path-join SRC "deep/x/y/f.txt") "x")
+           (rmdir (path-join SRC "deep") ":recursive")
+           (str (is-dir (path-join SRC "deep"))))
+       "nil")
+
+(test "rmdir removes an empty directory"
+       (do (mkdir (path-join SRC "hollow") ":recursive")
+           (rmdir (path-join SRC "hollow"))
+           (str (is-dir (path-join SRC "hollow"))))
+       "nil")
+
 ; ---- clean up the files ---------------------------------------------------
-; AINL has no `rmdir`, so the directories stay; the files go. One pass over the
-; inbox removes the unmoved files, and a pass over each subdirectory removes the
-; moved ones. `ainl test` checks for leftovers, and a re-run then starts from a
-; tree of empty directories, which `mkdir`'s refusal rule handles via the
-; `is-dir` guard above.
+; Now that rmdir exists, this suite cleans up after itself completely: the files
+; go, then each subdirectory, then the root — so a re-run starts from the same
+; tree it started from and a "no leftovers" check can actually pass here.
+;
+; `delete-file` still handles the plain files at the top level; each subdirectory
+; is emptied file by file and then removed, because rmdir is empty-only by
+; design. The root is removed last, once SRC is empty.
 (def di (list-dir SRC))
 (while (not (= di (list)))
   (def sub (path-join SRC (first di)))
@@ -257,6 +293,9 @@
       (do (def ei (list-dir sub))
           (while (not (= ei (list)))
             (delete-file (path-join sub (first ei)))
-            (def ei (rest ei))))
+            (def ei (rest ei)))
+          (rmdir sub))
       (delete-file sub))
   (def di (rest di)))
+(rmdir SRC)
+(rmdir ROOT)

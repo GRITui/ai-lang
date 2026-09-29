@@ -160,6 +160,12 @@ enum {
    * that one name rather than getting a second id, which is exactly what makes
    * `db-set`/`db-get` a round-tripping pair in a compiled binary. */
   B_DB_SET, B_DB_GET_RAW, B_DB_DEL, B_DB_KEYS, B_DB_COUNT,
+  /* Tier 3 file system, companion. Appended last for the same reason, and it
+   * takes the next free id rather than sitting next to B_MKDIR: every earlier
+   * id keeps the value it has always had. The implementation is builtin_rmdir
+   * below — a twin of builtin_rmdir in ainl-core/src/eval.rs, recursive walk
+   * included. */
+  B_RMDIR,
   B_COUNT
 };
 
@@ -1911,6 +1917,7 @@ static Value builtin_list_dir(Value *args, int nargs) {
  * hosts). */
 
 #include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -2235,6 +2242,198 @@ static Value builtin_file_size(Value *args, int nargs) {
   off_t size = st.st_size;
   free(probe);
   return v_int((int64_t)size);
+}
+
+/* (rmdir path) / (rmdir path ":recursive") -> nil. The inverse of mkdir, and
+ * the half of the file-system API that was missing: a program could create a
+ * directory and could not remove one.
+ *
+ * Every decision is made here rather than left to the host, for the same reason
+ * builtin_mkdir is: os.rmdir, fs.rmdirSync and Dir.rmdir are all empty-only but
+ * raise six different exception classes for the three failure modes, and the
+ * 4-backend rule compares the *message* byte for byte. The rules are pinned in
+ * docs/SYNTAX.md §3h rather than delegated to the host, for the same reason the
+ * path trio is: the hosts disagree on every edge case that matters.
+ *
+ * The empty check is made *before* rmdir(2) rather than read off ENOTEMPTY, so
+ * the message can name the entry that blocked it — the one thing errno cannot
+ * carry portably. */
+
+/* The first entry name in `dir`, in byte order, or NULL when it is empty *or*
+ * unreadable. The two are not the same claim, but neither can be reported: the
+ * caller of this is about to rmdir(2) anyway, and that decides between them.
+ * NULL on an unreadable directory means rmdir(2) is attempted and fails, which
+ * is the honest outcome — the same one the interpreter's fs_remove_tree gets. */
+static char *fs_first_entry(const char *dir) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return NULL;
+  char *first = NULL;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    /* Byte order, the same order list-dir returns in — readdir order is
+     * filesystem-dependent and differs per host, so the *first* entry has to be
+     * chosen by a rule every backend can express, not by the order the host
+     * happened to hand them over.
+     *
+     * The candidate goes through a `const char *` local because `name_cmp`
+     * dereferences its arguments as `char *const *`: `&ent->d_name` is a
+     * pointer to the array, and reading through that as a `char *` is a wild
+     * read — it segfaulted, which is how this was found. A local (rather than a
+     * C99 compound literal) because this runtime is built without -std, and the
+     * local is the same shape builtin_list_dir already sorts with. */
+    const char *candidate = ent->d_name;
+    if (!first || name_cmp(&candidate, &first) < 0) {
+      char *dup = strdup(ent->d_name);
+      if (!dup) {
+        free(first);
+        closedir(d);
+        return NULL;
+      }
+      free(first);
+      first = dup;
+    }
+  }
+  closedir(d);
+  return first;
+}
+
+/* Remove `dir` and everything under it, depth-first: children before parents,
+ * and a directory is rmdir'd only once it is empty — the post-order walk `rm -r`
+ * performs. Returns 0 on success, -1 on the first failure, and stops there, so
+ * a partial delete is visible to the caller rather than silent.
+ *
+ * lstat, not stat: a symlink is unlinked, never followed. Following it would
+ * delete the target's *contents* through a link the caller never named, which is
+ * the single worst thing a recursive delete can do. */
+static int fs_remove_tree(const char *dir) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return -1;
+  size_t cap = 16, n = 0;
+  char **names = malloc(cap * sizeof(char *));
+  if (!names) {
+    closedir(d);
+    return -1;
+  }
+  struct dirent *ent;
+  int failed = 0;
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    if (n == cap) {
+      cap *= 2;
+      char **bigger = realloc(names, cap * sizeof(char *));
+      if (!bigger) {
+        for (size_t k = 0; k < n; k++)
+          free(names[k]);
+        free(names);
+        closedir(d);
+        return -1;
+      }
+      names = bigger;
+    }
+    names[n] = strdup(ent->d_name);
+    if (!names[n]) {
+      for (size_t k = 0; k < n; k++)
+        free(names[k]);
+      free(names);
+      closedir(d);
+      return -1;
+    }
+    n++;
+  }
+  closedir(d);
+  /* Collect first, then recurse: a recursive readdir on the same directory is
+   * not portable, and the collection is bounded by the entry count anyway. */
+  for (size_t k = 0; k < n && !failed; k++) {
+    size_t plen = strlen(dir) + 1 + strlen(names[k]) + 1;
+    char *child = malloc(plen);
+    if (!child) {
+      failed = 1;
+      break;
+    }
+    snprintf(child, plen, "%s/%s", dir, names[k]);
+    struct stat st;
+    if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+      if (fs_remove_tree(child) != 0)
+        failed = 1;
+    } else if (unlink(child) != 0) {
+      failed = 1;
+    }
+    free(child);
+  }
+  for (size_t k = 0; k < n; k++)
+    free(names[k]);
+  free(names);
+  if (failed)
+    return -1;
+  return rmdir(dir);
+}
+
+static Value builtin_rmdir(Value *args, int nargs) {
+  /* Arity before the option, and the message names the two accepted shapes
+   * without quoting the option token: the transpiler targets' repr helpers do
+   * not escape a double quote inside a rendered string, so a message containing
+   * ":recursive" would render differently on python/js/ruby than here. "option"
+   * is still exact — there is exactly one, and docs/SYNTAX.md §3h names it. */
+  if (nargs < 1 || nargs > 2) {
+    set_err("rmdir expects (rmdir path) or (rmdir path option)");
+    return v_nil();
+  }
+  const char *path = as_path_arg(&args[0], "rmdir");
+  if (!path)
+    return v_nil();
+  int recursive = 0;
+  if (nargs == 2) {
+    if (args[1].tag != V_STR) {
+      set_err("rmdir expects a str option, got %s", type_name(&args[1]));
+      return v_nil();
+    }
+    if (strcmp(args[1].u.s->data, ":recursive") != 0) {
+      set_err("rmdir: unknown option '%s'", args[1].u.s->data);
+      return v_nil();
+    }
+    recursive = 1;
+  }
+  char *probe = fs_probe_path(path);
+  if (!probe) {
+    set_err("rmdir: out of memory");
+    return v_nil();
+  }
+  struct stat st;
+  if (lstat(probe, &st) != 0) {
+    set_err("rmdir: cannot remove '%s': it does not exist", path);
+    free(probe);
+    return v_nil();
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    set_err("rmdir: cannot remove '%s': it is not a directory", path);
+    free(probe);
+    return v_nil();
+  }
+  if (recursive) {
+    /* One message for every failure, for the reason mkdir collapses its errno
+     * zoo: AINL does not surface errno, and the hosts each name a different one
+     * for the same situation. */
+    if (fs_remove_tree(probe) != 0)
+      set_err("rmdir: cannot remove '%s'", path);
+    free(probe);
+    return v_nil();
+  }
+  char *first = fs_first_entry(probe);
+  if (first) {
+    set_err("rmdir: cannot remove '%s': it is not empty (%s)", path, first);
+    free(first);
+    free(probe);
+    return v_nil();
+  }
+  if (rmdir(probe) != 0)
+    set_err("rmdir: cannot remove '%s'", path);
+  free(probe);
+  return v_nil();
 }
 
 /* (split str sep) -> list of str. An empty separator is rejected, as in the
@@ -3764,6 +3963,8 @@ static Value v_call(Value callee, Value *args, int nargs) {
       return builtin_is_dir(args, nargs);
     case B_FILE_SIZE:
       return builtin_file_size(args, nargs);
+    case B_RMDIR:
+      return builtin_rmdir(args, nargs);
     /* Tier 4 storage */
     case B_DB_OPEN:
       return builtin_db_open(args, nargs);
@@ -4990,6 +5191,9 @@ static void scope_install_prelude(Scope *env) {
       /* Tier 4 key-value layer */
       {"db-set", B_DB_SET}, {"db-get-raw", B_DB_GET_RAW}, {"db-del", B_DB_DEL},
       {"db-keys", B_DB_KEYS}, {"db-count", B_DB_COUNT},
+      /* Tier 3 file system, companion. Last for the same reason as every
+       * earlier group: each id keeps the value it has always had. */
+      {"rmdir", B_RMDIR},
   };
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
     Value b;

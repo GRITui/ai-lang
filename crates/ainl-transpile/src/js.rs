@@ -271,15 +271,29 @@ impl Js {
         // `_ainl_tname` renders AINL's type name for a wrong-typed path, so
         // `got int` matches the interpreter rather than `got number`; it
         // branches on _Hash and _Sym, so both come with it.
-        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
-            .iter()
-            .any(|n| self.needed.contains(*n))
+        if [
+            "_mkdir",
+            "_rmdir",
+            "_rename",
+            "_copy",
+            "_is_dir",
+            "_file_size",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
         {
             self.needed.insert("_error");
             self.needed.insert("_fs_probe");
             self.needed.insert("_ainl_tname");
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
+        }
+        // `_rmdir`'s `":recursive"` form is a hand-rolled walk, kept as its own
+        // helper so the rule that matters (post-order, and a symlink unlinked
+        // rather than followed) stays readable. The RUNTIME table is emitted in
+        // declaration order, so it is declared after `_rmdir`.
+        if self.needed.contains("_rmdir") {
+            self.needed.insert("_fs_rm_tree");
         }
         // Tier 1 JSON. The whole cluster is pulled in by either entry point,
         // because `_ainl_tname` (json-parse's type error, and the "keys must be
@@ -675,6 +689,7 @@ impl Js {
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 // ---- Tier 3 file system ----
                 "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rmdir" => return self.call_builtin("_rmdir", args, Some("_rmdir")),
                 "rename" => return self.call_builtin("_rename", args, Some("_rename")),
                 "copy" => return self.call_builtin("_copy", args, Some("_copy")),
                 "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
@@ -1394,6 +1409,37 @@ const RUNTIME: &[(&str, &str)] = &[
         // directory and then writes into it needs to know whether *it* created
         // it.
         "function _mkdir(...args) {\n  if (args.length < 1 || args.length > 2) _error(\"mkdir expects (mkdir path) or (mkdir path option)\");\n  const path = args[0];\n  const opt = args.length > 1 ? args[1] : null;\n  if (typeof path !== \"string\") _error(`mkdir expects a str path, got ${_ainl_tname(path)}`);\n  if (opt !== null) {\n    if (typeof opt !== \"string\") _error(`mkdir expects a str option, got ${_ainl_tname(opt)}`);\n    if (opt !== \":recursive\") _error(`mkdir: unknown option '${opt}'`);\n  }\n  const fs = require(\"fs\");\n  // lstatSync, not existsSync: the interpreter's symlink_metadata is an\n  // lstat, and a broken symlink is still a directory entry mkdir must refuse.\n  let exists = true;\n  try {\n    fs.lstatSync(_fs_probe(path));\n  } catch (e) {\n    exists = false;\n  }\n  if (exists) _error(`mkdir: cannot create '${path}': it exists`);\n  try {\n    fs.mkdirSync(path, opt === \":recursive\" ? { recursive: true } : undefined);\n  } catch (e) {\n    _error(`mkdir: cannot create '${path}'`);\n  }\n}",
+    ),
+    (
+        "_rmdir",
+        // The inverse of _mkdir, and the same explicit-rules rule: fs.rmdirSync
+        // is empty-only while fs.rmSync is recursive and follows a symlinked
+        // *file*, and neither raises a class AINL can name. So neither is
+        // allowed to decide anything. See docs/SYNTAX.md §3h.
+        //
+        // The arity guard is inside the helper for the same reason as _mkdir: a
+        // JS TypeError is not an _AinlError, so it would escape an AINL `catch`
+        // and print a Node stack trace to stderr.
+        //
+        // The empty check is made here rather than read off ENOTEMPTY, because
+        // the message has to NAME the entry that blocked it. The name is the
+        // first in Buffer (byte) order, matching _list_dir: readdirSync returns
+        // filesystem order, which differs per host, so "the first entry" has to
+        // be chosen by a rule every backend can express.
+        //
+        // The recursive case is a hand-rolled walk rather than fs.rmSync: rmSync
+        // follows a symlinked directory, so deleting through a link would take
+        // the target's contents with it — and it silently ignores ENOENT on a
+        // child, which would make a partial delete look complete. lstat here, so
+        // a symlink is unlinked and never followed.
+        "function _rmdir(...args) {\n  if (args.length < 1 || args.length > 2) _error(\"rmdir expects (rmdir path) or (rmdir path option)\");\n  const path = args[0];\n  const opt = args.length > 1 ? args[1] : null;\n  if (typeof path !== \"string\") _error(`rmdir expects a str path, got ${_ainl_tname(path)}`);\n  if (opt !== null) {\n    if (typeof opt !== \"string\") _error(`rmdir expects a str option, got ${_ainl_tname(opt)}`);\n    if (opt !== \":recursive\") _error(`rmdir: unknown option '${opt}'`);\n  }\n  const fs = require(\"fs\");\n  // lstatSync, not statSync: the interpreter's symlink_metadata is an lstat, so\n  // a symlink to a directory is a symlink and is not a directory.\n  const p = _fs_probe(path);\n  let st;\n  try {\n    st = fs.lstatSync(p);\n  } catch (e) {\n    _error(`rmdir: cannot remove '${path}': it does not exist`);\n  }\n  if (st.isSymbolicLink() || !st.isDirectory()) _error(`rmdir: cannot remove '${path}': it is not a directory`);\n  if (opt === \":recursive\") {\n    _fs_rm_tree(p);\n    return;\n  }\n  const names = fs.readdirSync(p).filter((n) => n !== \".\" && n !== \"..\");\n  if (names.length > 0) {\n    names.sort((a, b) => Buffer.compare(Buffer.from(a, \"utf8\"), Buffer.from(b, \"utf8\")));\n    _error(`rmdir: cannot remove '${path}': it is not empty (${names[0]})`);\n  }\n  try {\n    fs.rmdirSync(p);\n  } catch (e) {\n    _error(`rmdir: cannot remove '${path}'`);\n  }\n}",
+    ),
+    (
+        // The recursive walk behind _rmdir's ':recursive'. Its own helper so the
+        // rule that matters — post-order, and a symlink unlinked rather than
+        // followed — is readable rather than buried in the argument handling.
+        "_fs_rm_tree",
+        "function _fs_rm_tree(p) {\n  const fs = require(\"fs\");\n  for (const n of fs.readdirSync(p)) {\n    const c = `${p}/${n}`;\n    const st = fs.lstatSync(c);\n    if (st.isDirectory()) _fs_rm_tree(c);\n    else fs.unlinkSync(c);\n  }\n  fs.rmdirSync(p);\n}",
     ),
     (
         "_rename",

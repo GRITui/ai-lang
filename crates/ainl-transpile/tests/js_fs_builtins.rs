@@ -19,12 +19,14 @@ fn js(src: &str) -> String {
 #[test]
 fn file_system_builtins_map_to_their_helpers() {
     let out = js(r#"(do (mkdir "d" ":recursive")
+             (rmdir "d" ":recursive")
              (rename "a" "b")
              (copy "a" "b")
              (is-dir "d")
              (file-size "a"))"#);
     for call in [
         "_mkdir(\"d\", \":recursive\")",
+        "_rmdir(\"d\", \":recursive\")",
         "_rename(\"a\", \"b\")",
         "_copy(\"a\", \"b\")",
         "_is_dir(\"d\")",
@@ -34,6 +36,7 @@ fn file_system_builtins_map_to_their_helpers() {
     }
     for helper in [
         "_mkdir",
+        "_rmdir",
         "_rename",
         "_copy",
         "_is_dir",
@@ -45,6 +48,17 @@ fn file_system_builtins_map_to_their_helpers() {
             "missing helper {helper}:\n{out}"
         );
     }
+    // The recursive walk is pulled in by _rmdir alone, so a program that only
+    // renames does not carry it.
+    let without = js(r#"(rename "a" "b")"#);
+    assert!(
+        !without.contains("function _fs_rm_tree("),
+        "_fs_rm_tree must not be emitted unless rmdir is used:\n{without}"
+    );
+    assert!(
+        out.contains("function _fs_rm_tree("),
+        "_rmdir must bring its recursive walk:\n{out}"
+    );
 }
 
 #[test]
@@ -177,6 +191,68 @@ fn arity_and_type_failures_are_ainl_errors_not_host_throws() {
             "the {who} message must be AINL's own:\n{out}"
         );
     }
+}
+
+#[test]
+fn rmdir_never_reaches_fs_rm_sync_and_names_the_blocking_entry() {
+    // fs.rmSync follows a symlink inside the tree and silently ignores ENOENT
+    // on a child, so a delegation would delete through a link *and* make a
+    // partial delete look complete. The walk is hand-rolled with lstatSync, so
+    // a link is unlinked rather than descended into.
+    //
+    // The refusal also has to NAME the entry, in byte order (Buffer.compare, the
+    // same key _list_dir uses) — readdirSync returns filesystem order, which
+    // differs per host.
+    let out = js(r#"(rmdir "d" ":recursive")"#);
+    assert!(
+        !out.contains("fs.rmSync"),
+        "the host's recursive delete must not be reached:\n{out}"
+    );
+    assert!(
+        out.contains("Buffer.compare(Buffer.from(a, \"utf8\")"),
+        "the named entry must be the first in byte order:\n{out}"
+    );
+    assert!(
+        out.contains("it is not empty ("),
+        "the refusal must name the entry:\n{out}"
+    );
+    // The walk is post-order: the directory is only rmdir'd after its children.
+    let walk = out
+        .split("function _fs_rm_tree(")
+        .nth(1)
+        .expect("_fs_rm_tree must be emitted");
+    let recurse = walk.find("_fs_rm_tree(c);").expect("the recursion");
+    let unlink = walk.find("fs.unlinkSync(c);").expect("the unlink");
+    let rmdir = walk.find("fs.rmdirSync(p);").expect("the final rmdir");
+    assert!(
+        recurse < unlink,
+        "the branch order must be readable:\n{out}"
+    );
+    assert!(unlink < rmdir, "children before parents:\n{out}");
+    assert!(
+        walk.contains("lstatSync(c)"),
+        "the walk must lstat, not stat, or it would follow a link:\n{out}"
+    );
+}
+
+#[test]
+fn rmdir_refuses_a_symlink_rather_than_following_it() {
+    // A link to a directory is not a directory (the lstat rule), and
+    // statSync would say it is — so the isSymbolicLink guard is the whole
+    // difference between "unlink the link" and "delete the target".
+    let out = js(r#"(rmdir "d")"#);
+    assert!(
+        out.contains("st.isSymbolicLink() || !st.isDirectory()"),
+        "a symlink must not be treated as a directory:\n{out}"
+    );
+    assert!(
+        out.contains("lstatSync(p)"),
+        "the probe must be lstatSync:\n{out}"
+    );
+    assert!(
+        out.contains("function _rmdir(...args)"),
+        "rmdir must take ...args so arity is AINL's error, not a JS one:\n{out}"
+    );
 }
 
 #[test]

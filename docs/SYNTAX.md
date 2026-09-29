@@ -951,17 +951,21 @@ implementation. (The parity program is a *print* program rather than a test
 file, so it lives in `fixtures/` — `ainl test` sweeps `tests/` and would count
 its output as suite noise.)
 
-## 3h. File system: `mkdir` / `rename` / `copy` / `is-dir` / `file-size`
+## 3h. File system: `mkdir` / `rmdir` / `rename` / `copy` / `is-dir` / `file-size`
 
 The Tier 3 file-system operations, completing the cluster that
 `read-file`/`write-file`/`delete-file`/`list-dir` started. They exist because the
 existing file builtins can only *inspect* and *rewrite*: moving a file meant
 read → write → delete, which copies every byte, cannot move a directory at all,
-and leaves two half-copies if it is interrupted.
+and leaves two half-copies if it is interrupted. `rmdir` closes the loop in the
+other direction: before it, a program could create a directory and not remove
+one, so a tool that organized files left its own scaffolding behind forever.
 
 ```
 (mkdir path)                    ; create one directory
 (mkdir path ":recursive")        ; create it and every missing parent
+(rmdir path)                    ; remove an EMPTY directory
+(rmdir path ":recursive")        ; remove it and everything under it
 (rename from to)                ; move a file or a directory tree
 (copy from to)                   ; duplicate a file
 (is-dir path)                    ; true for a directory, nil otherwise
@@ -1021,6 +1025,97 @@ one AINL gives:
 ```
 (mkdir "absent/child")
 ; mkdir: cannot create 'absent/child'
+```
+
+### rmdir removes an empty directory, and says which entry is in the way
+
+`rmdir` is the inverse of `mkdir`, and the same option convention applies —
+`":recursive"` is the second positional argument, and an unknown one is an
+error rather than ignored:
+
+```
+(rmdir "d")                      ; nil
+(rmdir "d")                      ; rmdir: cannot remove 'd': it does not exist
+(mkdir "d/inner" ":recursive")
+(rmdir "d")
+; rmdir: cannot remove 'd': it is not empty (inner)
+(rmdir "d" ":parents")
+; rmdir: unknown option ':parents'
+```
+
+Without `":recursive"` only an **empty** directory can be removed, which is
+POSIX `rmdir(2)`. That is not caution, it is what the hosts already do: `os.rmdir`,
+`fs.rmdirSync` and `Dir.rmdir` are all empty-only, so this is the one rule every
+backend agrees on and the message can be identical rather than host-shaped.
+
+The refusal **names the entry that blocked it**, in byte order. A count would
+answer a question the caller did not ask ("how much is in here?"); a name answers
+the one they did ("what is stopping me?") and is itself the next call — here,
+`(rmdir "d/inner")`. Byte order rather than directory order, because `readdir`
+order is filesystem-dependent and differs per host — the same reason `list-dir`
+sorts. A directory holding only an *empty* subdirectory is not empty, and the
+message says so by naming the subdirectory.
+
+A **missing path is an error, not `nil`**, even though `is-dir` answers `nil` for
+the very same path. `is-dir` is a *question* and has exactly one negative
+answer; `rmdir` is an *action*, and "delete this" against a typo must not look
+like it worked. The same goes for a file:
+
+```
+(rmdir "notes.txt")
+; rmdir: cannot remove 'notes.txt': it is not a directory
+```
+
+`delete-file` exists for that, so a caller who reached for `rmdir` made a mistake
+worth reporting rather than a condition to absorb.
+
+### `":recursive"` is a full subtree delete, and it is not reversible
+
+It removes the directory **and every file and directory under it**, depth-first,
+by unlink and rmdir. It does not move anything aside, and AINL has no trash and
+no undo. A caller who wants the data kept must `rename` it out first — which is
+one syscall and is the right way to say "archive this":
+
+```
+(mkdir "work/a/b" ":recursive")
+(write-file "work/a/b/f.txt" "x")
+(rename "work/a" "keep/a")        ; archive the part worth keeping
+(rmdir "work" ":recursive")       ; delete the rest, irreversibly
+```
+
+`":recursive"` on a missing path is still an error. It is a licence to remove
+*more*, not to invent a directory.
+
+### rmdir unlinks a symlink; it never follows one
+
+A symlink is not a directory, so a plain `rmdir` on one is the same "it is not a
+directory" refusal — even when it points at a directory:
+
+```
+(rmdir "link-to-dir")
+; rmdir: cannot remove 'link-to-dir': it is not a directory
+```
+
+Inside a `":recursive"` delete, a symlink is **unlinked, not descended into**.
+This is the single most important rule in this section, and it is the one the
+hosts each get differently: `shutil.rmtree` refuses a symlinked *top* directory
+but not a link inside the tree, `fs.rmSync` follows by default, and
+`FileUtils.rm_rf` does not. Following a link would delete the target's contents
+through a path the caller never named. Each backend implements the walk itself
+for exactly this reason — see the backend-scope note below.
+
+### The two rules are symmetric with `mkdir`
+
+`mkdir` refuses an existing path so a caller can tell whether *it* created a
+directory; `rmdir` refuses a non-empty one for the mirror-image reason, so a
+caller can tell whether its delete did anything. Together they mean a program can
+be re-run over its own output, which is the property a self-cleaning tool needs:
+
+```
+(if (not (file-exists "out")) (mkdir "out" ":recursive"))
+...                             ; fill it
+(if (is-dir "out/inner") (rmdir "out/inner"))
+(if (= (is-dir "out") true) (rmdir "out"))
 ```
 
 ### rename refuses an existing destination
@@ -1131,6 +1226,13 @@ them is a `try`/`catch`-able AINL error:
 (mkdir 1)                        ; mkdir expects a str path, got int
 (mkdir)                          ; mkdir expects (mkdir path) or (mkdir path option)
 (mkdir "a" "b" "c")              ; mkdir expects (mkdir path) or (mkdir path option)
+(rmdir 1)                        ; rmdir expects a str path, got int
+(rmdir "a" 2)                    ; rmdir expects a str option, got int
+(rmdir)                          ; rmdir expects (rmdir path) or (rmdir path option)
+(rmdir "a" "b" "c")              ; rmdir expects (rmdir path) or (rmdir path option)
+(rmdir "a" ":parents")           ; rmdir: unknown option ':parents'
+(rmdir "gone")                   ; rmdir: cannot remove 'gone': it does not exist
+(rmdir "f.txt")                  ; rmdir: cannot remove 'f.txt': it is not a directory
 (rename 1 2)                     ; rename expects a str path, got int
 (rename "a")                     ; rename expects (rename from to)
 (copy 1 2)                       ; copy expects a str path, got int
@@ -1141,13 +1243,18 @@ them is a `try`/`catch`-able AINL error:
 (file-size)                      ; file-size expects (file-size path)
 ```
 
+The "it is not empty (name)" message is the one case whose text is *derived*
+rather than fixed, and it is derived from the same byte-ordered `readdir` the
+C runtime and the three transpiler targets already use for `list-dir` — so it
+names the same entry on every backend.
+
 The type name is AINL's, not the host's: a Python port that rendered
 `<class 'int'>`, or a Ruby one that rendered `Integer`, would be a message the
 program could not match on.
 
 ### Backend scope: all four
 
-All five are supported on **all four backends** — the interpreter, the bytecode
+All six are supported on **all four backends** — the interpreter, the bytecode
 VM, the AOT C runtime, and the Python, JS and Ruby transpilers — byte-identical
 on stdout, on stderr and on return codes.
 
@@ -1159,9 +1266,29 @@ JavaScript checks before `fs.renameSync` and omits the `recursive` flag rather
 than passing `false`; Ruby builds the parents one component at a time with a
 local `_fs_mkdir_p` rather than requiring `fileutils`, which would also be quiet
 on an existing leaf. All three use `lstat` throughout, and each catches its
-host's exception class to re-raise an AINL error — a `TypeError`, `ArgumentError`
-or `SystemCallError` is not an `_AinlError`, so it would escape an AINL `catch`
-and print a host backtrace to stderr.
+host's exception class to re-raise an AINL error — a `TypeError`,
+`ArgumentError` or `SystemCallError` is not an `_AinlError`, so it would escape
+an AINL `catch` and print a host backtrace to stderr.
+
+`rmdir` needs the same discipline for one more reason: **none of the three hosts
+has a recursive delete that agrees with the others.** `shutil.rmtree` follows a
+symlinked file and refuses a symlinked top directory, `fs.rmSync` follows links
+and ignores `ENOENT` on a child, and `FileUtils.rm_rf` is silent about a failure
+it could not perform — so a program that deleted through a link, or that
+partially failed, would behave differently on each. Python, JavaScript and Ruby
+each hand-roll the walk (`_fs_rm_tree`) and call it post-order with `lstat` on
+every entry, and the C runtime carries the same walk in `fs_remove_tree`.
+
+Ruby's projection has one trap the other two do not, and it is worth naming
+because it is invisible until something prints the result: **Ruby returns the
+value of its last expression**, and `Dir.mkdir`, `File.rename` and `Dir.rmdir`
+all return `0` while `File.write` and `IO.copy_stream` return a byte count. A
+helper that ends on the host call hands that value to the AINL program, so
+`(print (write-file "a.txt" "A"))` printed `1` on ruby and `nil` everywhere else.
+Every void filesystem helper in the Ruby target therefore ends in an explicit
+`nil`; `crates/ainl-transpile/tests/ruby_fs_builtins.rs` asserts that for all
+seven, and `fixtures/rmdir_parity.ainl` prints a void return on every runner so
+the gate would catch a regression.
 
 `scripts/check-fs-builtins.sh` runs `fixtures/fs_builtins_parity.ainl` through
 all five runners and diffs them against the interpreter, which is the normative
@@ -1169,6 +1296,14 @@ implementation. Each runner gets a **fresh scratch tree**, because the program
 creates, moves and deletes files and is not idempotent. (The parity program is a
 *print* program rather than a test file, so it lives in `fixtures/` — `ainl test`
 sweeps `tests/` and would count its output as suite noise.)
+
+`scripts/check-rmdir.sh` is the same gate for `rmdir`, with
+`fixtures/rmdir_parity.ainl`. It is a separate script because that program needs
+something the shell must build for it: AINL has no `symlink` builtin, so the
+script creates a link to a target *outside* the tree the program then deletes, and
+the program checks the target survived. That is the case a delegated recursive
+delete gets wrong on at least one of the three hosts, and it cannot be expressed
+in a program that has no way to create a link.
 
 ## 3i. Packages: `ainl pkg`
 
