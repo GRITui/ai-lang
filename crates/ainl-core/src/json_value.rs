@@ -70,6 +70,7 @@
 //! something this module introduces; `json-serialize` still emits `1.0` for a
 //! float, so a JS program that round-trips still produces valid JSON.
 
+use crate::bignum::BigNum;
 use crate::error::{Error, Result};
 use crate::eval::Env;
 use crate::value::{ConsCell, Value};
@@ -367,7 +368,7 @@ impl<'a> Parser<'a> {
             // `-0` parses as the integer 0: AINL has one int type and no
             // negative zero, and `(= 0 -0)` is true anyway.
             if let Ok(i) = text.parse::<i64>() {
-                return Ok(Value::Int(i));
+                return Ok(Value::Int(BigNum::small(i)));
             }
         }
         text.parse::<f64>()
@@ -631,10 +632,10 @@ mod tests {
         assert_eq!(parse("null").unwrap(), Value::Nil);
         assert_eq!(parse("true").unwrap(), Value::Bool(true));
         assert_eq!(parse("false").unwrap(), Value::Bool(false));
-        assert_eq!(parse("0").unwrap(), Value::Int(0));
-        assert_eq!(parse("-0").unwrap(), Value::Int(0));
-        assert_eq!(parse("42").unwrap(), Value::Int(42));
-        assert_eq!(parse("-42").unwrap(), Value::Int(-42));
+        assert_eq!(parse("0").unwrap(), Value::Int(BigNum::small(0)));
+        assert_eq!(parse("-0").unwrap(), Value::Int(BigNum::small(0)));
+        assert_eq!(parse("42").unwrap(), Value::Int(BigNum::small(42)));
+        assert_eq!(parse("-42").unwrap(), Value::Int(BigNum::small(-42)));
         assert_eq!(parse("1.5").unwrap(), Value::Float(1.5));
         assert_eq!(parse("1e3").unwrap(), Value::Float(1000.0));
         assert_eq!(parse("\"\"").unwrap(), Value::str(""));
@@ -643,8 +644,14 @@ mod tests {
 
     #[test]
     fn i64_min_and_max_survive() {
-        assert_eq!(parse("9223372036854775807").unwrap(), Value::Int(i64::MAX));
-        assert_eq!(parse("-9223372036854775808").unwrap(), Value::Int(i64::MIN));
+        assert_eq!(
+            parse("9223372036854775807").unwrap(),
+            Value::Int(BigNum::small(i64::MAX))
+        );
+        assert_eq!(
+            parse("-9223372036854775808").unwrap(),
+            Value::Int(BigNum::small(i64::MIN))
+        );
         // Past i64 it becomes a float, rather than erroring or wrapping.
         assert_eq!(
             parse("9223372036854775808").unwrap(),
@@ -871,7 +878,7 @@ mod tests {
         let v = parse(s).unwrap();
         let Value::Map(pairs) = &v else { panic!() };
         assert_eq!(pairs[0].0, Value::str("a"));
-        assert_eq!(pairs[0].1, Value::Int(1));
+        assert_eq!(pairs[0].1, Value::Int(BigNum::small(1)));
         assert_eq!(pairs[1].0, Value::str("b"));
     }
 
@@ -971,7 +978,10 @@ mod tests {
 
     #[test]
     fn non_string_keys_are_rejected() {
-        let v = Value::Map(Rc::new(vec![(Value::Int(1), Value::Int(2))]));
+        let v = Value::Map(Rc::new(vec![(
+            Value::Int(BigNum::small(1)),
+            Value::Int(BigNum::small(2)),
+        )]));
         let e = builtin_json_serialize(&[v]).unwrap_err();
         assert!(
             e.to_string()
@@ -981,7 +991,7 @@ mod tests {
         // A symbol key is its own error, not a coercion.
         let v = Value::Map(Rc::new(vec![(
             Value::Sym(Rc::new("a".into())),
-            Value::Int(1),
+            Value::Int(BigNum::small(1)),
         )]));
         let e = builtin_json_serialize(&[v]).unwrap_err();
         assert!(
@@ -1027,14 +1037,18 @@ mod tests {
     #[test]
     fn arity_and_type_errors() {
         assert!(builtin_json_parse(&[]).is_err());
-        assert!(builtin_json_parse(&[Value::Int(1)]).is_err());
+        assert!(builtin_json_parse(&[Value::Int(BigNum::small(1))]).is_err());
         assert!(builtin_json_parse(&[Value::str("1"), Value::str("2")]).is_err());
         assert!(builtin_json_serialize(&[]).is_err());
-        assert!(builtin_json_serialize(&[Value::Int(1), Value::Int(2)]).is_err());
+        assert!(builtin_json_serialize(&[
+            Value::Int(BigNum::small(1)),
+            Value::Int(BigNum::small(2))
+        ])
+        .is_err());
         // `Error::Runtime`'s Display prepends "runtime error: ", which the
         // CLI shows; the *message* the other backends must match is the
         // interior, so that's what is asserted here.
-        let e = builtin_json_parse(&[Value::Int(1)]).unwrap_err();
+        let e = builtin_json_parse(&[Value::Int(BigNum::small(1))]).unwrap_err();
         assert_eq!(
             e,
             Error::runtime("json-parse expects a str, got int"),

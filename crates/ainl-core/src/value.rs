@@ -1,5 +1,6 @@
 //! Runtime values.
 
+use crate::bignum::BigNum;
 use crate::code::FnCode;
 use crate::error::Result;
 use crate::eval::Env;
@@ -50,7 +51,7 @@ pub struct ConsCell {
 pub enum Value {
     Nil,
     Bool(bool),
-    Int(i64),
+    Int(BigNum),
     Float(f64),
     Str(Rc<String>),
     /// A quoted symbol (from `(quote x)`), distinct from a variable reference.
@@ -201,9 +202,7 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
-                (*a as f64) == *b
-            }
+            (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => a.to_f64() == *b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Sym(a), Value::Sym(b)) => a == b,
             (Value::List(a), Value::List(b)) => cons_cells_eq(a, b),

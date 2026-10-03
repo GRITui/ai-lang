@@ -37,6 +37,7 @@
 //! pairs the probe here with a real GBNF membership check on the result.
 
 use ainl_core::value::Value;
+use ainl_core::BigNum;
 use std::fmt;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -282,7 +283,10 @@ fn as_text(v: &Value) -> Option<&str> {
 
 fn as_int(v: &Value) -> Option<i64> {
     match v {
-        Value::Int(i) => Some(*i),
+        // A bignum wider than i64 has no i64 answer; `None` sends it down the
+        // same "not an int here" path a float would take, which for these
+        // harness fields means "leave it out" rather than a silent truncation.
+        Value::Int(i) => i.as_i64(),
         Value::Float(x) => Some(*x as i64),
         _ => None,
     }
@@ -384,14 +388,14 @@ fn build_payload(
             // as `0.0`, and the harnesses on both sides of the comparison send
             // a plain integer here.
             if backend.temperature.fract() == 0.0 {
-                Value::Int(backend.temperature as i64)
+                Value::Int(BigNum::small(backend.temperature as i64))
             } else {
                 Value::Float(backend.temperature)
             },
         ),
         (
             Value::str("max_tokens"),
-            Value::Int(backend.max_tokens as i64),
+            Value::Int(BigNum::small(backend.max_tokens as i64)),
         ),
     ];
     if let Some(g) = grammar {

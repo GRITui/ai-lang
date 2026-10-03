@@ -3,15 +3,16 @@
 **Run it:** `cargo build --release && bash scripts/numeric-divergence-demo.sh` reproduces
 the numbers below.
 
-AINL has one integer type at the *source* level, but four different runtime
-representations of it: the interpreter's `i64` (promoting to `f64` on
-overflow), Python's and Ruby's arbitrary-precision integers, and JavaScript's
-single `f64` number type. For any program whose integer values stay within
-`i64` range (roughly ±9.2×10¹⁸) and away from float-precision edges, all four
-agree byte-for-byte — that's what `scripts/check-transpile.sh` verifies for
-the example programs. **Outside that range, they diverge**, and no amount of
-transpiler polish fixes this without changing what "the same value" means in
-at least one of the four runtimes.
+AINL has one integer type at the *source* level, but different runtime
+representations of it: the interpreter's arbitrary-precision `BigNum`
+(exact, never overflows), Python's and Ruby's arbitrary-precision integers,
+and JavaScript's single `f64` number type. For any program whose integer
+values stay within `i64` range (roughly ±9.2×10¹⁸) and away from
+float-precision edges, all four agree byte-for-byte — that's what
+`scripts/check-transpile.sh` verifies for the example programs. **Outside that
+range the interpreter still agrees with Python and Ruby exactly, and diverges
+only from JavaScript**, whose single `f64` type cannot represent large integers
+precisely.
 
 ## Measured divergence
 
@@ -23,53 +24,87 @@ at least one of the four runtimes.
 
 | target | `i64::MAX * 2` | `(fact 25)` |
 |---|---|---|
-| interpreter (`ainl run`) | `18446744073709551616.0` | `15511210043330986055303168.0` |
+| interpreter (`ainl run`) | `18446744073709551614` | `15511210043330985984000000` |
 | JS (`ainl transpile --to js`) | `18446744073709552000` | `1.5511210043330986e+25` |
 | Python (`ainl transpile --to python`) | `18446744073709551614` | `15511210043330985984000000` |
 | Ruby (`ainl transpile --to ruby`) | `18446744073709551614` | `15511210043330985984000000` |
 
-Four different answers from four different design choices, none of them a
-bug in isolation:
+Two answers from two different design choices, neither a bug in isolation:
 
-- **The interpreter** promotes `i64` overflow to `f64` (`eval.rs::numeric_fold`),
-  matching typical dynamic-language "int until it doesn't fit" semantics —
-  but `f64` only has 53 bits of exact integer precision, so the promoted
-  value is already an approximation once it's produced.
-- **Python and Ruby** have arbitrary-precision integers built into the
-  language; the transpiler emits plain `+`/`*`, and those languages just...
-  don't overflow. They compute the mathematically exact product/factorial.
-- **JavaScript** has exactly one number type (`f64`) for everything, so
-  every AINL integer is already a float there — there's no separate "promote
-  on overflow" step, it's float arithmetic from the first multiplication.
+- **The interpreter** uses `BigNum` (`crates/ainl-core/src/bignum.rs`), a
+  hand-written arbitrary-precision integer with an allocation-free `i64` fast
+  path. Integers never overflow: an operation that leaves `i64` range widens to
+  a signed-magnitude bignum and stays exact. This matches Python and Ruby
+  exactly, and is the model the AOT C target is required to match (below).
+- **JavaScript** has exactly one number type (`f64`) for everything, so every
+  AINL integer is already a float there — it rounds at 2^53, well before
+  `i64::MAX`. There is no separate "promote on overflow" step; it is float
+  arithmetic from the first multiplication.
+
+### What changed, and why it was a semantics change
+
+The interpreter used to hold integers as `i64` and **promote to `f64` on
+overflow** (`eval.rs::numeric_fold`), so `i64::MAX * 2` produced
+`18446744073709551616.0` — already an approximation, since `f64` carries only
+53 bits of exact integer precision, and not even the right approximation for
+values above 2^53. That promotion path is **removed**. `(fact 25)` used to
+print `15511210043330986055303168.0` (a float, rounded); it now prints the
+exact integer `15511210043330985984000000`, and `(fact 100)` prints all 158
+digits. Programs that relied on the old float output for out-of-range values
+will see different text — that is the point of the change, and it is what
+Python and Ruby have always done.
+
+Scope is **integers only**: floats remain `f64`, and `/` still returns a float
+(`(/ 1 2)` is `0.5`), so float precision edges are unchanged. Comparisons are
+exact for two integers (they no longer round-trip through `f64`); an
+int/float pair still compares as `f64`, so `(= 1 1.0)` remains `true`.
 
 ## What this means for "lossless"
 
 "Lossless interop" and "byte-equal transpilation" (README.md,
-`scripts/check-transpile.sh`, the M4 milestone in MASTER_PLAN.md) are true
-**for programs whose values stay in the safe range** — verified for the
-example programs, which all do. They are not a claim about arbitrary AINL
-programs. A program that intentionally overflows `i64` (e.g. computing large
-factorials, hashing, or checksums) will produce four different numeric
-results depending on where it runs, and none of the four transpilers can
-detect this ahead of time — it's a runtime value, not something visible in
-the static AST a transpiler works from.
+`scripts/check-transpile.sh`, the M4 milestone in MASTER_PLAN.md) now hold for
+**any integer value AINL can express**, not just those inside the safe range:
+the interpreter, the bytecode VM and the Python/Ruby targets all compute the
+exact mathematical value, because all three use arbitrary-precision integers.
+What is *not* covered is JavaScript, which has no integer type at all and
+rounds at 2^53 — a limit of the target language, not of the transpiler, and not
+something a transpiler can fix without abandoning `number` for `BigInt`.
+
+Float behaviour is unchanged and still bounded: `/` returns a float, and float
+arithmetic remains `f64` in every backend.
 
 ## The AOT compiler targets the *interpreter's* model, not the transpilers'
 
 `ainl compile` (Stage 2, `crates/ainl-cc`) does **not** reproduce the C
 transpiler's wrapping behaviour described above. It is required to match the
-**AINL interpreter** exactly — i64 with promotion to f64 on overflow, the same as
+**AINL interpreter** exactly — arbitrary-precision integers, the same as
 Python/Ruby and *not* the same as the C/JS targets.
 
 That distinction is the whole point, and it is enforced rather than asserted:
 `crates/ainl-cc/tests/aot_numeric.rs` compiles each edge case with `ainl_cc`,
 runs the binary, and diffs against `ainl_core`'s own result. Covered:
-integer arithmetic, i64 overflow at both `INT64_MAX`/`INT64_MIN` in `+`/`-`/`*`,
-float shortest-round-trip formatting (`(/ 1.0 3)`, `(+ 0.1 0.2)`), int/float
-mixing and cross-type comparison, and runtime type errors.
+integer arithmetic, the `i64` boundary in `+`/`-`/`*`, float shortest-round-trip
+formatting (`(/ 1.0 3)`, `(+ 0.1 0.2)`), int/float mixing and cross-type
+comparison, and runtime type errors.
+
+**Known gap (tracked, not fixed here).** The C runtime still implements the
+*old* "i64 promoting to `f64` on overflow" model, so on values outside `i64`
+range it now diverges from the interpreter: the C runtime's own overflow test
+is correct for the model it implements (it neither wraps nor traps), but it
+prints a float where the interpreter now prints exact digits. For example
+`(+ 9223372036854775807 1)` gives `9223372036854775808` in the interpreter and
+`9223372036854775808.0` from the AOT binary. Two of the cases in
+`aot_numeric.rs` (`i64_overflow_promotes_to_float_not_wrap` and
+`int64_min_magnitude_boundary`) are the ones that cross the boundary and are
+therefore expected to fail until the C runtime gains arbitrary-precision
+integers. The in-range cases — every example program, and everything
+`scripts/check-transpile.sh` covers — still agree exactly, which is what the
+rest of that file's tests assert.
 
 Writing the C runtime to that model surfaced three genuine defects, all of which
-returned plausible-looking wrong answers rather than failing loudly:
+returned plausible-looking wrong answers rather than failing loudly (they were
+bugs under the old promoting-to-`f64` model, and remain bugs of the same kind
+under the new one — the C runtime still implements the promoting model):
 
 - `(* 2 -9223372036854775808)` returned `0` instead of
   `-18446744073709551616.0`. The overflow check computed the unsigned magnitude
@@ -135,19 +170,20 @@ that re-parses to an equal value in both cases;
 `crates/ainl-transpile/tests/json_parity.rs` pins both halves so neither can
 drift.
 
-## Options if this needs to be closed (not done — tracked here for whoever picks it up)
+## Options for what is still open (tracked here for whoever picks it up)
 
-1. **Make the interpreter arbitrary-precision too**, matching Python/Ruby.
-   Requires hand-writing a bignum type (add/sub/mul/div/compare/to-string) to
-   preserve the zero-dependency runtime — a real feature, not a tweak.
+1. **Make the AOT C runtime arbitrary-precision**, matching the interpreter.
+   Same reasoning as the interpreter change, in `crates/ainl-cc/src/runtime.c`:
+   the emitted C would need a small bignum implementation and a dynamic `Value`
+   payload for the big case. This is what closes the remaining in-toolchain
+   gap, and the two failing cases in `aot_numeric.rs` are the fixture.
 2. **Make JS match**, by emitting `BigInt`-based arithmetic instead of native
    `number` for the JS target. Loses JS-native ergonomics (no mixing with
-   `Math.*`, `JSON`, etc. without explicit conversion) in exchange for
-   integer fidelity.
-3. **Accept and scope the claim** (current state): document that
-   losslessness holds within `i64`/float-safe range, and treat overflow
-   behavior as an explicit, tested boundary rather than an implicit promise.
-   This is what's currently done; §"Measured divergence" above is a
-   regression fixture (`crates/ainl-transpile/tests/numeric_divergence.rs`)
-   so a future change to any one target's arithmetic doesn't silently drift
-   further from the other three without a test noticing.
+   `Math.*`, `JSON`, etc. without explicit conversion) in exchange for integer
+   fidelity. This is the only remaining *cross-language* divergence.
+3. **Accept and scope the JS claim** (current state): the interpreter, the VM
+   and the Python/Ruby targets are exact for all integers; JavaScript is not,
+   because `f64` cannot be. §"Measured divergence" above is a regression
+   fixture (`crates/ainl-transpile/tests/numeric_divergence.rs`) so a future
+   change to any target's arithmetic doesn't silently drift without a test
+   noticing.

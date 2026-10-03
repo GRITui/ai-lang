@@ -5,7 +5,7 @@
 //!     (def i 0) (def s 0) (while (< i 40000) (def s (+ s i)) (def i (+ i 1))) s
 //! which sums 0..39999 = 799,980,000.
 
-use ainl_core::Value;
+use ainl_core::{BigNum, Value};
 use std::time::{Duration, Instant};
 
 const N: i64 = 40_000;
@@ -42,8 +42,12 @@ fn vm_is_faster_than_tree_walk_on_40k_loop() {
     let (vm_val, vm_dur) = best_of(3, || ainl_core::run_str(&src).unwrap());
 
     // Identical results.
-    assert_eq!(tw_val, Value::Int(EXPECTED), "tree-walk result");
-    assert_eq!(vm_val, Value::Int(EXPECTED), "VM result");
+    assert_eq!(
+        tw_val,
+        Value::Int(BigNum::small(EXPECTED)),
+        "tree-walk result"
+    );
+    assert_eq!(vm_val, Value::Int(BigNum::small(EXPECTED)), "VM result");
 
     let speedup = tw_dur.as_secs_f64() / vm_dur.as_secs_f64();
     eprintln!("40k loop  tree-walk={tw_dur:?}  vm={vm_dur:?}  speedup={speedup:.2}x");

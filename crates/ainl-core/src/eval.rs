@@ -1,5 +1,6 @@
 //! Environment + tree-walking evaluator.
 
+use crate::bignum::BigNum;
 use crate::error::{Error, Result};
 use crate::parser::Node;
 use crate::suggest;
@@ -274,7 +275,7 @@ pub fn eval(node: &Node, env: &Env) -> Result<Value> {
     let _guard = DepthGuard::enter()?;
     tick()?;
     match node {
-        Node::Int(i, _) => Ok(Value::Int(*i)),
+        Node::Int(i, _) => Ok(Value::Int(BigNum::small(*i))),
         Node::Float(x, _) => Ok(Value::Float(*x)),
         Node::Str(s, _) => Ok(Value::str(s.clone())),
         Node::Sym(name, span) => match name.as_str() {
@@ -730,7 +731,7 @@ fn sf_try(args: &[Node], env: &Env) -> Result<Value> {
 
 fn quote_node(node: &Node) -> Value {
     match node {
-        Node::Int(i, _) => Value::Int(*i),
+        Node::Int(i, _) => Value::Int(BigNum::small(*i)),
         Node::Float(x, _) => Value::Float(*x),
         Node::Str(s, _) => Value::str(s.clone()),
         Node::Sym(s, _) => Value::Sym(Rc::new(s.clone())),
@@ -768,20 +769,8 @@ fn install_prelude(env: &Env) {
         };
     }
 
-    b!("+", |a| numeric_fold(
-        a,
-        0.0,
-        0,
-        |x, y| x + y,
-        |x, y| x.checked_add(y)
-    ));
-    b!("*", |a| numeric_fold(
-        a,
-        1.0,
-        1,
-        |x, y| x * y,
-        |x, y| x.checked_mul(y)
-    ));
+    b!("+", |a| numeric_fold(a, 0.0, 0, |x, y| x + y, BigNum::add));
+    b!("*", |a| numeric_fold(a, 1.0, 1, |x, y| x * y, BigNum::mul));
     b!("-", builtin_sub);
     b!("/", builtin_div);
     b!("=", |a| Ok(Value::Bool(a.windows(2).all(|w| w[0] == w[1]))));
@@ -1008,7 +997,7 @@ fn as_content_arg<'a>(v: &'a Value, who: &str) -> Result<&'a str> {
 /// wording — a new builtin should name itself in its own error.
 fn as_num_arg(v: &Value, who: &str) -> Result<f64> {
     match v {
-        Value::Int(i) => Ok(*i as f64),
+        Value::Int(i) => Ok(i.to_f64()),
         Value::Float(x) => Ok(*x),
         other => Err(Error::runtime(format!(
             "{who} expects a number, got {}",
@@ -1075,7 +1064,12 @@ fn byte_offset(s: &str, idx: i64, who: &str, which: &str) -> Result<usize> {
 /// `"%s expects an int %s index"` with which="start" byte-for-byte.
 fn as_index_arg(v: &Value, who: &str, which: &str) -> Result<i64> {
     match v {
-        Value::Int(i) => Ok(*i),
+        Value::Int(i) => i.as_i64().ok_or_else(|| {
+            Error::runtime(format!(
+                "{who} expects an int {which}index, got {}",
+                v.type_name()
+            ))
+        }),
         other => Err(Error::runtime(format!(
             "{who} expects an int {which}index, got {}",
             other.type_name()
@@ -1137,7 +1131,7 @@ fn builtin_code(args: &[Value]) -> Result<Value> {
         [s_val] => {
             let s = as_str_arg(s_val, "code")?;
             match s.as_bytes().first() {
-                Some(b) => Ok(Value::Int(*b as i64)),
+                Some(b) => Ok(Value::Int(BigNum::small(*b as i64))),
                 None => Err(Error::runtime("code expects a non-empty string")),
             }
         }
@@ -1147,7 +1141,7 @@ fn builtin_code(args: &[Value]) -> Result<Value> {
             if i < 0 || i >= s.len() as i64 {
                 return Err(Error::runtime("code index out of bounds"));
             }
-            Ok(Value::Int(s.as_bytes()[i as usize] as i64))
+            Ok(Value::Int(BigNum::small(s.as_bytes()[i as usize] as i64)))
         }
         _ => Err(Error::runtime("code expects (code str) or (code str i)")),
     }
@@ -1191,7 +1185,9 @@ fn builtin_index_of(args: &[Value]) -> Result<Value> {
     let needle = as_str_arg(needle, "index-of")?;
     // `str::find` already returns a byte offset and already gives 0 for an
     // empty needle — the one host that happens to be right for free.
-    Ok(Value::Int(hay.find(needle).map_or(-1, |at| at as i64)))
+    Ok(Value::Int(BigNum::small(
+        hay.find(needle).map_or(-1, |at| at as i64),
+    )))
 }
 
 // ---- stdlib: file I/O ------------------------------------------------------
@@ -1813,7 +1809,7 @@ fn builtin_file_size(args: &[Value]) -> Result<Value> {
             "file-size: cannot read '{path}': it is a directory"
         )));
     }
-    Ok(Value::Int(st.len() as i64))
+    Ok(Value::Int(BigNum::small(st.len() as i64)))
 }
 
 // ---- stdlib: strings -------------------------------------------------------
@@ -1966,7 +1962,7 @@ fn builtin_exit(args: &[Value]) -> Result<Value> {
     };
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    std::process::exit(*i as i32);
+    std::process::exit(i.as_i64().unwrap_or(i32::MAX as i64) as i32);
 }
 
 // ---- stdlib: time ----------------------------------------------------------
@@ -1985,7 +1981,7 @@ fn builtin_now(args: &[Value]) -> Result<Value> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Ok(Value::Int(secs))
+    Ok(Value::Int(BigNum::small(secs)))
 }
 
 /// `(sleep seconds)` → `nil`. Negative and NaN are rejected so all four
@@ -2021,17 +2017,14 @@ fn builtin_sleep(args: &[Value]) -> Result<Value> {
 
 // ---- stdlib: math ----------------------------------------------------------
 
-/// `(abs n)` — integer-preserving, promoting to float only where i64 cannot
-/// represent the answer (`abs` of i64::MIN), exactly like unary `-`.
+/// `(abs n)` — integer-preserving and exact: `abs` of any int (including
+/// i64::MIN, which widens to a bignum) stays an int.
 fn builtin_abs(args: &[Value]) -> Result<Value> {
     let [n] = args else {
         return Err(Error::runtime("abs expects (abs n)"));
     };
     match n {
-        Value::Int(i) => match i.checked_abs() {
-            Some(r) => Ok(Value::Int(r)),
-            None => Ok(Value::Float((*i as f64).abs())),
-        },
+        Value::Int(i) => Ok(Value::Int(i.abs())),
         Value::Float(x) => Ok(Value::Float(x.abs())),
         other => Err(Error::runtime(format!(
             "abs expects a number, got {}",
@@ -2069,12 +2062,12 @@ fn builtin_floor(args: &[Value]) -> Result<Value> {
         return Err(Error::runtime("floor expects (floor n)"));
     };
     if let Value::Int(i) = n {
-        return Ok(Value::Int(*i));
+        return Ok(Value::Int(i.clone()));
     }
     let x = as_num_arg(n, "floor")?;
     let f = x.floor();
     if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
-        Ok(Value::Int(f as i64))
+        Ok(Value::Int(BigNum::small(f as i64)))
     } else {
         Ok(Value::Float(f))
     }
@@ -2100,7 +2093,7 @@ fn arg1(a: &[Value]) -> Result<&Value> {
 
 pub(crate) fn as_f64(v: &Value) -> Result<f64> {
     match v {
-        Value::Int(i) => Ok(*i as f64),
+        Value::Int(i) => Ok(i.to_f64()),
         Value::Float(x) => Ok(*x),
         other => Err(Error::runtime(format!(
             "expected a number, got {}",
@@ -2109,40 +2102,33 @@ pub(crate) fn as_f64(v: &Value) -> Result<f64> {
     }
 }
 
-/// Fold numeric args, staying in integer arithmetic until a float appears (or
-/// an integer op overflows), matching typical dynamic-language semantics.
+/// Fold numeric args, staying in exact integer arithmetic until a float
+/// appears. Integer ops never overflow — they widen to a bignum — so the only
+/// promotion is int→float when a float operand is present, matching typical
+/// dynamic-language semantics.
 pub(crate) fn numeric_fold(
     args: &[Value],
     _f_id: f64,
     i_id: i64,
     ff: fn(f64, f64) -> f64,
-    fi: fn(i64, i64) -> Option<i64>,
+    fi: fn(&BigNum, &BigNum) -> BigNum,
 ) -> Result<Value> {
-    let mut acc_i = i_id;
+    let mut acc_i = BigNum::small(i_id);
     let mut acc_f = 0.0f64;
     let mut is_float = false;
-    let mut first = true;
     for v in args {
         match v {
-            Value::Int(i) if !is_float => match fi(acc_i, *i) {
-                Some(r) => acc_i = r,
-                None => {
-                    is_float = true;
-                    acc_f = ff(acc_i as f64, *i as f64);
-                }
-            },
+            Value::Int(i) if !is_float => acc_i = fi(&acc_i, i),
             _ => {
                 let x = as_f64(v)?;
                 if !is_float {
                     is_float = true;
-                    acc_f = acc_i as f64;
+                    acc_f = acc_i.to_f64();
                 }
                 acc_f = ff(acc_f, x);
             }
         }
-        first = false;
     }
-    let _ = first;
     if is_float {
         Ok(Value::Float(acc_f))
     } else {
@@ -2154,14 +2140,9 @@ pub(crate) fn builtin_sub(args: &[Value]) -> Result<Value> {
     match args {
         [] => Err(Error::runtime("- expects at least 1 argument")),
         [one] => match one {
-            // i64::MIN has no positive i64 counterpart; checked_neg catches
-            // that (rather than silently wrapping in release builds) and we
-            // promote to float, matching every other arithmetic op's overflow
-            // behavior.
-            Value::Int(i) => match i.checked_neg() {
-                Some(r) => Ok(Value::Int(r)),
-                None => Ok(Value::Float(-(*i as f64))),
-            },
+            // Exact negation: i64::MIN widens to a bignum rather than
+            // promoting to float, matching every other arithmetic op.
+            Value::Int(i) => Ok(Value::Int(i.neg())),
             Value::Float(x) => Ok(Value::Float(-*x)),
             other => Err(Error::runtime(format!(
                 "- expected number, got {}",
@@ -2175,16 +2156,13 @@ pub(crate) fn builtin_sub(args: &[Value]) -> Result<Value> {
             }
             if all_int {
                 let mut acc = if let Value::Int(i) = first {
-                    *i
+                    i.clone()
                 } else {
                     unreachable!()
                 };
                 for v in rest {
                     if let Value::Int(i) = v {
-                        match acc.checked_sub(*i) {
-                            Some(r) => acc = r,
-                            None => return float_sub(first, rest),
-                        }
+                        acc = acc.sub(i);
                     }
                 }
                 Ok(Value::Int(acc))
@@ -2225,25 +2203,25 @@ pub(crate) fn builtin_mod(args: &[Value]) -> Result<Value> {
     let [Value::Int(a), Value::Int(b)] = args else {
         return Err(Error::runtime("mod expects (mod int int)"));
     };
-    if *b == 0 {
+    if b.is_zero() {
         return Err(Error::runtime("mod by zero"));
     }
-    // `i64::MIN.rem_euclid(-1)` panics: the *quotient* (i64::MAX + 1) doesn't
-    // fit in i64, even though the mathematical remainder of dividing by ±1 is
-    // always 0. Special-case it rather than letting the overflow through.
-    if *b == -1 {
-        return Ok(Value::Int(0));
-    }
-    Ok(Value::Int(a.rem_euclid(*b)))
+    Ok(Value::Int(a.rem_euclid(b)))
 }
 
 pub(crate) fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> Result<Value> {
     for w in args.windows(2) {
-        let a = as_f64(&w[0])?;
-        let b = as_f64(&w[1])?;
-        let ord = a
-            .partial_cmp(&b)
-            .ok_or_else(|| Error::runtime("cannot compare NaN"))?;
+        let ord = match (&w[0], &w[1]) {
+            // int vs int: exact, never through f64 (two large distinct ints
+            // can be equal as f64 but not as ints).
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            _ => {
+                let a = as_f64(&w[0])?;
+                let b = as_f64(&w[1])?;
+                a.partial_cmp(&b)
+                    .ok_or_else(|| Error::runtime("cannot compare NaN"))?
+            }
+        };
         if !keep(ord) {
             return Ok(Value::Bool(false));
         }
@@ -2253,9 +2231,9 @@ pub(crate) fn compare(args: &[Value], keep: fn(std::cmp::Ordering) -> bool) -> R
 
 fn builtin_len(args: &[Value]) -> Result<Value> {
     match arg1(args)? {
-        Value::List(l) => Ok(Value::Int(l.len as i64)),
-        Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-        Value::Map(m) => Ok(Value::Int(m.len() as i64)),
+        Value::List(l) => Ok(Value::Int(BigNum::small(l.len as i64))),
+        Value::Str(s) => Ok(Value::Int(BigNum::small(s.chars().count() as i64))),
+        Value::Map(m) => Ok(Value::Int(BigNum::small(m.len() as i64))),
         other => Err(Error::runtime(format!(
             "len expects list, str, or hash, got {}",
             other.type_name()
@@ -2372,10 +2350,13 @@ fn builtin_nth(args: &[Value]) -> Result<Value> {
     let [Value::List(l), Value::Int(i)] = args else {
         return Err(Error::runtime("nth expects (nth list int)"));
     };
-    if *i < 0 {
+    let i = i
+        .as_i64()
+        .ok_or_else(|| Error::runtime("nth index out of range"))?;
+    if i < 0 {
         return Ok(Value::Nil);
     }
-    Ok(l.nth(*i as usize).cloned().unwrap_or(Value::Nil))
+    Ok(l.nth(i as usize).cloned().unwrap_or(Value::Nil))
 }
 
 fn builtin_cons(args: &[Value]) -> Result<Value> {
@@ -2450,7 +2431,10 @@ mod tests {
         // `add5`'s captured scope (holding `n = 5`) must still be alive and
         // correct — this is the correctness counterpart to the leak test
         // above: the fix must not clear a scope a live closure still needs.
-        assert_eq!(crate::run_in("(add5 10)", &env).unwrap(), Value::Int(15));
+        assert_eq!(
+            crate::run_in("(add5 10)", &env).unwrap(),
+            Value::Int(BigNum::small(15))
+        );
     }
 
     // ---- list (cons cell) semantics ---------------------------------------
@@ -2461,7 +2445,7 @@ mod tests {
         // the old Vec-backed lists produced.
         assert_eq!(
             crate::run_str("(first (cons 1 (list 2 3)))").unwrap(),
-            Value::Int(1)
+            Value::Int(BigNum::small(1))
         );
         assert_eq!(
             crate::run_str("(rest (cons 1 (list 2 3)))").unwrap(),
@@ -2469,7 +2453,7 @@ mod tests {
         );
         assert_eq!(
             crate::run_str("(len (cons 1 (list 2 3)))").unwrap(),
-            Value::Int(3)
+            Value::Int(BigNum::small(3))
         );
         // cons is immutable: the original list is untouched.
         let src = "\
@@ -2492,24 +2476,27 @@ mod tests {
     fn nth_and_empty_list_edge_cases() {
         assert_eq!(
             crate::run_str("(nth (list 1 2 3) 0)").unwrap(),
-            Value::Int(1)
+            Value::Int(BigNum::small(1))
         );
         assert_eq!(
             crate::run_str("(nth (list 1 2 3) 1)").unwrap(),
-            Value::Int(2)
+            Value::Int(BigNum::small(2))
         );
         assert_eq!(
             crate::run_str("(nth (list 1 2 3) 2)").unwrap(),
-            Value::Int(3)
+            Value::Int(BigNum::small(3))
         );
         assert_eq!(crate::run_str("(nth (list 1 2 3) 3)").unwrap(), Value::Nil);
         assert_eq!(crate::run_str("(nth (list 1 2 3) -1)").unwrap(), Value::Nil);
         // Empty list: len 0, first/rest are nil/empty.
-        assert_eq!(crate::run_str("(len (list))").unwrap(), Value::Int(0));
+        assert_eq!(
+            crate::run_str("(len (list))").unwrap(),
+            Value::Int(BigNum::small(0))
+        );
         assert_eq!(crate::run_str("(first (list))").unwrap(), Value::Nil);
         assert_eq!(
             crate::run_str("(len (rest (list)))").unwrap(),
-            Value::Int(0)
+            Value::Int(BigNum::small(0))
         );
         // `rest` of a one-element list is the empty list (not nil).
         assert_eq!(
@@ -2603,7 +2590,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = crate::run_str(src).unwrap();
         let elapsed = start.elapsed();
-        assert_eq!(result, Value::Int(20000));
+        assert_eq!(result, Value::Int(BigNum::small(20000)));
         assert!(
             elapsed.as_millis() < 500,
             "20k cons build took {elapsed:?} — list builtins may have regressed to O(n²)"
@@ -2629,7 +2616,7 @@ mod tests {
 
     fn as_i64(v: &Value) -> i64 {
         match v {
-            Value::Int(i) => *i,
+            Value::Int(i) => i.as_i64().expect("test int fits in i64"),
             other => panic!("expected int, got {other:?}"),
         }
     }
@@ -3147,11 +3134,14 @@ mod tests {
         );
         assert_eq!(
             crate::run_str(r#"(index-of "héllo" "llo")"#).unwrap(),
-            Value::Int(3)
+            Value::Int(BigNum::small(3))
         );
         // `len` on a str still counts CHARACTERS — the two rules coexist, and
         // a 2-byte slice is one character.
-        assert_eq!(crate::run_str(r#"(len "é")"#).unwrap(), Value::Int(1));
+        assert_eq!(
+            crate::run_str(r#"(len "é")"#).unwrap(),
+            Value::Int(BigNum::small(1))
+        );
 
         // char returns a whole character, never half of one, and skips by bytes.
         assert_eq!(
@@ -3169,14 +3159,17 @@ mod tests {
 
         // code reads a raw byte, so it CAN address a continuation byte — that is
         // the escape hatch `char` deliberately refuses to be.
-        assert_eq!(crate::run_str(r#"(code "A")"#).unwrap(), Value::Int(65));
+        assert_eq!(
+            crate::run_str(r#"(code "A")"#).unwrap(),
+            Value::Int(BigNum::small(65))
+        );
         assert_eq!(
             crate::run_str(r#"(code "日本" 0)"#).unwrap(),
-            Value::Int(0xE6)
+            Value::Int(BigNum::small(0xE6))
         );
         assert_eq!(
             crate::run_str(r#"(code "日本" 1)"#).unwrap(),
-            Value::Int(0x97)
+            Value::Int(BigNum::small(0x97))
         );
 
         // starts-with / ends-with, including the empty-needle case.
@@ -3205,15 +3198,15 @@ mod tests {
         // index-of: first occurrence, -1 when absent, 0 for an empty needle.
         assert_eq!(
             crate::run_str(r#"(index-of "banana" "na")"#).unwrap(),
-            Value::Int(2)
+            Value::Int(BigNum::small(2))
         );
         assert_eq!(
             crate::run_str(r#"(index-of "hello" "z")"#).unwrap(),
-            Value::Int(-1)
+            Value::Int(BigNum::small(-1))
         );
         assert_eq!(
             crate::run_str(r#"(index-of "hello" "")"#).unwrap(),
-            Value::Int(0)
+            Value::Int(BigNum::small(0))
         );
     }
 
@@ -3369,25 +3362,44 @@ mod tests {
 
     #[test]
     fn math_builtins_abs_min_max_floor_sqrt() {
-        // abs stays integer; abs of i64::MIN promotes to float (no i64 answer).
-        assert_eq!(crate::run_str("(abs -7)").unwrap(), Value::Int(7));
-        assert_eq!(crate::run_str("(abs 7)").unwrap(), Value::Int(7));
+        // abs stays integer; abs of i64::MIN widens to an exact bignum (no i64
+        // answer, but no float round-trip either — every bit is kept).
+        assert_eq!(
+            crate::run_str("(abs -7)").unwrap(),
+            Value::Int(BigNum::small(7))
+        );
+        assert_eq!(
+            crate::run_str("(abs 7)").unwrap(),
+            Value::Int(BigNum::small(7))
+        );
         assert_eq!(crate::run_str("(abs -2.5)").unwrap(), Value::Float(2.5));
         assert_eq!(
             crate::run_str("(abs -9223372036854775808)").unwrap(),
-            Value::Float(9223372036854775808.0)
+            Value::Int(BigNum::from_str("9223372036854775808").unwrap())
         );
 
         // min/max are variadic and fold pairwise.
-        assert_eq!(crate::run_str("(min 3 1 2)").unwrap(), Value::Int(1));
-        assert_eq!(crate::run_str("(max 3 1 2)").unwrap(), Value::Int(3));
-        assert_eq!(crate::run_str("(min 5)").unwrap(), Value::Int(5));
+        assert_eq!(
+            crate::run_str("(min 3 1 2)").unwrap(),
+            Value::Int(BigNum::small(1))
+        );
+        assert_eq!(
+            crate::run_str("(max 3 1 2)").unwrap(),
+            Value::Int(BigNum::small(3))
+        );
+        assert_eq!(
+            crate::run_str("(min 5)").unwrap(),
+            Value::Int(BigNum::small(5))
+        );
         assert_eq!(crate::run_str("(max 1.5 2)").unwrap(), Value::Float(2.0));
         // Mixed int/float comparison is numeric, not per-type.
         assert_eq!(crate::run_str("(min 2 1.5)").unwrap(), Value::Float(1.5));
         // Ties keep the first argument (the < / > comparison is strict), so a
         // min over equal values is the first one.
-        assert_eq!(crate::run_str("(min 2 2)").unwrap(), Value::Int(2));
+        assert_eq!(
+            crate::run_str("(min 2 2)").unwrap(),
+            Value::Int(BigNum::small(2))
+        );
         assert_eq!(crate::run_str("(max 2.5 2.5)").unwrap(), Value::Float(2.5));
         // min/max are numeric-only: a list operand is a type error, not a
         // lexicographic comparison (this is what makes the C/JS/Python/Ruby
@@ -3395,17 +3407,32 @@ mod tests {
         let err = crate::run_str("(min (list 1) 1)").unwrap_err().to_string();
         assert!(err.contains("min expects a number, got list"), "got: {err}");
         // Negatives and zero.
-        assert_eq!(crate::run_str("(min 0 -3 -1)").unwrap(), Value::Int(-3));
-        assert_eq!(crate::run_str("(max 0 -3 -1)").unwrap(), Value::Int(0));
+        assert_eq!(
+            crate::run_str("(min 0 -3 -1)").unwrap(),
+            Value::Int(BigNum::small(-3))
+        );
+        assert_eq!(
+            crate::run_str("(max 0 -3 -1)").unwrap(),
+            Value::Int(BigNum::small(0))
+        );
 
         // floor always yields an int; an int argument passes through unchanged
         // (no float round-trip, so a large i64 keeps every bit).
-        assert_eq!(crate::run_str("(floor 2.7)").unwrap(), Value::Int(2));
-        assert_eq!(crate::run_str("(floor -2.1)").unwrap(), Value::Int(-3));
-        assert_eq!(crate::run_str("(floor 4)").unwrap(), Value::Int(4));
+        assert_eq!(
+            crate::run_str("(floor 2.7)").unwrap(),
+            Value::Int(BigNum::small(2))
+        );
+        assert_eq!(
+            crate::run_str("(floor -2.1)").unwrap(),
+            Value::Int(BigNum::small(-3))
+        );
+        assert_eq!(
+            crate::run_str("(floor 4)").unwrap(),
+            Value::Int(BigNum::small(4))
+        );
         assert_eq!(
             crate::run_str("(floor 9007199254740993)").unwrap(),
-            Value::Int(9007199254740993)
+            Value::Int(BigNum::small(9007199254740993))
         );
 
         // sqrt is always a float.

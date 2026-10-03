@@ -44,6 +44,7 @@
 //! Keys, all `str`: `status` (int), `ok` (bool), `body` (str), `headers` (a
 //! map of lowercased header name to value).
 
+use crate::bignum::BigNum;
 use crate::error::{Error, Result};
 use crate::eval::Env;
 use crate::value::Value;
@@ -622,7 +623,7 @@ impl Response {
         let body = String::from_utf8(self.body)
             .map_err(|_| Error::runtime("http: the response body is not valid utf-8"))?;
         let mut pairs: Vec<(Value, Value)> = vec![
-            (Value::str("status"), Value::Int(self.status)),
+            (Value::str("status"), Value::Int(BigNum::small(self.status))),
             (
                 Value::str("ok"),
                 Value::Bool((200..300).contains(&self.status)),
@@ -1116,7 +1117,7 @@ mod tests {
                 .map(|(_, b)| b.clone()),
             _ => panic!("not a map"),
         };
-        assert_eq!(get("status"), Some(Value::Int(201)));
+        assert_eq!(get("status"), Some(Value::Int(BigNum::small(201))));
         assert_eq!(get("ok"), Some(Value::Bool(true)));
         assert_eq!(get("body"), Some(Value::str("{}")));
         assert_eq!(get("reason"), Some(Value::str("Created")));

@@ -83,6 +83,7 @@
 //! rather than the whole database refused, so the records before it survive: a
 //! bad tail is a tail, whether the crash or a foreign writer caused it.
 
+use crate::bignum::BigNum;
 use crate::error::{Error, Result};
 use crate::eval::Env;
 use crate::value::Value;
@@ -397,7 +398,9 @@ fn as_str_arg<'a>(v: &'a Value, who: &str, what: &str) -> Result<&'a str> {
 /// The handle operand, reported under the builtin's own name.
 fn as_handle(v: &Value, who: &str) -> Result<i64> {
     match v {
-        Value::Int(n) => Ok(*n),
+        Value::Int(n) => n.as_i64().ok_or_else(|| {
+            Error::runtime(format!("{who} expects a db handle, got {}", v.type_name()))
+        }),
         other => Err(Error::runtime(format!(
             "{who} expects a db handle, got {}",
             other.type_name()
@@ -499,11 +502,11 @@ fn db_open(args: &[Value]) -> Result<Value> {
         match slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 slots[i] = Some(db);
-                Ok(Value::Int(i as i64 + 1))
+                Ok(Value::Int(BigNum::small(i as i64 + 1)))
             }
             None => {
                 slots.push(Some(db));
-                Ok(Value::Int(slots.len() as i64))
+                Ok(Value::Int(BigNum::small(slots.len() as i64)))
             }
         }
     })
@@ -891,12 +894,16 @@ mod tests {
         let s = Scratch::new("closed");
         let path = s.path();
         let h = db_open(&[Value::str(path)]).expect("open");
-        let Value::Int(handle_no) = h else {
+        let Value::Int(ref handle_no) = h else {
             panic!("db-open must return a handle number, got {h}");
         };
-        db_close(&[Value::Int(handle_no)]).expect("close");
-        let e = db_put(&[Value::Int(handle_no), Value::str("k"), Value::str("v")])
-            .expect_err("a closed handle must be refused");
+        db_close(&[Value::Int(handle_no.clone())]).expect("close");
+        let e = db_put(&[
+            Value::Int(handle_no.clone()),
+            Value::str("k"),
+            Value::str("v"),
+        ])
+        .expect_err("a closed handle must be refused");
         assert!(
             e.message()
                 .contains(&format!("handle {handle_no} is not open")),

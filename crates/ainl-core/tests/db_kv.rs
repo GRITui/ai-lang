@@ -23,7 +23,7 @@
 //!   agree. The three are asserted together, every time, because a fix to one
 //!   that misses another is easy to write and invisible to a single assertion.
 
-use ainl_core::{run_str, Env, Value};
+use ainl_core::{run_str, BigNum, Env, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -480,7 +480,7 @@ fn db_put_text_that_is_json_reads_as_that_value() {
     .expect("read");
     assert_eq!(
         v,
-        Value::Int(42),
+        Value::Int(BigNum::small(42)),
         "JSON text reads back as the value it spells"
     );
 }
@@ -543,7 +543,7 @@ fn the_builtins_are_reachable_through_run_str() {
     let p = s.db("a.ainl-db");
     let v = run_str(&format!(r#"(db-open "{p}")"#)).expect("db-open");
     assert!(
-        matches!(v, Value::Int(n) if n >= 1),
+        matches!(v, Value::Int(ref n) if n.as_i64().unwrap_or(i64::MIN) >= 1),
         "db-open returns a handle number, got {v:?}"
     );
 }

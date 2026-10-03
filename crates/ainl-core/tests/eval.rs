@@ -1,4 +1,4 @@
-use ainl_core::{parse_to_json, run_str, ConsCell, LineIndex, Value};
+use ainl_core::{parse_to_json, run_str, BigNum, ConsCell, LineIndex, Value};
 
 fn eval(src: &str) -> Value {
     run_str(src).unwrap_or_else(|e| panic!("eval failed for `{src}`: {e}"))
@@ -6,9 +6,9 @@ fn eval(src: &str) -> Value {
 
 #[test]
 fn arithmetic_stays_integer() {
-    assert_eq!(eval("(+ 1 2 3)"), Value::Int(6));
-    assert_eq!(eval("(- 10 3 2)"), Value::Int(5));
-    assert_eq!(eval("(* 2 3 4)"), Value::Int(24));
+    assert_eq!(eval("(+ 1 2 3)"), Value::Int(BigNum::small(6)));
+    assert_eq!(eval("(- 10 3 2)"), Value::Int(BigNum::small(5)));
+    assert_eq!(eval("(* 2 3 4)"), Value::Int(BigNum::small(24)));
 }
 
 #[test]
@@ -26,37 +26,46 @@ fn comparisons_are_chained() {
 
 #[test]
 fn if_and_truthiness() {
-    assert_eq!(eval("(if true 1 2)"), Value::Int(1));
-    assert_eq!(eval("(if nil 1 2)"), Value::Int(2));
-    assert_eq!(eval("(if false 1 2)"), Value::Int(2));
-    assert_eq!(eval("(if 0 1 2)"), Value::Int(1)); // 0 is truthy
+    assert_eq!(eval("(if true 1 2)"), Value::Int(BigNum::small(1)));
+    assert_eq!(eval("(if nil 1 2)"), Value::Int(BigNum::small(2)));
+    assert_eq!(eval("(if false 1 2)"), Value::Int(BigNum::small(2)));
+    assert_eq!(eval("(if 0 1 2)"), Value::Int(BigNum::small(1))); // 0 is truthy
 }
 
 #[test]
 fn closures_and_recursion() {
     let src = "(def fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))) (fib 20)";
-    assert_eq!(eval(src), Value::Int(6765));
+    assert_eq!(eval(src), Value::Int(BigNum::small(6765)));
 }
 
 #[test]
 fn let_scoping() {
-    assert_eq!(eval("(let ((a 2) (b 3)) (+ a b))"), Value::Int(5));
+    assert_eq!(
+        eval("(let ((a 2) (b 3)) (+ a b))"),
+        Value::Int(BigNum::small(5))
+    );
 }
 
 #[test]
 fn variadic_and_lists() {
-    assert_eq!(eval("(len (list 1 2 3))"), Value::Int(3));
+    assert_eq!(eval("(len (list 1 2 3))"), Value::Int(BigNum::small(3)));
     let src = "(def f (fn (& xs) (len xs))) (f 1 2 3 4)";
-    assert_eq!(eval(src), Value::Int(4));
+    assert_eq!(eval(src), Value::Int(BigNum::small(4)));
 }
 
 #[test]
 fn hash_basics() {
-    assert_eq!(eval(r#"(get (hash "a" 1 "b" 2) "a")"#), Value::Int(1));
+    assert_eq!(
+        eval(r#"(get (hash "a" 1 "b" 2) "a")"#),
+        Value::Int(BigNum::small(1))
+    );
     assert_eq!(eval(r#"(get (hash "a" 1) "missing")"#), Value::Nil);
     assert_eq!(eval(r#"(has (hash "a" 1) "a")"#), Value::Bool(true));
     assert_eq!(eval(r#"(has (hash "a" 1) "z")"#), Value::Bool(false));
-    assert_eq!(eval(r#"(len (hash "a" 1 "b" 2))"#), Value::Int(2));
+    assert_eq!(
+        eval(r#"(len (hash "a" 1 "b" 2))"#),
+        Value::Int(BigNum::small(2))
+    );
 }
 
 #[test]
@@ -68,15 +77,24 @@ fn hash_assoc_does_not_mutate_the_original() {
     "#;
     assert_eq!(
         eval(src),
-        Value::List(ConsCell::from_values([Value::Int(1), Value::Int(99)]))
+        Value::List(ConsCell::from_values([
+            Value::Int(BigNum::small(1)),
+            Value::Int(BigNum::small(99))
+        ]))
     );
 }
 
 #[test]
 fn hash_construction_lets_a_repeated_key_keep_its_last_value() {
     // Last value wins, but only one entry — not two.
-    assert_eq!(eval(r#"(len (hash "a" 1 "a" 2))"#), Value::Int(1));
-    assert_eq!(eval(r#"(get (hash "a" 1 "a" 2) "a")"#), Value::Int(2));
+    assert_eq!(
+        eval(r#"(len (hash "a" 1 "a" 2))"#),
+        Value::Int(BigNum::small(1))
+    );
+    assert_eq!(
+        eval(r#"(get (hash "a" 1 "a" 2) "a")"#),
+        Value::Int(BigNum::small(2))
+    );
 }
 
 #[test]
@@ -121,7 +139,7 @@ fn hash_key_equality_distinguishes_symbol_from_string() {
 #[test]
 fn while_loop_mutation() {
     let src = "(let ((i 0)) (while (< i 5) (def i (+ i 1))) i)";
-    assert_eq!(eval(src), Value::Int(5));
+    assert_eq!(eval(src), Value::Int(BigNum::small(5)));
 }
 
 // Scoping (docs/SYNTAX.md §2a): `let` and `fn` each open a fresh scope; `def`
@@ -131,7 +149,7 @@ fn while_loop_mutation() {
 #[test]
 fn nested_let_shadows_rather_than_mutates() {
     let src = "(let ((i 0)) (let () (def i 99)) i)";
-    assert_eq!(eval(src), Value::Int(0));
+    assert_eq!(eval(src), Value::Int(BigNum::small(0)));
 }
 
 #[test]
@@ -139,19 +157,19 @@ fn fn_body_shadows_rather_than_mutates_the_defining_scope() {
     let src = "(def counter 0) \
                (def bump (fn () (def counter (+ counter 1)) counter)) \
                (bump) (bump) counter";
-    assert_eq!(eval(src), Value::Int(0));
+    assert_eq!(eval(src), Value::Int(BigNum::small(0)));
 }
 
 #[test]
 fn if_does_not_open_a_new_scope_so_def_mutates() {
     let src = "(let ((x 1)) (if true (def x 2) nil) x)";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval(src), Value::Int(BigNum::small(2)));
 }
 
 #[test]
 fn quote_makes_data() {
     // a quoted list of symbols is data, not a function call
-    assert_eq!(eval("(len (quote (a b c)))"), Value::Int(3));
+    assert_eq!(eval("(len (quote (a b c)))"), Value::Int(BigNum::small(3)));
 }
 
 #[test]
@@ -182,36 +200,43 @@ fn each_run_in_call_gets_a_fresh_step_budget() {
     // call sharing the same `Env` (as the REPL does line-by-line).
     let env = ainl_core::Env::with_prelude();
     assert!(ainl_core::run_in("(while true 0)", &env).is_err());
-    assert_eq!(ainl_core::run_in("(+ 1 2)", &env).unwrap(), Value::Int(3));
+    assert_eq!(
+        ainl_core::run_in("(+ 1 2)", &env).unwrap(),
+        Value::Int(BigNum::small(3))
+    );
 }
 
 #[test]
 fn mod_min_by_neg_one_does_not_panic() {
     // i64::MIN.rem_euclid(-1) panics in std (the quotient overflows even
     // though the true remainder is 0); AINL's `mod` must not crash.
-    assert_eq!(eval("(mod -9223372036854775808 -1)"), Value::Int(0));
-}
-
-#[test]
-fn overflow_promotes_to_float_matching_documented_numeric_model() {
-    // Pins the interpreter's half of the divergence documented in
-    // docs/NUMERIC_MODEL.md: i64 overflow promotes to f64 here, while the
-    // Python/Ruby targets have arbitrary-precision integers and never
-    // overflow, and the JS target is f64 throughout with no promotion step.
-    // A change to this value should come with an update to that doc.
     assert_eq!(
-        eval("(* 9223372036854775807 2)"),
-        Value::Float(18446744073709551616.0)
+        eval("(mod -9223372036854775808 -1)"),
+        Value::Int(BigNum::small(0))
     );
 }
 
 #[test]
-fn unary_negate_promotes_to_float_on_i64_min_overflow() {
-    // -i64::MIN has no i64 representation; must promote to float like every
-    // other arithmetic op's overflow path, not silently wrap or panic.
+fn overflow_widens_to_bignum_matching_documented_numeric_model() {
+    // Pins the interpreter's half of the numeric model documented in
+    // docs/NUMERIC_MODEL.md: integer overflow now WIDENS to an exact
+    // arbitrary-precision int (bignum) rather than promoting to f64, matching
+    // the Python/Ruby targets. A change to this value should come with an
+    // update to that doc.
+    assert_eq!(
+        eval("(* 9223372036854775807 2)"),
+        Value::Int(BigNum::from_str("18446744073709551614").unwrap())
+    );
+}
+
+#[test]
+fn unary_negate_widens_to_bignum_on_i64_min_overflow() {
+    // -i64::MIN has no i64 representation; it widens to an exact bignum (not a
+    // float, not a wrap, not a panic), like every other arithmetic op's
+    // overflow path.
     assert_eq!(
         eval("(- -9223372036854775808)"),
-        Value::Float(9223372036854775808.0)
+        Value::Int(BigNum::from_str("9223372036854775808").unwrap())
     );
 }
 

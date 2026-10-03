@@ -85,6 +85,7 @@
 //! no escaping. Quoting them would be inventing a second key syntax to solve a
 //! problem the format does not have.
 
+use crate::bignum::BigNum;
 use crate::db::{Db, DB_BUILTINS};
 use crate::error::{Error, Result};
 use crate::eval::Env;
@@ -147,7 +148,9 @@ fn with_db<T>(n: i64, who: &str, f: impl FnOnce(&mut Db) -> Result<T>) -> Result
 
 fn as_handle(v: &Value, who: &str) -> Result<i64> {
     match v {
-        Value::Int(n) => Ok(*n),
+        Value::Int(n) => n.as_i64().ok_or_else(|| {
+            Error::runtime(format!("{who} expects a db handle, got {}", v.type_name()))
+        }),
         other => Err(Error::runtime(format!(
             "{who} expects a db handle, got {}",
             other.type_name()
@@ -376,7 +379,7 @@ fn db_count(args: &[Value]) -> Result<Value> {
     };
     let h = as_handle(h, DB_COUNT)?;
     let n = with_db(h, DB_COUNT, |db| Ok(live_keys(db).len()))?;
-    Ok(Value::Int(n as i64))
+    Ok(Value::Int(BigNum::small(n as i64)))
 }
 
 /// Re-exported so a test can assert the two layers' name sets do not overlap by
@@ -444,8 +447,8 @@ mod tests {
     #[test]
     fn every_value_type_round_trips_through_the_log() {
         let cases: Vec<(Value, &str)> = vec![
-            (Value::Int(42), "42"),
-            (Value::Int(-7), "-7"),
+            (Value::Int(BigNum::small(42)), "42"),
+            (Value::Int(BigNum::small(-7)), "-7"),
             (Value::Float(1.0), "1.0"),
             (Value::Float(1.5), "1.5"),
             (Value::Bool(true), "true"),
@@ -475,22 +478,29 @@ mod tests {
     fn an_int_stays_an_int_and_a_float_stays_a_float() {
         let s = Scratch::new("num");
         let mut db = open(&s);
-        db.put("i", &enc(&Value::Int(1))).expect("put");
+        db.put("i", &enc(&Value::Int(BigNum::small(1))))
+            .expect("put");
         db.put("f", &enc(&Value::Float(1.0))).expect("put");
         drop(db);
         let db = open(&s);
-        assert_eq!(dec(&lookup(&db, "i").unwrap()), Value::Int(1));
+        assert_eq!(
+            dec(&lookup(&db, "i").unwrap()),
+            Value::Int(BigNum::small(1))
+        );
         assert_eq!(dec(&lookup(&db, "f").unwrap()), Value::Float(1.0));
     }
 
     #[test]
     fn a_nested_list_round_trips() {
         let v = list(vec![
-            Value::Int(1),
+            Value::Int(BigNum::small(1)),
             Value::str("two"),
             Value::Bool(false),
             Value::Nil,
-            list(vec![Value::Int(3), Value::Int(4)]),
+            list(vec![
+                Value::Int(BigNum::small(3)),
+                Value::Int(BigNum::small(4)),
+            ]),
         ]);
         let s = Scratch::new("nested");
         let mut db = open(&s);
@@ -506,8 +516,10 @@ mod tests {
     fn a_tombstone_is_absent_from_get_keys_and_count() {
         let s = Scratch::new("tomb");
         let mut db = open(&s);
-        db.put("live", &enc(&Value::Int(1))).expect("put");
-        db.put("gone", &enc(&Value::Int(2))).expect("put");
+        db.put("live", &enc(&Value::Int(BigNum::small(1))))
+            .expect("put");
+        db.put("gone", &enc(&Value::Int(BigNum::small(2))))
+            .expect("put");
         db.put("gone", TOMBSTONE).expect("tombstone");
         assert_eq!(
             lookup(&db, "gone"),
@@ -525,8 +537,10 @@ mod tests {
     fn a_delete_survives_a_reopen() {
         let s = Scratch::new("del-reopen");
         let mut db = open(&s);
-        db.put("keep", &enc(&Value::Int(1))).expect("put");
-        db.put("drop", &enc(&Value::Int(2))).expect("put");
+        db.put("keep", &enc(&Value::Int(BigNum::small(1))))
+            .expect("put");
+        db.put("drop", &enc(&Value::Int(BigNum::small(2))))
+            .expect("put");
         db.put("drop", TOMBSTONE).expect("tombstone");
         drop(db);
         let db = open(&s);
@@ -544,11 +558,16 @@ mod tests {
     fn a_set_after_a_delete_revives_the_key() {
         let s = Scratch::new("revive");
         let mut db = open(&s);
-        db.put("k", &enc(&Value::Int(1))).expect("put");
+        db.put("k", &enc(&Value::Int(BigNum::small(1))))
+            .expect("put");
         db.put("k", TOMBSTONE).expect("tombstone");
         assert_eq!(lookup(&db, "k"), None);
-        db.put("k", &enc(&Value::Int(2))).expect("put");
-        assert_eq!(dec(&lookup(&db, "k").unwrap()), Value::Int(2));
+        db.put("k", &enc(&Value::Int(BigNum::small(2))))
+            .expect("put");
+        assert_eq!(
+            dec(&lookup(&db, "k").unwrap()),
+            Value::Int(BigNum::small(2))
+        );
     }
 
     /// The tombstone must be unreachable by any value JSON can produce, or a
@@ -558,11 +577,11 @@ mod tests {
         for v in [
             Value::Nil,
             Value::Bool(true),
-            Value::Int(0),
+            Value::Int(BigNum::small(0)),
             Value::Float(0.5),
             Value::str("~"),
             Value::str(""),
-            list(vec![Value::Int(1)]),
+            list(vec![Value::Int(BigNum::small(1))]),
         ] {
             assert_ne!(
                 enc(&v),

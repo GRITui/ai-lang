@@ -39,6 +39,7 @@
 //! self-referential `def` cycle rooted in a call's scope is cleared on return
 //! unless the result still keeps that scope alive).
 
+use crate::bignum::{self, BigNum};
 use crate::code::{FnCode, Instr};
 use crate::error::{Error, Result};
 use crate::eval::{
@@ -240,7 +241,7 @@ impl Compiler {
 
     fn compile_expr_inner(&mut self, node: &Node) -> Result<()> {
         match node {
-            Node::Int(i, _) => self.push_const(Value::Int(*i)),
+            Node::Int(i, _) => self.push_const(Value::Int(BigNum::small(*i))),
             Node::Float(x, _) => self.push_const(Value::Float(*x)),
             Node::Str(s, _) => self.push_const(Value::str(s.clone())),
             Node::Sym(name, _) => match name.as_str() {
@@ -834,7 +835,7 @@ fn fn_name(params: &[String], variadic: &Option<String>) -> String {
 
 fn quote_node(node: &Node) -> Value {
     match node {
-        Node::Int(i, _) => Value::Int(*i),
+        Node::Int(i, _) => Value::Int(BigNum::small(*i)),
         Node::Float(x, _) => Value::Float(*x),
         Node::Str(s, _) => Value::str(s.clone()),
         Node::Sym(s, _) => Value::Sym(Rc::new(s.clone())),
@@ -845,6 +846,28 @@ fn quote_node(node: &Node) -> Value {
 // ---------------------------------------------------------------------------
 // Stack machine
 // ---------------------------------------------------------------------------
+
+/// Clone a local slot's value, taking the in-range integer case as a bare
+/// `i64` copy.
+///
+/// `LoadSlot` clones whatever it finds in the slot, and an integer variable is
+/// the common case in every loop. `Value`'s own `Clone` must branch on the
+/// variant to decide whether an `Rc` refcount needs bumping — which it cannot
+/// know statically — so the int case pays for a branch it would never take.
+/// Rebuilding `Value::Int(BigNum::Small(n))` from the known-small `n` skips
+/// that: the refcount question cannot arise, because there is no `Rc`.
+///
+/// Anything else (a bignum, a list, a closure, an unbound slot) falls through
+/// to an ordinary clone.
+#[inline]
+fn small_int_or_clone(slot: &Option<Value>) -> Option<Value> {
+    match slot {
+        None => None,
+        Some(Value::Int(BigNum::Small(n))) => Some(Value::Int(BigNum::Small(*n))),
+        Some(Value::Int(big @ BigNum::Big(_))) => Some(Value::Int(big.clone())),
+        Some(other) => Some(other.clone()),
+    }
+}
 
 /// One activation on the explicit frame stack.
 struct Frame {
@@ -1131,7 +1154,7 @@ fn run_with_locals(
                 // reads the *outer* `counter`). The name is resolved only on
                 // the fall-through path (a `&String`, no clone), keeping the
                 // hot loop allocation-free.
-                let v = match frame.locals.get(s).and_then(|o| o.clone()) {
+                let v = match frame.locals.get(s).and_then(small_int_or_clone) {
                     Some(v) => v,
                     None => {
                         let name = frame.code.locals[s].clone();
@@ -1159,10 +1182,19 @@ fn run_with_locals(
             Instr::DefSlot(s) => {
                 let v = stack.pop().unwrap();
                 let frame = frames.last_mut().unwrap();
-                frame.locals.get_mut(s).unwrap().replace(v.clone());
-                if frame.code.env_active {
+                // Only clone when the value genuinely has to live in two places
+                // (the slot *and* the env). With no active env the slot takes
+                // ownership, so the clone is pure cost — and for an int it is a
+                // variant branch to decide whether an `Rc` refcount needs
+                // bumping, which is the hot loop's third such branch. This is
+                // the `def` in `(def i (+ i 1))`.
+                let env_active = frame.code.env_active;
+                if env_active {
+                    frame.locals.get_mut(s).unwrap().replace(v.clone());
                     let name = frame.code.locals[s].clone();
                     frame.env.define(name, v);
+                } else {
+                    frame.locals.get_mut(s).unwrap().replace(v);
                 }
                 // Push the name symbol back (matches `sf_def`'s return value).
                 // `slot_syms[s]` is precomputed, so this is an `Rc` refcount
@@ -1208,20 +1240,24 @@ fn run_with_locals(
             Instr::Add => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                // Integer fast path: stay in i64 until overflow, then promote
-                // to f64 — identical to `numeric_fold` for two args, minus the
+                // Integer fast path: exact add that stays in the inline i64 form
+                // (allocation-free) while it fits, and widens to a bignum only on
+                // overflow. Identical to `numeric_fold` for two args, minus the
                 // slice + closure call overhead (the benchmark's hot op).
                 match (&a, &b) {
-                    (Value::Int(x), Value::Int(y)) => match x.checked_add(*y) {
-                        Some(r) => stack.push(Value::Int(r)),
-                        None => stack.push(Value::Float((*x as f64) + (*y as f64))),
-                    },
+                    (Value::Int(BigNum::Small(x)), Value::Int(BigNum::Small(y))) => {
+                        match x.checked_add(*y) {
+                            Some(r) => stack.push(Value::Int(BigNum::Small(r))),
+                            None => stack.push(Value::Int(bignum::add_i64(*x, *y))),
+                        }
+                    }
+                    (Value::Int(x), Value::Int(y)) => stack.push(Value::Int(x.add(y))),
                     _ => stack.push(value!(numeric_fold(
                         &[a, b],
                         0.0,
                         0,
                         |x, y| x + y,
-                        i64::checked_add
+                        BigNum::add
                     )
                     .map_err(|e| e.or_at(cur_span(&frames, ip))))),
                 }
@@ -1229,14 +1265,25 @@ fn run_with_locals(
             Instr::Mul => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                stack.push(value!(numeric_fold(
-                    &[a, b],
-                    1.0,
-                    1,
-                    |x, y| x * y,
-                    i64::checked_mul
-                )
-                .map_err(|e| e.or_at(cur_span(&frames, ip)))));
+                // Integer fast path: exact product, in-range case kept at a bare
+                // `i64` like Add, widening to a bignum only on overflow.
+                match (&a, &b) {
+                    (Value::Int(BigNum::Small(x)), Value::Int(BigNum::Small(y))) => {
+                        match x.checked_mul(*y) {
+                            Some(r) => stack.push(Value::Int(BigNum::Small(r))),
+                            None => stack.push(Value::Int(bignum::mul_i64(*x, *y))),
+                        }
+                    }
+                    (Value::Int(x), Value::Int(y)) => stack.push(Value::Int(x.mul(y))),
+                    _ => stack.push(value!(numeric_fold(
+                        &[a, b],
+                        1.0,
+                        1,
+                        |x, y| x * y,
+                        BigNum::mul
+                    )
+                    .map_err(|e| e.or_at(cur_span(&frames, ip))))),
+                }
             }
             Instr::Sub => {
                 let b = stack.pop().unwrap();
@@ -1281,12 +1328,17 @@ fn run_with_locals(
             Instr::CmpLt => {
                 let b = stack.pop().unwrap();
                 let a = stack.pop().unwrap();
-                // Integer fast path: same f64 comparison the tree-walk's
-                // `compare` does (via `as_f64`), inlined to skip the slice +
-                // helper call (the benchmark's hot op).
+                // Integer fast path: exact comparison (not via f64, which
+                // would collapse two large distinct ints), inlined to skip the
+                // slice + helper call (the benchmark's hot op). The
+                // Small/Small case is compared as bare `i64`s so no `BigNum`
+                // is dereferenced on the hot path.
                 match (&a, &b) {
+                    (Value::Int(BigNum::Small(x)), Value::Int(BigNum::Small(y))) => {
+                        stack.push(Value::Bool(x < y))
+                    }
                     (Value::Int(x), Value::Int(y)) => {
-                        stack.push(Value::Bool((*x as f64) < (*y as f64)))
+                        stack.push(Value::Bool(x.cmp(y) == Ordering::Less))
                     }
                     _ => stack.push(value!(compare(&[a, b], |o| o == Ordering::Less))),
                 }

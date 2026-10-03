@@ -17,6 +17,7 @@
 //! an unbound symbol in the other would be a silent, hard-to-find difference.
 
 use ainl_core::value::Value;
+use ainl_core::BigNum;
 use ainl_core::Env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -184,7 +185,7 @@ fn http_get_returns_status_headers_and_body() {
     let src = format!(r#"(get (http-get "{}") "status")"#, server.url("/hello"));
     let resp = run_vm(&format!(r#"(http-get "{}")"#, server.url("/hello")))
         .expect("http-get should succeed");
-    assert_eq!(field(&resp, "status"), Value::Int(200));
+    assert_eq!(field(&resp, "status"), Value::Int(BigNum::small(200)));
     assert_eq!(field(&resp, "ok"), Value::Bool(true));
     assert_eq!(field(&resp, "body"), Value::str("hello"));
     assert_eq!(field(&resp, "reason"), Value::str("OK"));
@@ -194,7 +195,7 @@ fn http_get_returns_status_headers_and_body() {
     assert_eq!(field(&headers, "content-type"), Value::str("text/plain"));
     assert_eq!(field(&headers, "x-trace"), Value::str("abc"));
     // And it composes with `get` at the source level too.
-    assert_eq!(run_vm(&src).unwrap(), Value::Int(200));
+    assert_eq!(run_vm(&src).unwrap(), Value::Int(BigNum::small(200)));
 }
 
 /// AINL sends an origin-form request target, a Host header, and a length. A
@@ -259,7 +260,7 @@ fn a_404_is_returned_not_raised() {
     let server = Server::canned(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot here!");
     let resp = run_vm(&format!(r#"(http-get "{}")"#, server.url("/missing")))
         .expect("a 404 must not be an error");
-    assert_eq!(field(&resp, "status"), Value::Int(404));
+    assert_eq!(field(&resp, "status"), Value::Int(BigNum::small(404)));
     assert_eq!(field(&resp, "ok"), Value::Bool(false));
     assert_eq!(field(&resp, "body"), Value::str("not here!"));
 }
@@ -269,7 +270,7 @@ fn a_404_is_returned_not_raised() {
 fn a_204_has_an_empty_body() {
     let server = Server::canned(b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n");
     let resp = run_vm(&format!(r#"(http-get "{}")"#, server.url("/x"))).expect("204");
-    assert_eq!(field(&resp, "status"), Value::Int(204));
+    assert_eq!(field(&resp, "status"), Value::Int(BigNum::small(204)));
     assert_eq!(field(&resp, "body"), Value::str(""));
 }
 
@@ -323,7 +324,7 @@ fn http_post_sends_the_body_and_the_server_receives_it() {
         server.url("/submit")
     ))
     .expect("post");
-    assert_eq!(field(&resp, "status"), Value::Int(201));
+    assert_eq!(field(&resp, "status"), Value::Int(BigNum::small(201)));
     let req = &server.requests()[0];
     assert!(req.starts_with("POST /submit HTTP/1.1"), "got:\n{req}");
     // The length must match the body, or the server reads the wrong number of
@@ -576,7 +577,7 @@ fn both_interpreters_agree_about_http() {
     );
     // `vm` is the 6-element list the program built, so index into it rather
     // than treating it as a response map.
-    assert_eq!(list_index(&vm, 0), Some(Value::Int(200)));
+    assert_eq!(list_index(&vm, 0), Some(Value::Int(BigNum::small(200))));
     assert_eq!(list_index(&vm, 1), Some(Value::Bool(true)));
     assert_eq!(list_index(&vm, 2), Some(Value::str("{\"a\":1}")));
     assert_eq!(
@@ -584,7 +585,7 @@ fn both_interpreters_agree_about_http() {
         Some(Value::str("application/json")),
         "headers must be reachable with the ordinary `get`"
     );
-    assert_eq!(list_index(&vm, 4), Some(Value::Int(200)));
+    assert_eq!(list_index(&vm, 4), Some(Value::Int(BigNum::small(200))));
     // The canned reply is served for the POST too, so `p`'s body is the canned
     // JSON — which is the point: both verbs return the same *shape*, and a
     // caller can write one function over the response map regardless.

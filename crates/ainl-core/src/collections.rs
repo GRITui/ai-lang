@@ -129,8 +129,8 @@ pub fn default_compare(a: &Value, b: &Value) -> Result<Ordering> {
             // a `sort` that ordered `[1, 1.0]` by tag would be a different
             // answer to the same question `(= 1 1.0)` says yes to.
             let (xf, yf) = match (a, b) {
-                (Value::Int(x), Value::Float(y)) => (*x as f64, *y),
-                (Value::Float(x), Value::Int(y)) => (*x, *y as f64),
+                (Value::Int(x), Value::Float(y)) => (x.to_f64(), *y),
+                (Value::Float(x), Value::Int(y)) => (*x, y.to_f64()),
                 _ => unreachable!("matched by the outer arm"),
             };
             xf.partial_cmp(&yf).ok_or_else(nan_err)
@@ -171,7 +171,7 @@ pub fn compare_bytes(a: &str, b: &str) -> Ordering {
 /// reads as a working sort.
 fn comparator_sign(v: &Value) -> Result<Ordering> {
     let n = match v {
-        Value::Int(i) => *i as f64,
+        Value::Int(i) => i.to_f64(),
         Value::Float(x) => *x,
         other => {
             return Err(Error::runtime(format!(
