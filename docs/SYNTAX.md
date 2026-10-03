@@ -224,12 +224,13 @@ zero, a bare `.5` or `1.`, a lone `+`, a control character inside a string, an
 unknown escape, a truncated or unpaired `\u` surrogate, nesting deeper than 512
 levels, and a duplicate key is fine but a non-string key is not.
 
-One documented divergence, in JS only, and it is *not* specific to JSON: a JS
-`Number` is a single type, so AINL's int/float distinction does not survive the
-crossing. `(json-serialize 1)` gives `1.0` there and `1` everywhere else, and an
-`int` inside a container likewise prints as `1.0`. Whole *floats* agree, and the
-output is valid JSON that re-parses to an equal value in both cases. §3i
-describes the full scope, which is wider than this builtin.
+The int/float distinction survives the round trip on **every** backend,
+including JS: `json-serialize 1` is `1` and `json-serialize 1.0` is `1.0`
+everywhere, and `json-parse` returns a tagged float for a decimal/exponential
+literal and a raw int otherwise. JS used to collapse the two (it has one
+`Number` type), which made `(json-serialize 1)` print `1.0` there and `1`
+everywhere else; the tagged-number fix closed that. §3j describes the fix and
+the one divergence that remains (magnitude, not type).
 
 ## 3a. `ainl repl` — interactive and scripted
 
@@ -1268,69 +1269,66 @@ copied into its own `.ainl-vendor/`.
 the interpreter, compiles it, deletes every `.ainl` file, and re-runs the
 binary — which is the only way to prove the inlining rather than assert it.
 
-## 3j. The JS int/float collapse: its true scope
+## 3j. The JS int/float distinction: now carried in the value
 
-The JavaScript target has one numeric type. AINL has two — `int` and `float` —
-and the difference does not survive the crossing. This section states the whole
-of it, because the scope is routinely under-stated as a JSON-only quirk, and a
-reader who believes that will write a program that behaves differently on JS
-without being able to predict which part.
+The JavaScript target used to have one numeric type. AINL has two — `int` and
+`float` — and the difference did not survive the crossing: a whole float lost
+its `.0` on display, a float index was silently accepted where AINL rejects it,
+a whole float was *named* an int in error text, and `json-serialize` turned an
+int into a float. This section used to state the whole of that collapse,
+because the scope was routinely under-stated as a JSON-only quirk, and a reader
+who believed that would write a program that behaved differently on JS without
+being able to predict which part.
 
-A whole float prints without its marker here, and only here:
+**The collapse is now closed on JS.** The transpiler carries the int/float
+distinction in the *value* rather than the type: a float literal is emitted as
+`new _Float(…)` (a thin wrapper with a `valueOf()`), and an int stays a raw
+`Number`. The tag drives **display and type-checks only, not `=`** —
+`(= 1 1.0)` is still `true` on every backend, because numeric equality is
+numeric. With the tag in place, all five backends agree on every case that used
+to diverge:
 
-| program | interpreter, AOT, Python, Ruby | JS |
-|---|---|---|
-| `(print 3.0)` | `3.0` | `3` |
-| `(print (/ 4 2))` | `2.0` | `2` |
-| `(print (+ 1.5 1.5))` | `3.0` | `3` |
+| program | interpreter, AOT, Python, Ruby, JS |
+|---|---|
+| `(print 3.0)` | `3.0` |
+| `(print (/ 4 2))` | `2.0` |
+| `(print (+ 1.5 1.5))` | `3.0` |
+| `(print (+ 1 2))` | `3` |
 
-A **non-whole float is unaffected** — `(print 0.5)` is `0.5` on all five — so
-the divergence is exactly the whole-valued case. A whole **int** is likewise
-unaffected, and stays a bare `3` on all five.
+A **non-whole float** was never affected — `(print 0.5)` is `0.5` on all five —
+and a whole **int** stays a bare `3` on all five (the tag does not leak into
+ints). The three consequences that used to follow from the missing type are all
+gone:
 
-The collapse is not a display rule, though, and this is the part that matters
-most in practice. Three further consequences follow from the same missing type:
+- **A float index is rejected on every backend.** `(substring "abc" 0 1.0)` is
+  a type error on all five (`expects an int end index, got float`); JS now sees
+  the tag and refuses it instead of returning `"a"`.
+- **A whole float is *named* a float in error messages.**
+  `(json-serialize (hash 1.0 "v"))` says `got float` on all five.
+- **`json-serialize` preserves the distinction.** `json-serialize 1` is `1` and
+  `json-serialize 1.0` is `1.0` on all five, and `json-parse` returns a tagged
+  float for a decimal/exponential literal and a raw int otherwise, so the
+  round trip is byte-identical across backends. §3's JSON note is updated
+  accordingly.
 
-- **A float index is accepted where AINL rejects it.** `(substring "abc" 0 1.0)`
-  is a type error on all four typed backends (`expects an int end index, got
-  float`); the JS target has no way to see the difference and returns `"a"`.
-  A program that aborts everywhere else quietly produces output here.
-- **A whole float is *named* an int in error messages.** `json-serialize` must
-  reject a non-`str` object key and reports the key's type, so
-  `(json-serialize (hash 1.0 "v"))` says `got float` on four backends and
-  `got int` on JS.
-- **`json-serialize` runs the other way.** There the collapse favours float:
-  `(json-serialize 1)` is `1` on four backends and `1.0` on JS, because a
-  whole float there is emitted as a float anyway. §3 records this one.
+### The one divergence that remains
 
-### Why it is not fixed, and what a fix would cost
+The tag closes the *type* dimension. It does **not** close the *magnitude*
+one: JS still computes in IEEE-754 doubles, so it does not reproduce the
+interpreter's i64-overflow promotion (e.g. `(* 9223372036854775807 2)` is
+`18446744073709552000` on JS and Python/Ruby's exact
+`18446744073709551614`). That is the accepted divergence documented in
+[NUMERIC_MODEL.md](NUMERIC_MODEL.md) and pinned by
+`crates/ainl-transpile/tests/numeric_divergence.rs`.
 
-The marker is *not* lost by the transpiler: `(print 3.0)` is emitted as
-`_print(3.0)`, with the `.0` in the generated source. It is lost because JavaScript
-has one `number` type, so `3.0` and `3` are the same value, `String(3.0)` is
-`"3"`, and nothing available at runtime distinguishes them.
+### How it is pinned
 
-That rules out a display-only fix. The obvious one — append `.0` to any
-integer-valued number in `_disp` — would also render `(print 3)` as `3.0`, on
-this target only: trading a divergence on every integer in every program for one
-on every whole float, and breaking agreement on the common case to repair the
-rare one. `whole_ints_must_keep_printing_as_bare_ints` in
-`crates/ainl-transpile/tests/js_number_collapse.rs` exists to keep that trade
-from being made silently.
+Every measurement above is pinned by
+`crates/ainl-transpile/tests/js_number_collapse.rs` (re-pinned to the fixed
+behaviour) and the JSON round-trip by
+`crates/ainl-transpile/tests/json_parity.rs`, so the day a target starts
+disagreeing about something here, the suite says so.
 
-Recovering the distinction means carrying it in the value instead of in the
-type — a tagged number, or `BigInt` for the integer range (option 2 in
-[NUMERIC_MODEL.md](NUMERIC_MODEL.md)). Both are numeric-model decisions with
-costs well beyond a print rule, which is why this is documented rather than
-patched. Every measurement above is pinned by
-`crates/ainl-transpile/tests/js_number_collapse.rs`, so the day a target starts
-disagreeing about something else here, the suite says so.
-
-### How to stay out of it
-
-Write floats whose value is not whole where the output is compared across
-backends — the transpiler test suites are written this way on purpose, so JS can
-be diffed byte-for-byte against the interpreter with no exemptions at all.
 
 ## 3k. Storage: `db-open` / `db-put` / `db-get-raw` / `db-flush` / `db-close`
 
@@ -1664,12 +1662,13 @@ The label is **transpiler-only**, not interpreter-only, because `ainl compile`
 runs these programs perfectly well. §3k explains the reasoning at length; the
 refusal is the same contract, on the same terms.
 
-**The round-trip claim is scoped to those three backends, deliberately.** JSON
-has one number type and AINL has two. On a JavaScript target an AINL int would
-come back as `1.0`, so the int/float guarantee above does not survive there.
-Since `db-*` is refused by the transpilers outright, that divergence is
-documented rather than papered over — the same way `json_parity.rs` pins its own
-JS exception explicitly instead of quietly filtering the comparison.
+**The round-trip claim is scoped to those three backends, deliberately.**
+`db-*` is refused by the transpilers outright, so it only runs where the
+interpreter and AOT carry the store — the int/float guarantee above is stated
+for exactly those backends. (JS used to be excluded on the strength of its
+one-`Number`-type collapse, which would have turned an AINL int into `1.0`; the
+tagged-number fix closed that, so the scoping is now purely about which
+backends support `db-*` at all.)
 
 ## 4. Canonical examples
 

@@ -247,6 +247,46 @@ impl Js {
             self.needed.insert("_Sym");
             self.needed.insert("_disp");
         }
+        // The tagged-number model: `_Float` is referenced by display, the
+        // type-name helper, the number check, JSON, and the arithmetic
+        // helpers. Pull it in whenever any of those is needed so the class is
+        // always declared before first use (it sits near the top of the
+        // RUNTIME table, ahead of every helper that touches it). `_float_disp`
+        // is only used by `_disp`.
+        if [
+            "_disp",
+            "_ainl_tname",
+            "_isnum",
+            "_anumber",
+            "_json_ser",
+            "_json_parse",
+            "_add",
+            "_sub",
+            "_mul",
+            "_div",
+            "_mod",
+            "_sqrt",
+            "_abs",
+            "_min",
+            "_max",
+            "_eq",
+            "_typename",
+            "_sort_key",
+            "_exit",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
+        {
+            self.needed.insert("_Float");
+        }
+        if self.needed.contains("_disp") {
+            self.needed.insert("_float_disp");
+        }
+        // Both float formatters share the shortest-round-trip digit math, so
+        // each pulls in `_float_digits`.
+        if self.needed.contains("_float_disp") || self.needed.contains("_json_float") {
+            self.needed.insert("_float_digits");
+        }
         // Tier 1 file I/O: the three path builtins share one canonicalizer, and
         // `_ainl_tname` (used by `path-join`'s positional type error) branches
         // on _Hash and _Sym, so it must pull both in.
@@ -260,6 +300,11 @@ impl Js {
             self.needed.insert("_ainl_tname");
             self.needed.insert("_Hash");
             self.needed.insert("_Sym");
+        }
+        // `exit` names a wrong-typed code through `_ainl_tname`, so a program
+        // that only reaches `_exit` (no other type-error site) still needs it.
+        if self.needed.contains("_exit") {
+            self.needed.insert("_ainl_tname");
         }
         // Tier 3 file system.
         //
@@ -948,7 +993,13 @@ impl ExprEmit for Js {
     fn expr(&mut self, node: &Node) -> Result<String> {
         match node {
             Node::Int(i, _) => Ok(i.to_string()),
-            Node::Float(x, _) => Ok(js_float(*x)),
+            Node::Float(x, _) => {
+                // A float literal carries the float tag: wrap it in `_Float` so
+                // the tag survives arithmetic and is visible to display and
+                // type-checks. Ints stay raw JS numbers.
+                self.need("_Float");
+                Ok(format!("new _Float({})", js_float(*x)))
+            }
             Node::Str(s, _) => Ok(js_str(s)),
             Node::Sym(name, _) => Ok(match name.as_str() {
                 "true" => "true".to_string(),
@@ -972,7 +1023,10 @@ impl Js {
     fn quote(&mut self, node: &Node) -> String {
         match node {
             Node::Int(i, _) => i.to_string(),
-            Node::Float(x, _) => js_float(*x),
+            Node::Float(x, _) => {
+                self.need("_Float");
+                format!("new _Float({})", js_float(*x))
+            }
             Node::Str(s, _) => js_str(s),
             Node::Sym(s, _) => {
                 self.need("_sym");
@@ -1099,9 +1153,37 @@ const RUNTIME: &[(&str, &str)] = &[
     // `_disp` can tell a hash apart from a plain list at print time (a
     // print call can't otherwise know a variable's AINL-level type).
     ("_Hash", "class _Hash extends Array {}"),
+    // The tagged-number model: a float is a `_Float` wrapper around a raw
+    // number, so the float tag survives arithmetic and is visible to display
+    // and type-checks. Ints stay raw JS numbers. `valueOf` returns the raw
+    // number so host operators (`+`, `<`, `Number()`) coerce it without any
+    // change to the shared comparison emission.
+    (
+        "_Float",
+        "class _Float { constructor(x) { this.v = x; } valueOf() { return this.v; } }",
+    ),
+    // Canonical float display, mirroring ainl-core's Value::Float Display:
+    // whole finite floats print `{x:.1}` (e.g. `3.0`), non-whole floats print
+    // the shortest round-trip digits.
+    // Shared shortest-round-trip digit math for a finite float, used by both
+    // `json-serialize` (`_json_float`) and display (`_float_disp`). Returns
+    // [digits, point] where `point` is the number of digits before the decimal
+    // point (so `point >= digits.length` means a whole number, `point <= 0`
+    // means a sub-unit fraction). `String(x)` is not usable for this: it gives
+    // `"1e+300"` and `"1"` (no `.0`). NOT toFixed: that is only specified up to
+    // 1e21 and returns exponential form beyond it. Kept throw-free so the
+    // display path never carries a host error raise.
+    (
+        "_float_digits",
+        "function _float_digits(x) { const neg = x < 0; const ax = neg ? -x : x; let s = \"\"; for (let p = 1; p <= 17; p++) { s = ax.toPrecision(p); if (Number(s) === ax) break; } const e = s.indexOf(\"e\"); let digits, point; if (e === -1) { digits = s.replace(\".\", \"\"); point = s.indexOf(\".\") === -1 ? digits.length : s.indexOf(\".\"); } else { const mant = s.slice(0, e); const exp = parseInt(s.slice(e + 1), 10); digits = mant.replace(\".\", \"\"); point = mant.indexOf(\".\") === -1 ? mant.length : mant.indexOf(\".\"); point += exp; } digits = digits.replace(/0+$/, \"\"); if (digits === \"\") digits = \"0\"; return [neg, digits, point]; }",
+    ),
+    (
+        "_float_disp",
+        "function _float_disp(x) { if (!Number.isFinite(x)) return Number.isNaN(x) ? \"NaN\" : (x > 0 ? \"inf\" : \"-inf\"); const [neg, digits, point] = _float_digits(x); let out; if (point <= 0) out = \"0.\" + \"0\".repeat(-point) + digits; else if (point >= digits.length) out = digits + \"0\".repeat(point - digits.length) + \".0\"; else out = digits.slice(0, point) + \".\" + digits.slice(point); return (neg ? \"-\" : \"\") + out; }",
+    ),
     (
         "_disp",
-        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (x instanceof _Hash) return \"{\" + x.map(p => _repr(p[0]) + \" \" + _repr(p[1])).join(\" \") + \"}\";\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  return String(x);\n}",
+        "function _disp(x) {\n  if (x === true) return \"true\";\n  if (x === false) return \"false\";\n  if (x === null || x === undefined) return \"nil\";\n  if (x instanceof _Sym) return x.name;\n  if (x instanceof _Hash) return \"{\" + x.map(p => _repr(p[0]) + \" \" + _repr(p[1])).join(\" \") + \"}\";\n  if (Array.isArray(x)) return \"(\" + x.map(_repr).join(\" \") + \")\";\n  if (x instanceof _Float) return _float_disp(x.valueOf());\n  return String(x);\n}",
     ),
     (
         "_repr",
@@ -1109,12 +1191,12 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_eq",
-        "function _eq(a, b) {\n  if (Array.isArray(a) && Array.isArray(b)) {\n    if (a.length !== b.length) return false;\n    for (let i = 0; i < a.length; i++) { if (!_eq(a[i], b[i])) return false; }\n    return true;\n  }\n  if (a instanceof _Sym && b instanceof _Sym) return a.name === b.name;\n  return a === b;\n}",
+        "function _eq(a, b) {\n  if (Array.isArray(a) && Array.isArray(b)) {\n    if (a.length !== b.length) return false;\n    for (let i = 0; i < a.length; i++) { if (!_eq(a[i], b[i])) return false; }\n    return true;\n  }\n  if (a instanceof _Sym && b instanceof _Sym) return a.name === b.name;\n  if ((a instanceof _Float || typeof a === \"number\") && (b instanceof _Float || typeof b === \"number\")) return Number(a) === Number(b);\n  return a === b;\n}",
     ),
     ("_print", "function _print(...xs) { console.log(xs.map(_disp).join(\" \")); }"),
     (
         "_typename",
-        "function _typename(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (x === true || x === false) return \"bool\";\n  if (x instanceof _Sym) return \"sym\";\n  if (x instanceof _Hash) return \"hash\";\n  if (Array.isArray(x)) return \"list\";\n  if (typeof x === \"string\") return \"str\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  return \"?\";\n}",
+        "function _typename(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (x === true || x === false) return \"bool\";\n  if (x instanceof _Sym) return \"sym\";\n  if (x instanceof _Hash) return \"hash\";\n  if (Array.isArray(x)) return \"list\";\n  if (typeof x === \"string\") return \"str\";\n  if (x instanceof _Float) return \"float\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  return \"?\";\n}",
     ),
     (
         "_test",
@@ -1130,7 +1212,7 @@ const RUNTIME: &[(&str, &str)] = &[
     // index and breaking ties on it.
     (
         "_sort_key",
-        "function _sort_key(x) {\n  if (typeof x === \"number\") return [0, x, \"\"];\n  if (typeof x === \"string\") return [1, 0, x];\n  _error(\"sort expects a list of numbers or of strings, got a list mixing \" + _typename(x) + \" and ?\");\n}",
+        "function _sort_key(x) {\n  if (typeof x === \"number\" || x instanceof _Float) return [0, x, \"\"];\n  if (typeof x === \"string\") return [1, 0, x];\n  _error(\"sort expects a list of numbers or of strings, got a list mixing \" + _typename(x) + \" and ?\");\n}",
     ),
     (
         "_cmp_sign",
@@ -1236,26 +1318,26 @@ const RUNTIME: &[(&str, &str)] = &[
         // (JS has no separate bool type) — so `(true + 1)` correctly reports
         // `got bool`, matching the other backends.
         "_add",
-        "function _add(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return xs.reduce((a, b) => a + b, 0); }",
+        "function _add(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); const r = xs.reduce((a, b) => a + b, 0); return xs.some(x => x instanceof _Float) ? new _Float(r) : r; }",
     ),
     (
         "_mul",
-        "function _mul(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return xs.reduce((a, b) => a * b, 1); }",
+        "function _mul(...xs) { for (const x of xs) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); const r = xs.reduce((a, b) => a * b, 1); return xs.some(x => x instanceof _Float) ? new _Float(r) : r; }",
     ),
     (
         "_sub",
-        "function _sub(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) return -a; for (const x of rest) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); return rest.reduce((r, x) => r - x, a); }",
+        "function _sub(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) return a instanceof _Float ? new _Float(-a) : -a; for (const x of rest) if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); const r = rest.reduce((acc, x) => acc - x, a); return (a instanceof _Float || rest.some(x => x instanceof _Float)) ? new _Float(r) : r; }",
     ),
     (
         // The zero check is the whole point here: JS returns `Infinity` for
         // `1/0` rather than throwing, so without it `(/ 1 0)` would silently
         // succeed on JS and fail on the other four.
         "_div",
-        "function _div(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) { if (a === 0) _error(\"division by zero\"); return 1 / a; } for (const x of rest) { if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); if (x === 0) _error(\"division by zero\"); } return rest.reduce((r, x) => r / x, a); }",
+        "function _div(a, ...rest) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (rest.length === 0) { if (a === 0) _error(\"division by zero\"); return new _Float(1 / a); } for (const x of rest) { if (!_isnum(x)) _error(\"expected a number, got \" + _ainl_tname(x)); if (x === 0) _error(\"division by zero\"); } return new _Float(rest.reduce((r, x) => r / x, a)); }",
     ),
     (
         "_mod",
-        "function _mod(a, b) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (!_isnum(b)) _error(\"expected a number, got \" + _ainl_tname(b)); if (b === 0) _error(\"mod by zero\"); return a % b; }",
+        "function _mod(a, b) { if (!_isnum(a)) _error(\"expected a number, got \" + _ainl_tname(a)); if (!_isnum(b)) _error(\"expected a number, got \" + _ainl_tname(b)); if (b === 0) _error(\"mod by zero\"); if (b === -1) return 0; let r = a % b; if (r !== 0 && (r < 0) !== (b < 0)) r += b; return r; }",
     ),
     (
         // Type guards for the list and hash builtins. Same reason as the
@@ -1305,7 +1387,7 @@ const RUNTIME: &[(&str, &str)] = &[
     //   * join requires strings, so `join([1,2])` is an error, not "1,2".
     // The `require` calls are lazy inside the helpers so a program that only
     // uses, say, `trim` never loads fs.
-    ("_isnum", "function _isnum(x) { return typeof x === \"number\"; }"),
+    ("_isnum", "function _isnum(x) { return typeof x === \"number\" || x instanceof _Float; }"),
     // The three file builtins below raise AINL's own message rather than
     // letting node's exception escape. That matters because `catch` binds the
     // message it sees, and a host message differs per target: node would give
@@ -1443,7 +1525,7 @@ const RUNTIME: &[(&str, &str)] = &[
     // typeof would say "number" for both an int and a float.
     (
         "_ainl_tname",
-        "function _ainl_tname(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (typeof x === \"boolean\") return \"bool\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  if (typeof x === \"string\") return \"str\";\n  if (Array.isArray(x)) return \"list\";\n  if (x instanceof _Hash) return \"hash\";\n  if (x instanceof _Sym) return \"sym\";\n  if (typeof x === \"function\") return \"fn\";\n  return \"?\";\n}",
+        "function _ainl_tname(x) {\n  if (x === null || x === undefined) return \"nil\";\n  if (typeof x === \"boolean\") return \"bool\";\n  if (x instanceof _Float) return \"float\";\n  if (typeof x === \"number\") return Number.isInteger(x) ? \"int\" : \"float\";\n  if (typeof x === \"string\") return \"str\";\n  if (Array.isArray(x)) return \"list\";\n  if (x instanceof _Hash) return \"hash\";\n  if (x instanceof _Sym) return \"sym\";\n  if (typeof x === \"function\") return \"fn\";\n  return \"?\";\n}",
     ),
     // ---- Tier 1 JSON ----
     // JS is the hardest of the four for json-serialize, and the reason is
@@ -1477,7 +1559,7 @@ const RUNTIME: &[(&str, &str)] = &[
         // NOT toFixed: that is only specified up to 1e21 and returns
         // exponential form beyond it, so it cannot be the rule for a value
         // that all four backends must print identically.
-        "function _json_float(x) {\n  if (!Number.isFinite(x)) {\n    const n = Number.isNaN(x) ? \"NaN\" : (x > 0 ? \"inf\" : \"-inf\");\n    throw new Error(`json-serialize: cannot serialize ${n} (not a finite number)`);\n  }\n  if (x === 0) return \"0.0\";\n  const neg = x < 0;\n  const ax = neg ? -x : x;\n  let s = \"\";\n  for (let p = 1; p <= 17; p++) {\n    s = ax.toPrecision(p);\n    if (Number(s) === ax) break;\n  }\n  // s looks like \"d.dddde+XX\" or \"d.dddd\" depending on magnitude.\n  const e = s.indexOf(\"e\");\n  let digits, point;\n  if (e === -1) {\n    digits = s.replace(\".\", \"\");\n    point = s.indexOf(\".\") === -1 ? digits.length : s.indexOf(\".\");\n  } else {\n    const mant = s.slice(0, e);\n    const exp = parseInt(s.slice(e + 1), 10);\n    digits = mant.replace(\".\", \"\");\n    point = mant.indexOf(\".\") === -1 ? mant.length : mant.indexOf(\".\");\n    point += exp;\n  }\n  // Trailing zeros beyond the significant digits are not printed.\n  digits = digits.replace(/0+$/, \"\");\n  if (digits === \"\") digits = \"0\";\n  let out;\n  if (point <= 0) out = \"0.\" + \"0\".repeat(-point) + digits;\n  else if (point >= digits.length) out = digits + \"0\".repeat(point - digits.length) + \".0\";\n  else out = digits.slice(0, point) + \".\" + digits.slice(point);\n  return (neg ? \"-\" : \"\") + out;\n}",
+        "function _json_float(x) {\n  if (!Number.isFinite(x)) {\n    const n = Number.isNaN(x) ? \"NaN\" : (x > 0 ? \"inf\" : \"-inf\");\n    throw new Error(`json-serialize: cannot serialize ${n} (not a finite number)`);\n  }\n  if (x === 0) return \"0.0\";\n  const [neg, digits, point] = _float_digits(x);\n  let out;\n  if (point <= 0) out = \"0.\" + \"0\".repeat(-point) + digits;\n  else if (point >= digits.length) out = digits + \"0\".repeat(point - digits.length) + \".0\";\n  else out = digits.slice(0, point) + \".\" + digits.slice(point);\n  return (neg ? \"-\" : \"\") + out;\n}",
     ),
     (
         "_json_str",
@@ -1490,7 +1572,7 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_json_ser",
-        "function _json_ser(v, depth) {\n  if (depth === undefined) depth = 0;\n  if (depth > 512) throw new Error('json-serialize: nesting too deep (max 512 levels)');\n  if (v === null || v === undefined) return 'null';\n  if (v === true) return 'true';\n  if (v === false) return 'false';\n  if (typeof v === 'number') return _json_float(v);\n  if (typeof v === 'string') return _json_str(v);\n  // _Hash is not an Array subclass in this target, but keep the map branch\n  // first anyway so the two container kinds can never be confused.\n  if (v instanceof _Hash) {\n    const parts = [];\n    for (const p of v) {\n      if (typeof p[0] !== 'string' || p[0] instanceof _Sym) {\n        throw new Error('json-serialize: object keys must be str, got ' + _ainl_tname(p[0]));\n      }\n      parts.push(_json_str(p[0]) + ':' + _json_ser(p[1], depth + 1));\n    }\n    return '{' + parts.join(',') + '}';\n  }\n  if (Array.isArray(v)) return '[' + v.map((e) => _json_ser(e, depth + 1)).join(',') + ']';\n  if (v instanceof _Sym) throw new Error('json-serialize: cannot serialize a sym');\n  if (typeof v === 'function') throw new Error('json-serialize: cannot serialize a fn');\n  throw new Error('json-serialize: cannot serialize a ' + _ainl_tname(v));\n}",
+        "function _json_ser(v, depth) {\n  if (depth === undefined) depth = 0;\n  if (depth > 512) throw new Error('json-serialize: nesting too deep (max 512 levels)');\n  if (v === null || v === undefined) return 'null';\n  if (v === true) return 'true';\n  if (v === false) return 'false';\n  if (v instanceof _Float) return _json_float(v.valueOf());\n  if (typeof v === 'number') return String(v);\n  if (typeof v === 'string') return _json_str(v);\n  // _Hash is not an Array subclass in this target, but keep the map branch\n  // first anyway so the two container kinds can never be confused.\n  if (v instanceof _Hash) {\n    const parts = [];\n    for (const p of v) {\n      if (typeof p[0] !== 'string' || p[0] instanceof _Sym) {\n        throw new Error('json-serialize: object keys must be str, got ' + _ainl_tname(p[0]));\n      }\n      parts.push(_json_str(p[0]) + ':' + _json_ser(p[1], depth + 1));\n    }\n    return '{' + parts.join(',') + '}';\n  }\n  if (Array.isArray(v)) return '[' + v.map((e) => _json_ser(e, depth + 1)).join(',') + ']';\n  if (v instanceof _Sym) throw new Error('json-serialize: cannot serialize a sym');\n  if (typeof v === 'function') throw new Error('json-serialize: cannot serialize a fn');\n  throw new Error('json-serialize: cannot serialize a ' + _ainl_tname(v));\n}",
     ),
     (
         "_json_parse",
@@ -1498,7 +1580,7 @@ const RUNTIME: &[(&str, &str)] = &[
         // object (not a _Hash), would not implement AINL's first-position
         // duplicate-key rule, would accept NaN/Infinity, and would not report
         // a byte offset for an error message.
-        "function _json_parse(s) {\n  let i = 0;\n  const n = s.length;\n  const err = (m) => { throw new Error(`json-parse: ${m} at position ${i}`); };\n  const ws = () => { while (i < n && (s[i] === ' ' || s[i] === '\\t' || s[i] === '\\n' || s[i] === '\\r')) i++; };\n  const value = (depth) => {\n    if (depth > 512) throw new Error('json-parse: nesting too deep (max 512 levels)');\n    ws();\n    if (i >= n) err('unexpected end of input');\n    const c = s[i];\n    if (c === '{') return obj(depth);\n    if (c === '[') return arr(depth);\n    if (c === '\"') { i++; return string(); }\n    if (s.startsWith('true', i)) { i += 4; return true; }\n    if (s.startsWith('false', i)) { i += 5; return false; }\n    if (s.startsWith('null', i)) { i += 4; return null; }\n    if (c === '-' || (c >= '0' && c <= '9')) return number();\n    err('unexpected character');\n  };\n  const obj = (depth) => {\n    i++;\n    const m = new _Hash();\n    ws();\n    if (i < n && s[i] === '}') { i++; return m; }\n    for (;;) {\n      ws();\n      if (i >= n || s[i] !== '\"') err('expected a string key');\n      i++;\n      const k = string();\n      ws();\n      if (i >= n || s[i] !== ':') err(\"expected ':' after a key\");\n      i++;\n      const v = value(depth + 1);\n      // Last value wins, first position — as hash/assoc do.\n      let at = -1;\n      for (let q = 0; q < m.length; q++) if (m[q][0] === k) { at = q; break; }\n      if (at >= 0) m[at][1] = v; else m.push([k, v]);\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === '}') { i++; return m; }\n      err(\"expected ',' or '}'\");\n    }\n  };\n  const arr = (depth) => {\n    i++;\n    const items = [];\n    ws();\n    if (i < n && s[i] === ']') { i++; return items; }\n    for (;;) {\n      items.push(value(depth + 1));\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === ']') { i++; return items; }\n      err(\"expected ',' or ']'\");\n    }\n  };\n  const hex4 = () => {\n    if (i + 4 > n) err('truncated \\\\u escape');\n    const v = parseInt(s.slice(i, i + 4), 16);\n    if (isNaN(v)) err('invalid \\\\u escape');\n    i += 4;\n    return v;\n  };\n  const string = () => {\n    let out = '';\n    for (;;) {\n      if (i >= n) err('unterminated string');\n      const c = s[i];\n      if (c === '\"') { i++; return out; }\n      i++;\n      if (c === '\\\\') {\n        if (i >= n) err('unterminated escape');\n        const e = s[i++];\n        if (e === '\"') out += '\"';\n        else if (e === '\\\\') out += '\\\\';\n        else if (e === '/') out += '/';\n        else if (e === 'b') out += '\\b';\n        else if (e === 'f') out += '\\f';\n        else if (e === 'n') out += '\\n';\n        else if (e === 'r') out += '\\r';\n        else if (e === 't') out += '\\t';\n        else if (e === 'u') {\n          const hi = hex4();\n          if (hi >= 0xd800 && hi <= 0xdbff) {\n            if (!(i + 1 < n && s[i] === '\\\\' && s[i + 1] === 'u')) err('unpaired surrogate');\n            i += 2;\n            const lo = hex4();\n            if (lo < 0xdc00 || lo > 0xdfff) err('invalid low surrogate');\n            out += String.fromCodePoint(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));\n          } else if (hi >= 0xdc00 && hi <= 0xdfff) err('unpaired surrogate');\n          else out += String.fromCodePoint(hi);\n        } else err('invalid escape');\n      } else if (c.charCodeAt(0) < 0x20) err('control character in string');\n      else out += c;\n    }\n  };\n  const number = () => {\n    const start = i;\n    if (s[i] === '-') i++;\n    if (i >= n) err('expected a digit');\n    if (s[i] === '0') {\n      i++;\n      if (i < n && s[i] >= '0' && s[i] <= '9') err('leading zero in number');\n    } else if (s[i] >= '1' && s[i] <= '9') {\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    } else err('expected a digit');\n    let isFloat = false;\n    if (i < n && s[i] === '.') {\n      isFloat = true; i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err(\"expected a digit after '.'\");\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    if (i < n && (s[i] === 'e' || s[i] === 'E')) {\n      isFloat = true; i++;\n      if (i < n && (s[i] === '+' || s[i] === '-')) i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err('expected a digit in the exponent');\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    const t = s.slice(start, i);\n    // JS has one number type, so an int-looking literal is a Number too — the\n    // int/float distinction the other backends keep simply does not exist here.\n    return Number(t);\n  };\n  const v = value(0);\n  ws();\n  if (i !== n) err('trailing content after the value');\n  return v;\n}",
+        "function _json_parse(s) {\n  let i = 0;\n  const n = s.length;\n  const err = (m) => { throw new Error(`json-parse: ${m} at position ${i}`); };\n  const ws = () => { while (i < n && (s[i] === ' ' || s[i] === '\\t' || s[i] === '\\n' || s[i] === '\\r')) i++; };\n  const value = (depth) => {\n    if (depth > 512) throw new Error('json-parse: nesting too deep (max 512 levels)');\n    ws();\n    if (i >= n) err('unexpected end of input');\n    const c = s[i];\n    if (c === '{') return obj(depth);\n    if (c === '[') return arr(depth);\n    if (c === '\"') { i++; return string(); }\n    if (s.startsWith('true', i)) { i += 4; return true; }\n    if (s.startsWith('false', i)) { i += 5; return false; }\n    if (s.startsWith('null', i)) { i += 4; return null; }\n    if (c === '-' || (c >= '0' && c <= '9')) return number();\n    err('unexpected character');\n  };\n  const obj = (depth) => {\n    i++;\n    const m = new _Hash();\n    ws();\n    if (i < n && s[i] === '}') { i++; return m; }\n    for (;;) {\n      ws();\n      if (i >= n || s[i] !== '\"') err('expected a string key');\n      i++;\n      const k = string();\n      ws();\n      if (i >= n || s[i] !== ':') err(\"expected ':' after a key\");\n      i++;\n      const v = value(depth + 1);\n      // Last value wins, first position — as hash/assoc do.\n      let at = -1;\n      for (let q = 0; q < m.length; q++) if (m[q][0] === k) { at = q; break; }\n      if (at >= 0) m[at][1] = v; else m.push([k, v]);\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === '}') { i++; return m; }\n      err(\"expected ',' or '}'\");\n    }\n  };\n  const arr = (depth) => {\n    i++;\n    const items = [];\n    ws();\n    if (i < n && s[i] === ']') { i++; return items; }\n    for (;;) {\n      items.push(value(depth + 1));\n      ws();\n      if (i < n && s[i] === ',') { i++; continue; }\n      if (i < n && s[i] === ']') { i++; return items; }\n      err(\"expected ',' or ']'\");\n    }\n  };\n  const hex4 = () => {\n    if (i + 4 > n) err('truncated \\\\u escape');\n    const v = parseInt(s.slice(i, i + 4), 16);\n    if (isNaN(v)) err('invalid \\\\u escape');\n    i += 4;\n    return v;\n  };\n  const string = () => {\n    let out = '';\n    for (;;) {\n      if (i >= n) err('unterminated string');\n      const c = s[i];\n      if (c === '\"') { i++; return out; }\n      i++;\n      if (c === '\\\\') {\n        if (i >= n) err('unterminated escape');\n        const e = s[i++];\n        if (e === '\"') out += '\"';\n        else if (e === '\\\\') out += '\\\\';\n        else if (e === '/') out += '/';\n        else if (e === 'b') out += '\\b';\n        else if (e === 'f') out += '\\f';\n        else if (e === 'n') out += '\\n';\n        else if (e === 'r') out += '\\r';\n        else if (e === 't') out += '\\t';\n        else if (e === 'u') {\n          const hi = hex4();\n          if (hi >= 0xd800 && hi <= 0xdbff) {\n            if (!(i + 1 < n && s[i] === '\\\\' && s[i + 1] === 'u')) err('unpaired surrogate');\n            i += 2;\n            const lo = hex4();\n            if (lo < 0xdc00 || lo > 0xdfff) err('invalid low surrogate');\n            out += String.fromCodePoint(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));\n          } else if (hi >= 0xdc00 && hi <= 0xdfff) err('unpaired surrogate');\n          else out += String.fromCodePoint(hi);\n        } else err('invalid escape');\n      } else if (c.charCodeAt(0) < 0x20) err('control character in string');\n      else out += c;\n    }\n  };\n  const number = () => {\n    const start = i;\n    if (s[i] === '-') i++;\n    if (i >= n) err('expected a digit');\n    if (s[i] === '0') {\n      i++;\n      if (i < n && s[i] >= '0' && s[i] <= '9') err('leading zero in number');\n    } else if (s[i] >= '1' && s[i] <= '9') {\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    } else err('expected a digit');\n    let isFloat = false;\n    if (i < n && s[i] === '.') {\n      isFloat = true; i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err(\"expected a digit after '.'\");\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    if (i < n && (s[i] === 'e' || s[i] === 'E')) {\n      isFloat = true; i++;\n      if (i < n && (s[i] === '+' || s[i] === '-')) i++;\n      if (!(i < n && s[i] >= '0' && s[i] <= '9')) err('expected a digit in the exponent');\n      while (i < n && s[i] >= '0' && s[i] <= '9') i++;\n    }\n    const t = s.slice(start, i);\n    // A float literal (one with a `.` or an exponent) carries the float tag;\n    // an int-looking literal stays a raw Number.\n    return isFloat ? new _Float(Number(t)) : Number(t);\n  };\n  const v = value(0);\n  ws();\n  if (i !== n) err('trailing content after the value');\n  return v;\n}",
     ),
     (
         "_json_parse_b",
@@ -1604,7 +1686,7 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_exit",
-        "function _exit(code) {\n  if (typeof code !== \"number\") throw new TypeError(\"exit expects an int\");\n  process.exit(code);\n}",
+        "function _exit(code) {\n  if (typeof code !== \"number\" || code instanceof _Float) throw new TypeError(\"exit expects an int, got \" + _ainl_tname(code));\n  process.exit(code);\n}",
     ),
     (
         "_now",
@@ -1616,7 +1698,7 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_abs",
-        "function _abs(n) {\n  _anumber(\"abs\", n);\n  return Math.abs(n);\n}",
+        "function _abs(n) {\n  _anumber(\"abs\", n);\n  const r = Math.abs(n);\n  return n instanceof _Float ? new _Float(r) : r;\n}",
     ),
     (
         // `who` is passed in rather than derived from `wantMax` because the
@@ -1633,6 +1715,6 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
     (
         "_sqrt",
-        "function _sqrt(n) {\n  _anumber(\"sqrt\", n);\n  if (n < 0) _error(\"sqrt expects a non-negative number\");\n  return Math.sqrt(n);\n}",
+        "function _sqrt(n) {\n  _anumber(\"sqrt\", n);\n  if (n < 0) _error(\"sqrt expects a non-negative number\");\n  return new _Float(Math.sqrt(n));\n}",
     ),
 ];

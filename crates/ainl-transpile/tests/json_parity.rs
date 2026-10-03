@@ -14,17 +14,19 @@
 //!
 //! ## Why the corpus avoids whole integers
 //!
-//! JS has one number type, so an AINL int arrives there as a `Number` and
-//! `json-serialize` gives it the `.0` that marks a float. That is the
-//! int/float collapse docs/NUMERIC_MODEL.md already records for `print` and for
-//! integer overflow; it is a property of the target, not of this builtin. To
-//! avoid a test that quietly tolerates a real bug, the portable corpus is
-//! written so that **no line it prints is a bare integer**. JS is then checked
-//! against the *whole* corpus byte for byte, with no filtering and no
-//! exemptions. The excluded behaviour is pinned separately and exactly, in
-//! `js_prints_every_number_as_a_float_because_it_has_one_number_type` — which
-//! also pins the half that *does* agree, a whole float, because that asymmetry
-//! is the easy thing to get wrong in the other direction.
+//! The portable corpus is written so that **no line it prints is a bare
+//! integer**, and `the_portable_corpus_contains_no_line_js_cannot_reproduce`
+//! enforces that guard. That guard was originally load-bearing: JS had one
+//! number type, so an AINL int arrived as a `Number` and `json-serialize`
+//! gave it the `.0` that marks a float — the int/float collapse
+//! docs/NUMERIC_MODEL.md records for `print` and for integer overflow.
+//!
+//! The tagged-number fix (numeric-model card 1/6) closed the JS collapse: JS
+//! now wraps a float literal in `_Float` and leaves an int a raw `Number`, so
+//! `json-serialize 1` → `1` and `json-serialize 1.0` → `1.0` on every backend.
+//! The guard is kept as a conservative invariant (it still passes), and the
+//! int/float round-trip itself is pinned in
+//! `js_now_preserves_the_int_float_distinction_in_json`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -99,8 +101,8 @@ const CASES: &[&str] = &[
     // Numbers on input: a decimal or exponential literal is a float. The
     // whole-integer cases live in
     // `an_integer_is_still_distinguishable_from_a_whole_float_where_the_type_allows_it`
-    // because `(print 1e3)` exposes the int/float distinction, which is the one
-    // thing JS cannot reproduce.
+    // because `(print 1e3)` exposes the int/float distinction, which the
+    // tagged-number fix now carries in JS too.
     r#"(print (json-parse "-0.5"))"#,
     r#"(print (json-parse "1.5"))"#,
     r#"(print (json-parse "1.5e-3"))"#,
@@ -227,9 +229,12 @@ fn next_id() -> u64 {
 
 #[test]
 fn the_portable_corpus_contains_no_line_js_cannot_reproduce() {
-    // The guard that makes the JS comparison below meaningful. If someone adds
-    // a bare integer to PORTABLE, this fails and points at the fix: quote it or
-    // put it beside a float, rather than widening an exemption.
+    // Conservative invariant, kept from when JS had one number type and a bare
+    // integer line was the one thing it could not reproduce. The tagged-number
+    // fix closed that gap, so the guard is no longer load-bearing — but it is
+    // cheap and still true, and it keeps the corpus honest if someone later
+    // adds a bare integer. If a bare integer appears, quote it or put it beside
+    // a float rather than widening an exemption.
     for line in run(PORTABLE, "interp").expect("interpreter").lines() {
         let bare = !line.is_empty()
             && line
@@ -238,8 +243,8 @@ fn the_portable_corpus_contains_no_line_js_cannot_reproduce() {
             && !line.ends_with(".0");
         assert!(
             !bare,
-            "PORTABLE prints the bare integer {line:?}, which JS cannot \
-             reproduce — it has one number type"
+            "PORTABLE prints the bare integer {line:?} — keep the corpus \
+             free of bare-integer lines"
         );
     }
 }
@@ -379,24 +384,22 @@ fn errors_are_reported_and_never_silently_accepted() {
 }
 
 #[test]
-fn js_prints_every_number_as_a_float_because_it_has_one_number_type() {
-    // The one documented divergence, pinned exactly so it cannot drift.
+fn js_now_preserves_the_int_float_distinction_in_json() {
+    // Re-pin of the old `js_prints_every_number_as_a_float_because_it_has_one_
+    // number_type` pin. That test asserted the documented divergence: JS has
+    // one number type, so `json-serialize` turned an AINL int into a float and
+    // printed `1` as `1.0`. The tagged-number fix (numeric-model card 1/6)
+    // closed it — JS now wraps a float literal in `_Float` and leaves an int a
+    // raw `Number`, so the distinction survives the round trip.
     //
-    // A JS `Number` is a single type, so there is no int/float distinction for
-    // `json-serialize` to preserve: an AINL int arrives as a JS Number and
-    // comes back out with the `.0` that marks a float. Reading a *whole float*
-    // literal is fine — `1.0` and `1` are the same JS value either way, and
-    // emitting `1.0` is what every other backend does — so the divergence is
-    // one-directional: JS turns ints into floats, never the reverse.
-    //
-    // The output is still valid JSON that re-parses to an equal value; only the
-    // int/float distinction is lost, the same thing docs/NUMERIC_MODEL.md says
-    // about `print` and about integer overflow in JS.
+    // Both cases now agree with the other four backends, and this pins that the
+    // fix held: a whole float comes out `1.0`, a whole int comes out `1`, on
+    // every backend including JS. If JS ever collapses the two again, this
+    // fails in the int case.
     let float = r#"(print (json-serialize (nth (json-parse "[1.0]") 0)))"#;
     let int = r#"(print (json-serialize (nth (json-parse "[1]") 0)))"#;
 
-    // Every backend that has two number types agrees on both.
-    for target in ["interp", "aot", "python", "ruby"] {
+    for target in ["interp", "aot", "python", "ruby", "js"] {
         let Some(f) = run(float, target) else {
             continue;
         };
@@ -404,28 +407,17 @@ fn js_prints_every_number_as_a_float_because_it_has_one_number_type() {
         assert_eq!(f, "1.0", "{target} must read 1.0 as a float");
         assert_eq!(i, "1", "{target} must read 1 as an int");
     }
-
-    match run(float, "js") {
-        // A whole float is agreed on — this is the surprising half, and the
-        // reason the portable corpus can include 1e21 and 1.25e17.
-        Some(js) => assert_eq!(js, "1.0", "JS agrees on a whole float"),
-        None => eprintln!("skipping js: node unavailable"),
-    }
-    match run(int, "js") {
-        // The divergent half, pinned so a change in either direction is noticed.
-        Some(js) => assert_eq!(js, "1.0", "JS has one number type; this pins that"),
-        None => eprintln!("skipping js: node unavailable"),
-    }
 }
 
 #[test]
 fn an_integer_is_still_distinguishable_from_a_whole_float_where_the_type_allows_it() {
     // The `.0` suffix is not decoration: it is what keeps a float
     // distinguishable from an int in the output text. The same JSON is `1.0`
-    // and `1` on the three backends that have two number types.
+    // and `1` on every backend — including JS, whose tagged-number fix now
+    // carries the int/float distinction.
     let floats = r#"(print (json-serialize (json-parse "[1.0,2.0]")))"#;
     let ints = r#"(print (json-serialize (json-parse "[1,2]")))"#;
-    for target in ["interp", "python", "ruby"] {
+    for target in ["interp", "aot", "python", "ruby", "js"] {
         let Some(f) = run(floats, target) else {
             continue;
         };
@@ -434,7 +426,4 @@ fn an_integer_is_still_distinguishable_from_a_whole_float_where_the_type_allows_
         assert_eq!(i, "[1,2]", "{target} should emit a bare int");
         assert_ne!(f, i, "{target} collapsed a float and an int");
     }
-    // AOT matches the interpreter here too — it has both int and float.
-    assert_eq!(run(floats, "aot").unwrap(), "[1.0,2.0]");
-    assert_eq!(run(ints, "aot").unwrap(), "[1,2]");
 }

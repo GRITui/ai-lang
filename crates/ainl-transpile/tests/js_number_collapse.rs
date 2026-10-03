@@ -1,37 +1,31 @@
-//! Pins the JS target's int/float collapse — a *known, documented* divergence
-//! that the rest of the suite is written to avoid rather than tolerate.
+//! Pins the JS target's int/float behaviour **after** the tagged-number fix
+//! (numeric-model card 1/6). The old file pinned a *known, documented*
+//! divergence — JS has one number type (`number`), so it could not tell `3.0`
+//! from `3` — and asserted that JS silently lost the float marker on display,
+//! accepted a float index, and named a whole float an "int" in error text.
 //!
-//! ## What is measured here
+//! ## What changed
 //!
-//! AINL has two number types on the interpreter, the AOT binary, and the Python
-//! and Ruby targets. JavaScript has one (`number`), so `3.0` and `3` are the
-//! same value with the same `String()` rendering, and the transpiler emits
-//! `_print(3.0)` for `(print 3.0)` — the `.0` is in the generated *source* and is
-//! erased when JS parses it. So on this target a whole float prints without its
-//! marker, while the other four print `3.0`.
+//! The JS emitter now carries an explicit int/float **tag** in the value (a
+//! `_Float` wrapper; ints stay raw `Number`s). The tag drives **display and
+//! type-checks only**, not `=`. As a result the three divergent cases now
+//! agree with the other four backends, and this file re-pins them to the
+//! *fixed* behaviour so the parity cannot drift back. This is a deliberate,
+//! documented re-pin of the collapse: the tests that asserted the divergence
+//! now assert its absence. See `docs/NUMERIC_MODEL.md` for the model and the
+//! one accepted divergence that remains (JS does not reproduce i64-overflow
+//! promotion).
 //!
-//! This is pinned rather than fixed because the fix is a numeric-model
-//! decision, not a display tweak: recovering the marker at print time requires
-//! knowing which expressions are floats, and JS offers nothing at runtime that
-//! distinguishes them. See docs/NUMERIC_MODEL.md.
-//!
-//! ## Why a pin rather than a fix
-//!
-//! The obvious one-line fix — "append `.0` to any integer-valued number" — is
-//! wrong, and `whole_ints_must_keep_printing_as_bare_ints` is the assertion that
-//! says so: it would render `(print 3)` as `3.0` on this target only, breaking
-//! agreement on the far more common int case to repair the rare float one.
-//!
-//! `a_float_index_is_still_rejected_where_the_backend_can_see_it` pins the
-//! sharper consequence: the collapse is not confined to display, and a program
-//! that errors on four backends silently succeeds on this one.
+//! The two tests that were *not* divergent (`a_non_whole_float_agrees_everywhere`,
+//! `whole_ints_must_keep_printing_as_bare_ints`) are unchanged — they held
+//! before and hold now.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The two backends that have an int/float distinction and therefore agree
-/// with each other, plus JS which does not.
-const TYPED: [&str; 4] = ["interp", "aot", "python", "ruby"];
+/// The four backends that always had an int/float distinction, plus JS, which
+/// now has one too. All five agree on every case in this file.
+const ALL: [&str; 5] = ["interp", "aot", "python", "ruby", "js"];
 
 fn ainl_bin() -> PathBuf {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -144,12 +138,14 @@ fn next_id() -> u64 {
 }
 
 #[test]
-fn whole_floats_print_without_their_marker_on_js_only() {
-    // The divergence the card asked about, pinned exactly.
+fn whole_floats_keep_their_marker_on_all_backends() {
+    // The old divergence, now fixed: a whole-valued float keeps its `.0` on
+    // every backend, including JS.
     //
     // Each case is a whole-valued float written a different way — a literal, a
-    // division, and an arithmetic result that promotes to float. They all lose
-    // the `.0` on JS and all keep it on the other four.
+    // division, and arithmetic results that promote to float. Before the tag
+    // they all lost the `.0` on JS and kept it on the other four; now all five
+    // agree.
     let cases = [
         ("(print 3.0)", "3.0"),
         ("(print (/ 4 2))", "2.0"),
@@ -158,31 +154,23 @@ fn whole_floats_print_without_their_marker_on_js_only() {
         ("(print (sqrt 4.0))", "2.0"),
     ];
     for (prog, expected) in cases {
-        for target in TYPED {
+        for target in ALL {
             let Some(out) = run(prog, target) else {
                 continue;
             };
             assert_eq!(out, expected, "{target} disagrees on `{prog}`");
-        }
-        if let Some(js) = run(prog, "js") {
-            let without = expected.strip_suffix(".0").unwrap_or(expected);
-            assert_eq!(
-                js, without,
-                "JS has one number type, so a whole float loses its marker; \
-                 this pins that. If this now passes with the `.0`, the collapse \
-                 was fixed and this test should be inverted, not deleted."
-            );
         }
     }
 }
 
 #[test]
 fn a_non_whole_float_agrees_everywhere() {
-    // The half that is *not* divergent, and the reason the divergence is easy
-    // to describe badly: `0.5` survives JS's single number type intact,
-    // because a non-whole value has no int/float boundary to cross.
+    // The half that was *never* divergent, and the reason the old divergence
+    // was easy to describe badly: `0.5` survives JS's single number type
+    // intact, because a non-whole value has no int/float boundary to cross.
+    // It still agrees everywhere.
     for prog in ["(print 0.5)", "(print (/ 1 2.0))", "(print (- 1.0 0.5))"] {
-        for target in TYPED.iter().copied().chain(["js"]) {
+        for target in ALL {
             let Some(out) = run(prog, target) else {
                 continue;
             };
@@ -201,10 +189,10 @@ fn whole_ints_must_keep_printing_as_bare_ints() {
     // "Append `.0` to any integer-valued number" would make `(print 3)` print
     // `3.0` on JS and only on JS — trading a divergence on every integer in
     // every program for one on every whole float. The int rendering is the
-    // correct current behaviour and is shared with all four other backends, so
-    // a change here must not take it away.
+    // correct behaviour and is shared with all five backends, so a change here
+    // must not take it away. The tag must not leak into ints.
     let prog = "(print (+ 1 2))";
-    for target in TYPED.iter().chain(&["js"]) {
+    for target in ALL {
         let Some(out) = run(prog, target) else {
             continue;
         };
@@ -213,15 +201,19 @@ fn whole_ints_must_keep_printing_as_bare_ints() {
 }
 
 #[test]
-fn a_float_index_is_still_rejected_where_the_backend_can_see_it() {
-    // The collapse is not only a display artefact, and this is the sharper
-    // consequence: `(substring "abc" 0 1.0)` is a type error on every backend
-    // that can tell 1.0 from 1 — but JS cannot, so it accepts the float and
-    // returns a string. A program that aborts everywhere else quietly produces
-    // output here, which is the worst shape this class of bug can take.
+fn a_float_index_is_rejected_on_all_backends() {
+    // The old file pinned the sharper consequence of the collapse:
+    // `(substring "abc" 0 1.0)` was a type error on four backends but JS
+    // silently accepted the float and returned `"a"` — a program that aborts
+    // everywhere else quietly producing output is the worst shape this class
+    // of bug can take.
+    //
+    // Now that JS carries the float tag, it rejects the index too, with the
+    // same message as the other four. This pins the fix: every backend errors,
+    // and names the offending value a float.
     let prog = r#"(print (substring "abc" 0 1.0))"#;
 
-    for target in TYPED {
+    for target in ALL {
         let Some((ok, _stdout, stderr)) = run_raw(prog, target) else {
             continue;
         };
@@ -231,37 +223,22 @@ fn a_float_index_is_still_rejected_where_the_backend_can_see_it() {
             "{target} rejected it with the wrong message:\n{stderr}"
         );
     }
-
-    if let Some((ok, stdout, _)) = run_raw(prog, "js") {
-        assert!(
-            ok,
-            "JS still accepts a float index. If that is now fixed, this test \
-             should be inverted to assert every backend rejects it — that would \
-             be the real parity fix landing."
-        );
-        assert_eq!(
-            stdout.trim(),
-            "a",
-            "JS returns a slice rather than erroring; this pins that"
-        );
-    }
 }
 
 #[test]
-fn a_whole_float_is_named_an_int_in_an_error_message() {
-    // The collapse reaches error *text*, not only printed values.
+fn a_whole_float_is_named_a_float_in_an_error_message() {
+    // The old file pinned that the collapse reached error *text*: `_ainl_tname`
+    // picked "int" vs "float" with `Number.isInteger`, so a whole float like
+    // `1.0` was reported as an int on JS only. AINL rejects a non-str object
+    // key in `json-serialize` and names the key's type, which makes this a
+    // one-line program that disagreed with the other four backends on stderr.
     //
-    // `_ainl_tname` picks "int" vs "float" with `Number.isInteger`, so `1.0` is
-    // reported as an int on this target. AINL rejects a non-str object key in
-    // `json-serialize` and names the key's type, which makes this a one-line
-    // program that disagrees with the other four backends on stderr.
-    //
-    // A non-whole float is unaffected — `1.5` is not an integer by this test
-    // either — so the divergence is confined to whole floats, like the display
-    // one above.
+    // Now that JS wraps a whole float in `_Float`, `_ainl_tname` sees the tag
+    // and names it a float on every backend. This pins the fix: all five agree
+    // on `got float`.
     let prog = r#"(print (json-serialize (hash 1.0 "v")))"#;
 
-    for target in TYPED {
+    for target in ALL {
         let Some((ok, _, stderr)) = run_raw(prog, target) else {
             continue;
         };
@@ -269,16 +246,6 @@ fn a_whole_float_is_named_an_int_in_an_error_message() {
         assert!(
             stderr.contains("got float"),
             "{target} must name 1.0 a float:\n{stderr}"
-        );
-    }
-
-    if let Some((ok, _, stderr)) = run_raw(prog, "js") {
-        assert!(!ok);
-        assert!(
-            stderr.contains("got int"),
-            "JS calls a whole float an int; this pins that. If it now says \
-             'got float', the type naming was fixed and this test should be \
-             rewritten to assert all five agree."
         );
     }
 }
