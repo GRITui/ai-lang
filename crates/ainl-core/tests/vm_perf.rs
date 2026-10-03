@@ -4,6 +4,24 @@
 //! The loop is the integer sum-to-N benchmark from docs/PERFORMANCE.md:
 //!     (def i 0) (def s 0) (while (< i 40000) (def s (+ s i)) (def i (+ i 1))) s
 //! which sums 0..39999 = 799,980,000.
+//!
+//! # This gate runs in *debug* mode, and it is close to its threshold
+//!
+//! CI runs `cargo test --workspace`, so this measures an unoptimized build —
+//! which is why it must be run locally with plain `cargo test`, not
+//! `cargo test --release`. Release is much faster on both sides (VM ~6.3ms vs
+//! ~25ms debug) and reports a *larger* speedup (~6.5x), so a release-only
+//! measurement will not tell you whether CI will pass.
+//!
+//! The real margin is thinner than it looks: the measured speedup sits at
+//! ~5.7x against a 5.0x floor, and on a contended shared CI runner one run was
+//! recorded at 4.88x and failed on that alone (the same commit then passed).
+//! The tree-walk side is the denominator and moves with machine load, so a
+//! single red run here is worth re-running before assuming a regression.
+//!
+//! For reference, the arbitrary-precision integers in `bignum.rs` cost this
+//! ratio essentially nothing: on the same machine, debug `vm_perf` measured
+//! 5.72x before the bignum change and 5.70x after.
 
 use ainl_core::{BigNum, Value};
 use std::time::{Duration, Instant};

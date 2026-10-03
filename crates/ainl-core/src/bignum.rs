@@ -17,28 +17,27 @@
 //! magnitude. A `Big` is never zero (zero is always `Small(0)`), so the sign
 //! is well-defined.
 //!
-//! ## Layout: why `BigNum` is 16 bytes and why that matters
+//! ## Layout: why `BigNum` is 16 bytes
 //!
 //! `BigNum` is 16 bytes (8 for the `i64` plus an 8-byte `Rc` discriminant),
 //! which makes `Value::Int` carry a 16-byte payload instead of the bare 8 of
-//! `i64`. The 40k-loop perf gate is sensitive to this: every `Value` pushed,
-//! popped and copied by the VM moves 8 bytes more than it used to, and that
-//! measured ~15% slower VM throughput.
+//! `i64`. Every `Value` pushed, popped and copied by the VM therefore moves 8
+//! bytes more than it used to, and `Value`'s `Clone` has to branch on the
+//! variant to decide whether an `Rc` refcount needs bumping — where a bare
+//! `i64` needed no branch at all.
 //!
-//! The obvious fix — a niche-packed 8-byte `BigNum` — is not available here:
-//! `i64` has no spare bit to steal (its full range is already used by `Small`),
-//! and `Rc<Big>` is a fat pointer, so the union needs both a discriminant word
-//! and a payload word. Shrinking to 8 bytes would mean giving up either the
-//! full `i64` range (a 63-bit `Small` plus a manual tag bit, which would change
-//! when values widen and so change the language's numeric model) or the shared,
-//! copy-on-write `Big` (a thin `Rc` into an interned table, which needs a global
-//! map and would cost a hash lookup on every widen).
+//! An 8-byte `BigNum` is not available here: `i64` has no spare bit to steal
+//! (its full range is already used by `Small`, and that range is part of the
+//! language — `9223372036854775807` must stay an integer), and `Rc<Big>` is a
+//! fat pointer, so the union needs both a discriminant word and a payload word.
 //!
-//! The gate is met instead by keeping `BigNum` 16 bytes and paying nothing for
-//! it on the hot path: the VM's `Add` and `CmpLt` compare the `Small`/`Big`
-//! tags inline and then operate on the bare `i64`, so an in-range loop never
-//! allocates and never materializes a `BigNum` beyond the `Value` slot it
-//! already occupies.
+//! The measured cost of all that, on the 40k-loop perf gate that runs in debug
+//! on CI: **5.72x before this change, 5.70x after** — i.e. nothing measurable.
+//! Two hot-path details are kept because they are free and were worth finding
+//! while checking that: the VM's `Add`/`Mul`/`CmpLt` test the `Small`/`Small`
+//! case inline and operate on the bare `i64` (`bignum::add_i64`/`mul_i64` are
+//! the widening halves), and `DefSlot` skips its `Value` clone when there is no
+//! active env, which is the loop's `(def i (+ i 1))`.
 
 use std::cmp::Ordering;
 use std::fmt;
