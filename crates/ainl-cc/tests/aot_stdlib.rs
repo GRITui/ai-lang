@@ -360,26 +360,14 @@ fn aot_abs_matches_the_interpreter() {
 }
 
 #[test]
-fn abs_of_i64_min_is_a_known_aot_gap() {
+fn aot_abs_of_i64_min_is_exact() {
     // `i64::MIN` has no positive i64 answer, so the interpreter widens to an
-    // exact bignum (`9223372036854775808`) while the C runtime promotes to
-    // f64 (`9223372036854775808.0`). This is the same tracked AOT gap as
-    // `aot_numeric.rs::out_of_i64_range_is_a_known_aot_gap` — the C runtime
-    // still implements the pre-bignum model. What is pinned here is the shape:
-    // the interpreter is exact, and the AOT binary returns the same number
-    // rendered as a float rather than wrapping or trapping.
-    let expr = "(abs -9223372036854775808)";
-    // Evaluated directly rather than through `print` (which returns nil), so
-    // the assertion is on the interpreter's value, not its formatting.
-    let interp = ainl_core::run_str(expr).expect("interpreter");
-    let interp_text = format!("{interp}");
-    assert_eq!(
-        interp_text, "9223372036854775808",
-        "the interpreter must widen abs of i64::MIN exactly"
-    );
-    assert!(
-        !interp_text.contains('.'),
-        "abs of i64::MIN must not come back as a float: {interp_text}"
+    // exact bignum (`9223372036854775808`). The C runtime now carries the same
+    // bignum, so it must print the same digits — no `.0`. This used to be the
+    // tracked AOT gap; it is exact parity now.
+    assert_stdout_parity(
+        "(do (print (abs -9223372036854775808))\n        (print (abs -9223372036854775807)))",
+        "abs_i64_min",
     );
 }
 
@@ -395,9 +383,11 @@ fn aot_min_and_max_match_the_interpreter() {
 fn aot_floor_matches_the_interpreter() {
     // The 2^53+1 case pins "an int argument is not round-tripped through a
     // double" — a C implementation that always went via `floor((double)i)`
-    // would lose the low bit here.
+    // would lose the low bit here. The out-of-range case pins the same for a
+    // bignum: `(floor (* 9223372036854775807 2))` must come back as the exact
+    // 20-digit integer, not a float.
     assert_stdout_parity(
-        "(do (print (floor 2.7) (floor -2.1) (floor 4))\n        (print (floor 9007199254740993)))",
+        "(do (print (floor 2.7) (floor -2.1) (floor 4))\n        (print (floor 9007199254740993))\n        (print (floor (* 9223372036854775807 2))))",
         "floor",
     );
 }

@@ -4,8 +4,8 @@
  * (zero runtime deps beyond libc). Faithfully ports the interpreter's Value
  * model (nil/bool/int/float/str/sym/list/map/builtin/closure), lexical scopes
  * with a parent chain (closures capture their defining scope), cons-cell
- * lists, and the numeric model (i64 with promotion to f64 on overflow, per
- * docs/NUMERIC_MODEL.md).
+ * lists, and the numeric model (arbitrary-precision integers that widen past
+ * i64, per docs/NUMERIC_MODEL.md).
  *
  * The codegen (ainl-cc) emits compiled functions that call into this runtime.
  * Local variables are dense slots (a Value array); captured (non-local)
@@ -64,13 +64,21 @@ static void set_err(const char *fmt, ...) {
 /* ---- value model ------------------------------------------------------- */
 typedef enum {
   V_NIL, V_BOOL, V_INT, V_FLOAT, V_STR, V_SYM, V_LIST, V_MAP, V_BUILTIN,
-  V_CLOSURE
+  V_CLOSURE, V_BIGINT
 } VTag;
 
 typedef struct Value Value;
 typedef struct Str Str;
 typedef struct ConsCell ConsCell;
 typedef struct Map Map;
+typedef struct BigNum BigNum; /* arbitrary-precision int, refcounted */
+
+/* Forward decls: the bignum module (defined below, after the checked-int
+ * helpers) is needed by v_ref/v_unref and the numeric ops. */
+static void bignum_unref(BigNum *bn);
+static void bignum_ref(BigNum *bn);
+static double bignum_to_f64(BigNum *bn);
+static void bignum_to_string(BigNum *bn, char *buf, size_t bufsz);
 typedef struct Closure Closure;
 typedef struct Scope Scope;
 
@@ -85,6 +93,7 @@ struct Value {
     Map *m;
     Closure *c;
     int builtin;
+    BigNum *bn; /* V_BIGINT: arbitrary-precision integer (refcounted) */
   } u;
 };
 
@@ -192,6 +201,9 @@ static void v_ref(Value *v) {
   case V_CLOSURE:
     v->u.c->ref++;
     break;
+  case V_BIGINT:
+    bignum_ref(v->u.bn);
+    break;
   default:
     break;
   }
@@ -240,6 +252,9 @@ static void v_unref(Value *v) {
     }
     break;
   }
+  case V_BIGINT:
+    bignum_unref(v->u.bn);
+    break;
   default:
     break;
   }
@@ -301,6 +316,13 @@ static Value v_float(double f) {
   Value v;
   v.tag = V_FLOAT;
   v.u.f = f;
+  return v;
+}
+/* Wrap a BigNum (ref >= 1) as a Value. Takes the reference. */
+static Value v_bigint(BigNum *bn) {
+  Value v;
+  v.tag = V_BIGINT;
+  v.u.bn = bn;
   return v;
 }
 static Value v_str(const char *s) {
@@ -527,6 +549,8 @@ static const char *type_name(Value *v) {
     return "bool";
   case V_INT:
     return "int";
+  case V_BIGINT:
+    return "int";
   case V_FLOAT:
     return "float";
   case V_STR:
@@ -547,6 +571,8 @@ static const char *type_name(Value *v) {
 static double as_f64(Value *v) {
   if (v->tag == V_INT)
     return (double)v->u.i;
+  if (v->tag == V_BIGINT)
+    return bignum_to_f64(v->u.bn);
   if (v->tag == V_FLOAT)
     return v->u.f;
   set_err("expected a number, got %s", type_name(v));
@@ -616,14 +642,635 @@ static int checked_mul(int64_t a, int64_t b, int64_t *out) {
   return 1;
 }
 
+/* ---- arbitrary-precision integers (matches ainl-core's BigNum) --------- */
+/* A line-for-line port of crates/ainl-core/src/bignum.rs. The interpreter's
+ * integers are arbitrary-precision: `Small(i64)` fast path + `Big` signed-
+ * magnitude base-2^32 limbs, refcounted. The C runtime mirrors that exactly
+ * so AOT results match the interpreter digit-for-digit (docs/NUMERIC_MODEL.md).
+ *
+ * Invariants (same as the Rust type):
+ *   - a zero value is always the Small(0) fast path, never a Big with empty
+ *     limbs;
+ *   - Big limbs are normalized (no trailing zero limbs);
+ *   - every BigNum is refcounted: bignum_new_* returns ref 1, bignum_ref
+ *     bumps, bignum_unref drops (freeing at 0).
+ *
+ * The a_* hot-path ops and the builtins take ownership of their Value args
+ * (the generated code unrefs them after the call), so the ops may consume the
+ * operands' BigNums. */
+struct BigNum {
+  int ref;
+  int is_small; /* 1 => i is valid; 0 => limbs (signed-magnitude) */
+  int64_t i;    /* small fast path */
+  int neg;      /* Big: sign */
+  uint32_t *limbs;
+  size_t nlimbs;
+};
+
+static BigNum *bignum_new_small(int64_t i) {
+  BigNum *bn = malloc(sizeof(BigNum));
+  bn->ref = 1;
+  bn->is_small = 1;
+  bn->i = i;
+  bn->neg = 0;
+  bn->limbs = NULL;
+  bn->nlimbs = 0;
+  return bn;
+}
+/* Wrap a computed BigNum as a Value, narrowing Small -> V_INT (indexable) and
+ * keeping Big as V_BIGINT (not indexable), mirroring as_i64() semantics. */
+static Value v_from_bignum(BigNum *bn) {
+  if (bn->is_small) {
+    Value v = v_int(bn->i);
+    bignum_unref(bn);
+    return v;
+  }
+  return v_bigint(bn);
+}
+static BigNum *bignum_new_big(int neg, const uint32_t *limbs, size_t nlimbs) {
+  BigNum *bn = malloc(sizeof(BigNum));
+  bn->ref = 1;
+  bn->is_small = 0;
+  bn->i = 0;
+  bn->neg = neg;
+  bn->nlimbs = nlimbs;
+  if (nlimbs == 0) {
+    bn->limbs = NULL;
+  } else {
+    bn->limbs = malloc(nlimbs * sizeof(uint32_t));
+    memcpy(bn->limbs, limbs, nlimbs * sizeof(uint32_t));
+  }
+  return bn;
+}
+static void bignum_ref(BigNum *bn) { bn->ref++; }
+/* Take a ref and return the pointer (mirrors Rc::clone). */
+static BigNum *bignum_clone_ref(BigNum *bn) {
+  bn->ref++;
+  return bn;
+}
+static void bignum_unref(BigNum *bn) {
+  if (!bn)
+    return;
+  if (--bn->ref == 0) {
+    free(bn->limbs);
+    free(bn);
+  }
+}
+/* Wrap an i64 as a Big (signed-magnitude), for the overflow paths. Mirrors
+ * i64_to_limbs: i64::MIN's magnitude is 2^63 = [0, 2^32]; 0 -> empty limbs. */
+static BigNum *bignum_i64_to_big(int64_t i) {
+  if (i == 0)
+    return bignum_new_big(0, NULL, 0);
+  if (i > 0) {
+    uint32_t lo = (uint32_t)(uint64_t)i;
+    uint32_t hi = (uint32_t)((uint64_t)i >> 32);
+    if (hi == 0)
+      return bignum_new_big(0, &lo, 1);
+    uint32_t l[2] = {lo, hi};
+    return bignum_new_big(0, l, 2);
+  }
+  uint64_t m = (uint64_t)(-(i + 1)) + 1; /* magnitude = |i| (safe for MIN) */
+  uint32_t lo = (uint32_t)m;
+  uint32_t hi = (uint32_t)(m >> 32);
+  if (hi == 0)
+    return bignum_new_big(1, &lo, 1);
+  uint32_t l[2] = {lo, hi};
+  return bignum_new_big(1, l, 2);
+}
+/* Build a BigNum from a signed magnitude, narrowing back to the Small fast
+ * path when the magnitude fits i64. Mirrors Rust `from_mag`: zero -> Small(0);
+ * >2 limbs -> Big (full magnitude kept); <=2 limbs -> Small when it fits
+ * (positive: m <= i64::MAX; negative: m <= 2^63, incl. i64::MIN). */
+static BigNum *bignum_from_mag(int neg, const uint32_t *mag, size_t n) {
+  size_t len = n;
+  while (len > 0 && mag[len - 1] == 0)
+    len--;
+  if (len == 0)
+    return bignum_new_small(0);
+  if (len > 2)
+    return bignum_new_big(neg, mag, n);
+  uint64_t lo = mag[0];
+  uint64_t hi = (len >= 2) ? mag[1] : 0;
+  uint64_t m = (hi << 32) | lo;
+  if (!neg) {
+    if (m <= (uint64_t)INT64_MAX)
+      return bignum_new_small((int64_t)m);
+  } else {
+    if (m <= ((uint64_t)INT64_MAX) + 1) {
+      int64_t val = (m == ((uint64_t)INT64_MAX) + 1) ? INT64_MIN
+                                                     : -(int64_t)m;
+      return bignum_new_small(val);
+    }
+  }
+  return bignum_new_big(neg, mag, n);
+}
+
+/* Unsigned-magnitude add/sub/mul on normalized limb arrays. Mirrors
+ * big_add / big_sub / big_mul. */
+static uint32_t *big_add(const uint32_t *a, size_t na, const uint32_t *b,
+                         size_t nb, size_t *out_n) {
+  size_t n = na > nb ? na : nb;
+  uint32_t *r = malloc(n * sizeof(uint32_t));
+  uint64_t c = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint64_t s = c;
+    if (i < na)
+      s += a[i];
+    if (i < nb)
+      s += b[i];
+    r[i] = (uint32_t)s;
+    c = s >> 32;
+  }
+  if (c) {
+    uint32_t *r2 = malloc((n + 1) * sizeof(uint32_t));
+    memcpy(r2, r, n * sizeof(uint32_t));
+    r2[n] = (uint32_t)c;
+    free(r);
+    r = r2;
+    n++;
+  }
+  while (n > 0 && r[n - 1] == 0)
+    n--;
+  if (n == 0) {
+    free(r);
+    r = NULL;
+  } else {
+    uint32_t *r2 = malloc(n * sizeof(uint32_t));
+    memcpy(r2, r, n * sizeof(uint32_t));
+    free(r);
+    r = r2;
+  }
+  *out_n = n;
+  return r;
+}
+/* Requires mag(a) >= mag(b). */
+static uint32_t *big_sub(const uint32_t *a, size_t na, const uint32_t *b,
+                         size_t nb, size_t *out_n) {
+  uint32_t *r = malloc(na * sizeof(uint32_t));
+  int64_t borrow = 0;
+  for (size_t i = 0; i < na; i++) {
+    int64_t av = (int64_t)a[i];
+    int64_t bv = i < nb ? (int64_t)b[i] : 0;
+    int64_t d = av - bv - borrow;
+    if (d < 0) {
+      d += (int64_t)1 << 32;
+      borrow = 1;
+    } else {
+      borrow = 0;
+    }
+    r[i] = (uint32_t)d;
+  }
+  size_t n = na;
+  while (n > 0 && r[n - 1] == 0)
+    n--;
+  if (n == 0) {
+    free(r);
+    r = NULL;
+  } else {
+    uint32_t *r2 = malloc(n * sizeof(uint32_t));
+    memcpy(r2, r, n * sizeof(uint32_t));
+    free(r);
+    r = r2;
+  }
+  *out_n = n;
+  return r;
+}
+static uint32_t *big_mul(const uint32_t *a, size_t na, const uint32_t *b,
+                         size_t nb, size_t *out_n) {
+  if (na == 0 || nb == 0) {
+    *out_n = 0;
+    return NULL;
+  }
+  size_t n = na + nb;
+  uint64_t *r = calloc(n, sizeof(uint64_t));
+  for (size_t i = 0; i < na; i++) {
+    uint64_t carry = 0;
+    for (size_t j = 0; j < nb; j++) {
+      uint64_t cur = r[i + j] + (uint64_t)a[i] * b[j] + carry;
+      r[i + j] = cur & 0xFFFFFFFFu;
+      carry = cur >> 32;
+    }
+    size_t k = i + nb;
+    while (carry) {
+      uint64_t cur = r[k] + carry;
+      r[k] = cur & 0xFFFFFFFFu;
+      carry = cur >> 32;
+      k++;
+    }
+  }
+  size_t m = n;
+  while (m > 0 && r[m - 1] == 0)
+    m--;
+  if (m == 0) {
+    free(r);
+    *out_n = 0;
+    return NULL;
+  }
+  uint32_t *out = malloc(m * sizeof(uint32_t));
+  for (size_t i = 0; i < m; i++)
+    out[i] = (uint32_t)r[i];
+  free(r);
+  *out_n = m;
+  return out;
+}
+/* Compare two magnitudes that may carry leading zero limbs. -1/0/1. */
+static int mag_cmp(const uint32_t *a, size_t na, const uint32_t *b,
+                   size_t nb) {
+  while (na > 0 && a[na - 1] == 0)
+    na--;
+  while (nb > 0 && b[nb - 1] == 0)
+    nb--;
+  if (na != nb)
+    return na < nb ? -1 : 1;
+  for (size_t i = na; i > 0; i--) {
+    if (a[i - 1] != b[i - 1])
+      return a[i - 1] < b[i - 1] ? -1 : 1;
+  }
+  return 0;
+}
+static int mag_ge(const uint32_t *a, size_t na, const uint32_t *b, size_t nb) {
+  return mag_cmp(a, na, b, nb) >= 0;
+}
+/* a -= b in place (a has `na` allocated limbs). Requires mag(a) >= mag(b). */
+static void mag_sub_inplace(uint32_t *a, size_t na, const uint32_t *b,
+                            size_t nb) {
+  int64_t borrow = 0;
+  for (size_t i = 0; i < na; i++) {
+    int64_t av = (int64_t)a[i];
+    int64_t bv = i < nb ? (int64_t)b[i] : 0;
+    int64_t d = av - bv - borrow;
+    if (d < 0) {
+      d += (int64_t)1 << 32;
+      borrow = 1;
+    } else {
+      borrow = 0;
+    }
+    a[i] = (uint32_t)d;
+  }
+}
+/* Unsigned long division of magnitude a by magnitude b (b != 0): returns the
+ * normalized remainder r = a mod b (0 <= r < b). Mirrors mag_divmod
+ * (bit-by-bit shift-subtract); the quotient is not needed. Caller frees *out. */
+static void mag_divmod_rem(const uint32_t *a, size_t na, const uint32_t *b,
+                           size_t nb, uint32_t **out, size_t *out_n) {
+  uint32_t *r = calloc(na + 1, sizeof(uint32_t));
+  size_t total_bits = na * 32;
+  for (size_t i = total_bits; i > 0; i--) {
+    size_t bit = i - 1;
+    uint32_t carry = 0;
+    for (size_t limb = 0; limb <= na; limb++) {
+      uint32_t new_carry = r[limb] >> 31;
+      r[limb] = (r[limb] << 1) | carry;
+      carry = new_carry;
+    }
+    r[0] |= (a[bit / 32] >> (bit % 32)) & 1;
+    if (mag_ge(r, na + 1, b, nb))
+      mag_sub_inplace(r, na + 1, b, nb);
+  }
+  size_t n = na + 1;
+  while (n > 0 && r[n - 1] == 0)
+    n--;
+  if (n == 0) {
+    free(r);
+    *out = NULL;
+    *out_n = 0;
+  } else {
+    uint32_t *r2 = malloc(n * sizeof(uint32_t));
+    memcpy(r2, r, n * sizeof(uint32_t));
+    free(r);
+    *out = r2;
+    *out_n = n;
+  }
+}
+/* Signed-magnitude compare of two magnitudes (a vs b): -1/0/1. */
+static int big_cmp_mag(const uint32_t *a, size_t na, const uint32_t *b,
+                       size_t nb) {
+  if (na != nb)
+    return na < nb ? -1 : 1;
+  for (size_t i = na; i > 0; i--) {
+    if (a[i - 1] != b[i - 1])
+      return a[i - 1] < b[i - 1] ? -1 : 1;
+  }
+  return 0;
+}
+/* Unsigned-magnitude to decimal (no sign). Mirrors big_to_string. */
+static void big_to_string(const uint32_t *limbs, size_t n, char *buf,
+                          size_t bufsz) {
+  if (n == 0) {
+    buf[0] = '0';
+    buf[1] = 0;
+    return;
+  }
+  uint32_t *tmp = malloc(n * sizeof(uint32_t));
+  memcpy(tmp, limbs, n * sizeof(uint32_t));
+  char *digits = malloc((n * 10 + 1) * sizeof(char));
+  size_t nd = 0;
+  while (n > 0) {
+    uint64_t rem = 0;
+    for (size_t i = n; i > 0; i--) {
+      uint64_t cur = (rem << 32) | tmp[i - 1];
+      tmp[i - 1] = (uint32_t)(cur / 10);
+      rem = cur % 10;
+    }
+    digits[nd++] = (char)('0' + rem);
+    while (n > 0 && tmp[n - 1] == 0)
+      n--;
+  }
+  free(tmp);
+  size_t need = nd + 1;
+  if (need > bufsz)
+    need = bufsz;
+  for (size_t i = 0; i < nd && i + 1 < bufsz; i++)
+    buf[i] = digits[nd - 1 - i];
+  buf[need - 1] = 0;
+  free(digits);
+}
+static int bignum_is_zero(BigNum *bn) {
+  if (bn->is_small)
+    return bn->i == 0;
+  return bn->nlimbs == 0;
+}
+static int bignum_cmp(BigNum *a, BigNum *b); /* fwd (defined below) */
+
+/* ---- BigNum arithmetic (mirrors the Rust impl) ------------------------- */
+static BigNum *bignum_add(BigNum *a, BigNum *b) {
+  if (a->is_small && b->is_small) {
+    int64_t r;
+    if (checked_add(a->i, b->i, &r))
+      return bignum_new_small(r);
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r2 = bignum_add(ab, bb);
+    bignum_unref(ab);
+    bignum_unref(bb);
+    return r2;
+  }
+  if (a->is_small) {
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *r = bignum_add(ab, b);
+    bignum_unref(ab);
+    return r;
+  }
+  if (b->is_small) {
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r = bignum_add(a, bb);
+    bignum_unref(bb);
+    return r;
+  }
+  /* Both Big. */
+  if (a->neg == b->neg) {
+    size_t n;
+    uint32_t *m = big_add(a->limbs, a->nlimbs, b->limbs, b->nlimbs, &n);
+    BigNum *out = bignum_from_mag(a->neg, m, n);
+    free(m);
+    return out;
+  }
+  int c = big_cmp_mag(a->limbs, a->nlimbs, b->limbs, b->nlimbs);
+  if (c == 0)
+    return bignum_new_small(0);
+  if (c > 0) { /* |a| > |b|, result sign = a's */
+    size_t n;
+    uint32_t *m = big_sub(a->limbs, a->nlimbs, b->limbs, b->nlimbs, &n);
+    BigNum *out = bignum_from_mag(a->neg, m, n);
+    free(m);
+    return out;
+  }
+  size_t n;
+  uint32_t *m = big_sub(b->limbs, b->nlimbs, a->limbs, a->nlimbs, &n);
+  BigNum *out = bignum_from_mag(b->neg, m, n);
+  free(m);
+  return out;
+}
+static BigNum *bignum_sub(BigNum *a, BigNum *b) {
+  if (a->is_small && b->is_small) {
+    int64_t r;
+    if (checked_sub(a->i, b->i, &r))
+      return bignum_new_small(r);
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r2 = bignum_sub(ab, bb);
+    bignum_unref(ab);
+    bignum_unref(bb);
+    return r2;
+  }
+  if (a->is_small) {
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *r = bignum_sub(ab, b);
+    bignum_unref(ab);
+    return r;
+  }
+  if (b->is_small) {
+    if (b->i == 0)
+      return bignum_new_big(a->neg, a->limbs, a->nlimbs);
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r = bignum_sub(a, bb);
+    bignum_unref(bb);
+    return r;
+  }
+  /* Both Big. a - b. */
+  if (a->neg == b->neg) { /* same sign: subtract magnitudes, sign = a's */
+    int c = big_cmp_mag(a->limbs, a->nlimbs, b->limbs, b->nlimbs);
+    if (c == 0)
+      return bignum_new_small(0);
+    if (c > 0) {
+      size_t n;
+      uint32_t *m = big_sub(a->limbs, a->nlimbs, b->limbs, b->nlimbs, &n);
+      BigNum *out = bignum_from_mag(a->neg, m, n);
+      free(m);
+      return out;
+    }
+    size_t n;
+    uint32_t *m = big_sub(b->limbs, b->nlimbs, a->limbs, a->nlimbs, &n);
+    BigNum *out = bignum_from_mag(!a->neg, m, n);
+    free(m);
+    return out;
+  }
+  /* Opposite signs: a - b = a + (-b) => add magnitudes, sign = a's. */
+  size_t n;
+  uint32_t *m = big_add(a->limbs, a->nlimbs, b->limbs, b->nlimbs, &n);
+  BigNum *out = bignum_from_mag(a->neg, m, n);
+  free(m);
+  return out;
+}
+static BigNum *bignum_mul(BigNum *a, BigNum *b) {
+  if (a->is_small && b->is_small) {
+    int64_t r;
+    if (checked_mul(a->i, b->i, &r))
+      return bignum_new_small(r);
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r2 = bignum_mul(ab, bb);
+    bignum_unref(ab);
+    bignum_unref(bb);
+    return r2;
+  }
+  if (a->is_small) {
+    if (a->i == 0)
+      return bignum_new_small(0);
+    if (a->i == 1)
+      return bignum_new_big(b->neg, b->limbs, b->nlimbs);
+    BigNum *ab = bignum_i64_to_big(a->i);
+    BigNum *r = bignum_mul(ab, b);
+    bignum_unref(ab);
+    return r;
+  }
+  if (b->is_small) {
+    if (b->i == 0)
+      return bignum_new_small(0);
+    if (b->i == 1)
+      return bignum_new_big(a->neg, a->limbs, a->nlimbs);
+    BigNum *bb = bignum_i64_to_big(b->i);
+    BigNum *r = bignum_mul(a, bb);
+    bignum_unref(bb);
+    return r;
+  }
+  int neg = a->neg != b->neg;
+  size_t n;
+  uint32_t *m = big_mul(a->limbs, a->nlimbs, b->limbs, b->nlimbs, &n);
+  BigNum *out = bignum_from_mag(neg, m, n);
+  free(m);
+  return out;
+}
+static int bignum_cmp(BigNum *a, BigNum *b) {
+  if (a->is_small && b->is_small) {
+    uint64_t ua = (uint64_t)a->i, ub = (uint64_t)b->i;
+    if (ua != ub)
+      return ua < ub ? -1 : 1;
+    return 0;
+  }
+  if (a->is_small) {
+    BigNum *ab = bignum_i64_to_big(a->i);
+    int c = bignum_cmp(ab, b);
+    bignum_unref(ab);
+    return c;
+  }
+  if (b->is_small) {
+    BigNum *bb = bignum_i64_to_big(b->i);
+    int c = bignum_cmp(a, bb);
+    bignum_unref(bb);
+    return c;
+  }
+  if (a->neg != b->neg)
+    return a->neg ? -1 : 1;
+  int c = big_cmp_mag(a->limbs, a->nlimbs, b->limbs, b->nlimbs);
+  if (c == 0)
+    return 0;
+  return a->neg ? -c : c;
+}
+static BigNum *bignum_mod(BigNum *a, BigNum *b) {
+  if (a->is_small && b->is_small) {
+    int64_t x = a->i, y = b->i;
+    if (y == 0)
+      return NULL; /* caller sets "mod by zero" */
+    if (y == -1)
+      return bignum_new_small(0);
+    int64_t r = x % y;
+    if (r < 0)
+      r += (y < 0) ? -y : y; /* Euclidean: result in [0, |y|) */
+    return bignum_new_small(r);
+  }
+  BigNum *ab = a->is_small ? bignum_i64_to_big(a->i) : a;
+  BigNum *bb = b->is_small ? bignum_i64_to_big(b->i) : b;
+  /* Mirrors big_rem_euclid: r_mag = |a| mod |b|; if a is negative,
+   * r_euclid = |b| - r_mag (exact division -> |b|, not 0). Always non-negative. */
+  uint32_t *r_mag = NULL;
+  size_t rn = 0;
+  mag_divmod_rem(ab->limbs, ab->nlimbs, bb->limbs, bb->nlimbs, &r_mag, &rn);
+  BigNum *out;
+  if (ab->neg) {
+    if (rn == 0) {
+      /* |b| - 0 = |b| (the exact-division quirk). */
+      out = bignum_from_mag(0, bb->limbs, bb->nlimbs);
+    } else {
+      uint32_t *bm = malloc(bb->nlimbs * sizeof(uint32_t));
+      memcpy(bm, bb->limbs, bb->nlimbs * sizeof(uint32_t));
+      mag_sub_inplace(bm, bb->nlimbs, r_mag, rn);
+      out = bignum_from_mag(0, bm, bb->nlimbs);
+      free(bm);
+    }
+  } else {
+    out = bignum_from_mag(0, r_mag, rn);
+  }
+  free(r_mag);
+  if (ab != a)
+    bignum_unref(ab);
+  if (bb != b)
+    bignum_unref(bb);
+  return out;
+}
+static BigNum *bignum_neg(BigNum *a) {
+  if (a->is_small) {
+    if (a->i == INT64_MIN)
+      return bignum_new_big(0, (const uint32_t[]){0, 1}, 2); /* +2^63 */
+    return bignum_new_small(-a->i);
+  }
+  /* Mirrors Rust: neg of a Big FLIPS the sign (magnitude shared). */
+  return bignum_new_big(!a->neg, a->limbs, a->nlimbs);
+}
+static BigNum *bignum_abs(BigNum *a) {
+  if (a->is_small) {
+    if (a->i == INT64_MIN)
+      return bignum_new_big(0, (const uint32_t[]){0, 1}, 2); /* +2^63 */
+    return bignum_new_small(a->i < 0 ? -a->i : a->i);
+  }
+  /* Mirrors Rust: abs of a Big keeps the magnitude, sign cleared (positive). */
+  return bignum_new_big(0, a->limbs, a->nlimbs);
+}
+static double bignum_to_f64(BigNum *bn) {
+  if (bn->is_small)
+    return (double)bn->i;
+  double acc = 0.0;
+  for (size_t i = bn->nlimbs; i > 0; i--)
+    acc = acc * 4294967296.0 + (double)bn->limbs[i - 1];
+  return bn->neg ? -acc : acc;
+}
+static void bignum_to_string(BigNum *bn, char *buf, size_t bufsz) {
+  if (bn->is_small) {
+    snprintf(buf, bufsz, "%lld", (long long)bn->i);
+    return;
+  }
+  if (bn->nlimbs == 0) {
+    buf[0] = '0';
+    buf[1] = 0;
+    return;
+  }
+  size_t cap = bn->nlimbs * 10 + 2;
+  char *tmp = malloc(cap);
+  big_to_string(bn->limbs, bn->nlimbs, tmp, cap);
+  size_t len = strlen(tmp);
+  size_t off = 0;
+  if (bn->neg && bufsz > 1) {
+    buf[0] = '-';
+    off = 1;
+  }
+  size_t copy = len;
+  if (off + copy >= bufsz)
+    copy = (bufsz > off) ? bufsz - off - 1 : 0;
+  memcpy(buf + off, tmp, copy);
+  buf[off + copy] = 0;
+  free(tmp);
+}
+
 /* ---- equality (matches the interpreter's PartialEq) -------------------- */
 static int values_eq(Value *a, Value *b) {
   if (a->tag != b->tag) {
-    /* int/float cross-compare */
+    /* int/float cross-compare (int-vs-int incl. V_BIGINT is exact, below). */
     if ((a->tag == V_INT && b->tag == V_FLOAT) ||
-        (a->tag == V_FLOAT && b->tag == V_INT)) {
+        (a->tag == V_FLOAT && b->tag == V_INT) ||
+        (a->tag == V_BIGINT && b->tag == V_FLOAT) ||
+        (a->tag == V_FLOAT && b->tag == V_BIGINT)) {
       double x = as_f64(a), y = as_f64(b);
       return x == y;
+    }
+    /* int vs bignum: exact, never through f64. */
+    if ((a->tag == V_INT && b->tag == V_BIGINT) ||
+        (a->tag == V_BIGINT && b->tag == V_INT)) {
+      Value *ii = (a->tag == V_INT) ? a : b;
+      Value *bb = (a->tag == V_INT) ? b : a;
+      BigNum *t = bignum_i64_to_big(ii->u.i);
+      int c = bignum_cmp(t, bb->u.bn);
+      bignum_unref(t);
+      return c == 0;
     }
     return 0;
   }
@@ -634,6 +1281,8 @@ static int values_eq(Value *a, Value *b) {
     return a->u.b == b->u.b;
   case V_INT:
     return a->u.i == b->u.i;
+  case V_BIGINT:
+    return bignum_cmp(a->u.bn, b->u.bn) == 0;
   case V_FLOAT:
     return a->u.f == b->u.f;
   case V_STR:
@@ -766,6 +1415,9 @@ static void value_to_string(Value *v, char *buf, size_t bufsz) {
   case V_INT:
     snprintf(buf, bufsz, "%lld", (long long)v->u.i);
     break;
+  case V_BIGINT:
+    bignum_to_string(v->u.bn, buf, bufsz);
+    break;
   case V_FLOAT:
     format_float(v->u.f, buf, bufsz);
     break;
@@ -860,32 +1512,63 @@ static void value_repr(Value *v, char *buf, size_t bufsz) {
 
 /* ---- builtins ---------------------------------------------------------- */
 static Value numeric_fold(Value *args, int nargs, int is_mul) {
-  int64_t acc_i = is_mul ? 1 : 0;
+  /* Fast path: all-int accumulation with checked i64 arithmetic (no
+   * allocation). The moment an operand overflows i64 — or a float shows up —
+   * we fall through to the BigNum / f64 path below, which is exact. This is
+   * what keeps the AOT compute loop at its pre-bignum speed: the common case
+   * of small integers never touches the heap. */
+  int64_t acc_i64 = is_mul ? 1 : 0;
+  int fast = 1;
+  for (int k = 0; fast && k < nargs; k++) {
+    Value *v = &args[k];
+    if (v->tag != V_INT) {
+      fast = 0;
+      break;
+    }
+    int64_t r;
+    int ok = is_mul ? checked_mul(acc_i64, v->u.i, &r)
+                    : checked_add(acc_i64, v->u.i, &r);
+    if (!ok) {
+      fast = 0;
+      break;
+    }
+    acc_i64 = r;
+  }
+  if (fast)
+    return v_int(acc_i64);
+
+  BigNum *acc_i = bignum_new_small(is_mul ? 1 : 0);
   double acc_f = 0.0;
   int is_float = 0;
   for (int k = 0; k < nargs; k++) {
     Value *v = &args[k];
     if (v->tag == V_INT && !is_float) {
-      int64_t i = v->u.i, r;
-      int ok = is_mul ? checked_mul(acc_i, i, &r) : checked_add(acc_i, i, &r);
-      if (ok) {
-        acc_i = r;
-      } else {
-        is_float = 1;
-        acc_f = is_mul ? (double)acc_i * (double)i : (double)acc_i + (double)i;
-      }
+      BigNum *t = bignum_i64_to_big(v->u.i);
+      BigNum *r = is_mul ? bignum_mul(acc_i, t) : bignum_add(acc_i, t);
+      bignum_unref(acc_i);
+      bignum_unref(t);
+      acc_i = r;
+    } else if (v->tag == V_BIGINT && !is_float) {
+      BigNum *t = bignum_clone_ref(v->u.bn);
+      BigNum *r = is_mul ? bignum_mul(acc_i, t) : bignum_add(acc_i, t);
+      bignum_unref(acc_i);
+      bignum_unref(t);
+      acc_i = r;
     } else {
       double x = as_f64(v);
-      if (g_err)
+      if (g_err) {
+        bignum_unref(acc_i);
         return v_nil();
+      }
       if (!is_float) {
         is_float = 1;
-        acc_f = (double)acc_i;
+        acc_f = bignum_to_f64(acc_i);
       }
       acc_f = is_mul ? acc_f * x : acc_f + x;
     }
   }
-  return is_float ? v_float(acc_f) : v_int(acc_i);
+  Value out = is_float ? v_float(acc_f) : v_from_bignum(acc_i);
+  return out;
 }
 
 static Value float_sub(Value *args, int nargs) {
@@ -909,26 +1592,36 @@ static Value builtin_sub(Value *args, int nargs) {
   if (nargs == 1) {
     Value *a = &args[0];
     if (a->tag == V_INT) {
-      if (a->u.i == INT64_MIN)
-        return v_float(-(double)a->u.i);
-      return v_int(-a->u.i);
+      BigNum *t = bignum_i64_to_big(a->u.i);
+      BigNum *r = bignum_neg(t);
+      bignum_unref(t);
+      return v_from_bignum(r);
     }
+    if (a->tag == V_BIGINT)
+      return v_from_bignum(bignum_neg(a->u.bn));
     if (a->tag == V_FLOAT)
       return v_float(-a->u.f);
     set_err("- expected number, got %s", type_name(a));
     return v_nil();
   }
-  int all_int = (args[0].tag == V_INT);
+  int all_int = (args[0].tag == V_INT || args[0].tag == V_BIGINT);
   for (int k = 1; k < nargs && all_int; k++)
-    all_int = (args[k].tag == V_INT);
+    all_int = (args[k].tag == V_INT || args[k].tag == V_BIGINT);
   if (all_int) {
-    int64_t acc = args[0].u.i, r;
+    BigNum *acc;
+    if (args[0].tag == V_INT)
+      acc = bignum_i64_to_big(args[0].u.i);
+    else
+      acc = bignum_clone_ref(args[0].u.bn);
     for (int k = 1; k < nargs; k++) {
-      if (!checked_sub(acc, args[k].u.i, &r))
-        return float_sub(args, nargs);
+      BigNum *t = (args[k].tag == V_INT) ? bignum_i64_to_big(args[k].u.i)
+                                         : bignum_clone_ref(args[k].u.bn);
+      BigNum *r = bignum_sub(acc, t);
+      bignum_unref(acc);
+      bignum_unref(t);
       acc = r;
     }
-    return v_int(acc);
+    return v_from_bignum(acc);
   }
   return float_sub(args, nargs);
 }
@@ -957,21 +1650,26 @@ static Value builtin_div(Value *args, int nargs) {
 }
 
 static Value builtin_mod(Value *args, int nargs) {
-  if (nargs != 2 || args[0].tag != V_INT || args[1].tag != V_INT) {
+  if (nargs != 2 ||
+      (args[0].tag != V_INT && args[0].tag != V_BIGINT) ||
+      (args[1].tag != V_INT && args[1].tag != V_BIGINT)) {
     set_err("mod expects (mod int int)");
     return v_nil();
   }
-  int64_t a = args[0].u.i, b = args[1].u.i;
-  if (b == 0) {
+  BigNum *a = (args[0].tag == V_INT) ? bignum_i64_to_big(args[0].u.i)
+                                     : bignum_clone_ref(args[0].u.bn);
+  BigNum *b = (args[1].tag == V_INT) ? bignum_i64_to_big(args[1].u.i)
+                                     : bignum_clone_ref(args[1].u.bn);
+  if (bignum_is_zero(b)) {
     set_err("mod by zero");
+    bignum_unref(a);
+    bignum_unref(b);
     return v_nil();
   }
-  if (b == -1)
-    return v_int(0);
-  int64_t r = a % b;
-  if (r < 0)
-    r += (b < 0) ? -b : b; /* Euclidean: result in [0, |b|) */
-  return v_int(r);
+  BigNum *r = bignum_mod(a, b);
+  bignum_unref(a);
+  bignum_unref(b);
+  return v_from_bignum(r);
 }
 
 static Value builtin_eq(Value *args, int nargs) {
@@ -982,32 +1680,71 @@ static Value builtin_eq(Value *args, int nargs) {
   return v_bool(1);
 }
 
+static int num_is_int(Value *v) {
+  return v->tag == V_INT || v->tag == V_BIGINT;
+}
+/* Exact integer ordering for int-vs-int (incl. V_BIGINT), never through f64. */
+static int int_order(Value *a, Value *b) {
+  if (a->tag == V_INT && b->tag == V_INT) {
+    if (a->u.i < b->u.i)
+      return -1;
+    if (a->u.i > b->u.i)
+      return 1;
+    return 0;
+  }
+  BigNum *ta = (a->tag == V_INT) ? bignum_i64_to_big(a->u.i)
+                                 : bignum_clone_ref(a->u.bn);
+  BigNum *tb = (b->tag == V_INT) ? bignum_i64_to_big(b->u.i)
+                                 : bignum_clone_ref(b->u.bn);
+  int c = bignum_cmp(ta, tb);
+  bignum_unref(ta);
+  bignum_unref(tb);
+  return c;
+}
 static Value builtin_cmp(Value *args, int nargs, int op) {
   for (int k = 0; k + 1 < nargs; k++) {
-    double a = as_f64(&args[k]);
-    if (g_err)
-      return v_nil();
-    double b = as_f64(&args[k + 1]);
-    if (g_err)
-      return v_nil();
-    if (isnan(a) || isnan(b)) {
-      set_err("cannot compare NaN");
-      return v_nil();
-    }
     int keep;
-    switch (op) {
-    case 0:
-      keep = a < b;
-      break;
-    case 1:
-      keep = a > b;
-      break;
-    case 2:
-      keep = a <= b;
-      break;
-    default:
-      keep = a >= b;
-      break;
+    if (num_is_int(&args[k]) && num_is_int(&args[k + 1])) {
+      int c = int_order(&args[k], &args[k + 1]);
+      switch (op) {
+      case 0:
+        keep = c < 0;
+        break;
+      case 1:
+        keep = c > 0;
+        break;
+      case 2:
+        keep = c <= 0;
+        break;
+      default:
+        keep = c >= 0;
+        break;
+      }
+    } else {
+      double a = as_f64(&args[k]);
+      if (g_err)
+        return v_nil();
+      double b = as_f64(&args[k + 1]);
+      if (g_err)
+        return v_nil();
+      if (isnan(a) || isnan(b)) {
+        set_err("cannot compare NaN");
+        return v_nil();
+      }
+      switch (op) {
+      case 0:
+        keep = a < b;
+        break;
+      case 1:
+        keep = a > b;
+        break;
+      case 2:
+        keep = a <= b;
+        break;
+      default:
+        keep = a >= b;
+        break;
+      }
     }
     if (!keep)
       return v_bool(0);
@@ -1123,8 +1860,14 @@ static Value builtin_rest(Value *args, int nargs) {
 }
 
 static Value builtin_nth(Value *args, int nargs) {
-  if (nargs != 2 || args[0].tag != V_LIST || args[1].tag != V_INT) {
+  if (nargs != 2 || args[0].tag != V_LIST || !num_is_int(&args[1])) {
     set_err("nth expects (nth list int)");
+    return v_nil();
+  }
+  // A V_BIGINT index is out of i64 range: the interpreter's as_i64() -> None
+  // reports "nth index out of range", not the type error.
+  if (args[1].tag == V_BIGINT) {
+    set_err("nth index out of range");
     return v_nil();
   }
   int64_t i = args[1].u.i;
@@ -1448,6 +2191,10 @@ static const char *as_content_arg(Value *v, const char *who) {
 static int as_num_arg(Value *v, const char *who, double *out) {
   if (v->tag == V_INT) {
     *out = (double)v->u.i;
+    return 1;
+  }
+  if (v->tag == V_BIGINT) {
+    *out = bignum_to_f64(v->u.bn);
     return 1;
   }
   if (v->tag == V_FLOAT) {
@@ -2671,20 +3418,24 @@ static Value builtin_env_get(Value *args, int nargs) {
   return v ? v_str(v) : v_nil();
 }
 
-/* (exit code) — does not return. stdout is flushed first: exit() does not
- * flush stdio the way a normal return does on every platform. */
+/* (exit code) -> int. A V_BIGINT code is out of i64 range; the interpreter
+ * clamps it to i32::MAX (as_i64() -> None -> i32::MAX), so this does too.
+ * Does not return. stdout is flushed first: exit() does not flush stdio the
+ * way a normal return does on every platform. */
 static Value builtin_exit(Value *args, int nargs) {
   if (nargs != 1) {
     set_err("exit expects (exit code)");
     return v_nil();
   }
-  if (args[0].tag != V_INT) {
+  if (!num_is_int(&args[0])) {
     set_err("exit expects an int, got %s", type_name(&args[0]));
     return v_nil();
   }
+  int64_t code = (args[0].tag == V_BIGINT) ? (int64_t)INT32_MAX
+                                          : args[0].u.i;
   fflush(stdout);
   fflush(stderr);
-  exit((int)args[0].u.i);
+  exit((int)code);
 }
 
 /* (now) -> whole seconds since the Unix epoch. */
@@ -2727,8 +3478,10 @@ static Value builtin_sleep(Value *args, int nargs) {
   return v_nil();
 }
 
-/* (abs n) — integer-preserving; abs(INT64_MIN) has no i64 answer, so it
- * promotes to float exactly as the interpreter's checked_abs does. */
+/* (abs n) — integer-preserving and exact: abs(INT64_MIN) has no i64 answer, so
+ * it widens to a bignum (9223372036854775808) exactly as the interpreter's
+ * BigNum::abs does. A V_BIGINT argument is already out of i64 range and its
+ * absolute value is the same magnitude with the sign cleared. */
 static Value builtin_abs(Value *args, int nargs) {
   if (nargs != 1) {
     set_err("abs expects (abs n)");
@@ -2736,10 +3489,13 @@ static Value builtin_abs(Value *args, int nargs) {
   }
   Value *a = &args[0];
   if (a->tag == V_INT) {
-    if (a->u.i == INT64_MIN)
-      return v_float(-(double)a->u.i);
-    return v_int(a->u.i < 0 ? -a->u.i : a->u.i);
+    BigNum *t = bignum_i64_to_big(a->u.i);
+    BigNum *r = bignum_abs(t);
+    bignum_unref(t);
+    return v_from_bignum(r);
   }
+  if (a->tag == V_BIGINT)
+    return v_bigint(bignum_abs(a->u.bn));
   if (a->tag == V_FLOAT)
     return v_float(fabs(a->u.f));
   set_err("abs expects a number, got %s", type_name(a));
@@ -2781,7 +3537,7 @@ static Value builtin_max(Value *args, int nargs) {
 }
 
 /* (floor n) -> int. An int passes through unchanged (no double round-trip, so
- * a large i64 keeps every bit). */
+ * a large i64 or an out-of-range bignum keeps every digit). */
 static Value builtin_floor(Value *args, int nargs) {
   if (nargs != 1) {
     set_err("floor expects (floor n)");
@@ -2789,6 +3545,8 @@ static Value builtin_floor(Value *args, int nargs) {
   }
   if (args[0].tag == V_INT)
     return v_int(args[0].u.i);
+  if (args[0].tag == V_BIGINT)
+    return v_bigint(bignum_clone_ref(args[0].u.bn));
   double x;
   if (!as_num_arg(&args[0], "floor", &x))
     return v_nil();
@@ -3850,7 +4608,10 @@ static Value v_call(Value callee, Value *args, int nargs) {
  * share its type test. */
 
 static inline int a_is_num(Value v) {
-  return v.tag == V_INT || v.tag == V_FLOAT;
+  return v.tag == V_INT || v.tag == V_BIGINT || v.tag == V_FLOAT;
+}
+static inline int a_is_int(Value v) {
+  return v.tag == V_INT || v.tag == V_BIGINT;
 }
 
 /* Set the type error the interpreter would raise, naming the first
@@ -3868,45 +4629,90 @@ static inline Value a_add(Value a, Value b) {
   if (a.tag == V_INT && b.tag == V_INT) {
     int64_t r;
     if (checked_add(a.u.i, b.u.i, &r))
-      return v_int(r);
-    return v_float((double)a.u.i + (double)b.u.i);
+      return v_int(r); /* fast path: no allocation, no overflow */
+    BigNum *r2 = bignum_add(bignum_i64_to_big(a.u.i), bignum_i64_to_big(b.u.i));
+    return v_from_bignum(r2);
+  }
+  if (a_is_int(a) && a_is_int(b)) {
+    BigNum *ta = (a.tag == V_INT) ? bignum_i64_to_big(a.u.i)
+                                  : bignum_clone_ref(a.u.bn);
+    BigNum *tb = (b.tag == V_INT) ? bignum_i64_to_big(b.u.i)
+                                  : bignum_clone_ref(b.u.bn);
+    BigNum *r = bignum_add(ta, tb);
+    bignum_unref(ta);
+    bignum_unref(tb);
+    return v_from_bignum(r);
   }
   if (!a_is_num(a) || !a_is_num(b)) {
     a_num_fail(a, b);
     return v_nil();
   }
-  double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
+  double x = as_f64(&a);
+  if (g_err)
+    return v_nil();
+  double y = as_f64(&b);
+  if (g_err)
+    return v_nil();
   return v_float(x + y);
 }
 static inline Value a_sub2(Value a, Value b) {
   if (a.tag == V_INT && b.tag == V_INT) {
     int64_t r;
     if (checked_sub(a.u.i, b.u.i, &r))
-      return v_int(r);
-    return v_float((double)a.u.i - (double)b.u.i);
+      return v_int(r); /* fast path: no allocation, no overflow */
+    BigNum *r2 = bignum_sub(bignum_i64_to_big(a.u.i), bignum_i64_to_big(b.u.i));
+    return v_from_bignum(r2);
+  }
+  if (a_is_int(a) && a_is_int(b)) {
+    BigNum *ta = (a.tag == V_INT) ? bignum_i64_to_big(a.u.i)
+                                  : bignum_clone_ref(a.u.bn);
+    BigNum *tb = (b.tag == V_INT) ? bignum_i64_to_big(b.u.i)
+                                  : bignum_clone_ref(b.u.bn);
+    BigNum *r = bignum_sub(ta, tb);
+    bignum_unref(ta);
+    bignum_unref(tb);
+    return v_from_bignum(r);
   }
   if (!a_is_num(a) || !a_is_num(b)) {
     a_num_fail(a, b);
     return v_nil();
   }
-  double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
+  double x = as_f64(&a);
+  if (g_err)
+    return v_nil();
+  double y = as_f64(&b);
+  if (g_err)
+    return v_nil();
   return v_float(x - y);
 }
 static inline Value a_mul(Value a, Value b) {
   if (a.tag == V_INT && b.tag == V_INT) {
     int64_t r;
     if (checked_mul(a.u.i, b.u.i, &r))
-      return v_int(r);
-    return v_float((double)a.u.i * (double)b.u.i);
+      return v_int(r); /* fast path: no allocation, no overflow */
+    BigNum *r2 = bignum_mul(bignum_i64_to_big(a.u.i), bignum_i64_to_big(b.u.i));
+    return v_from_bignum(r2);
+  }
+  if (a_is_int(a) && a_is_int(b)) {
+    BigNum *ta = (a.tag == V_INT) ? bignum_i64_to_big(a.u.i)
+                                  : bignum_clone_ref(a.u.bn);
+    BigNum *tb = (b.tag == V_INT) ? bignum_i64_to_big(b.u.i)
+                                  : bignum_clone_ref(b.u.bn);
+    BigNum *r = bignum_mul(ta, tb);
+    bignum_unref(ta);
+    bignum_unref(tb);
+    return v_from_bignum(r);
   }
   if (!a_is_num(a) || !a_is_num(b)) {
     a_num_fail(a, b);
     return v_nil();
   }
-  double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
+  double x = as_f64(&a);
+  if (g_err)
+    return v_nil();
+  double y = as_f64(&b);
+  if (g_err)
+    return v_nil();
   return v_float(x * y);
 }
 static inline Value a_div(Value a, Value b) {
@@ -3914,68 +4720,97 @@ static inline Value a_div(Value a, Value b) {
     a_num_fail(a, b);
     return v_nil();
   }
-  double x = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  double y = b.tag == V_INT ? (double)b.u.i : b.u.f;
+  double x = as_f64(&a);
+  if (g_err)
+    return v_nil();
+  double y = as_f64(&b);
+  if (g_err)
+    return v_nil();
   if (y == 0.0) {
     set_err("division by zero");
     return v_nil();
   }
   return v_float(x / y);
 }
-static inline int a_cmp_ok(Value a, Value b, double *px, double *py) {
+/* Exact numeric ordering for the a_* comparison hot paths: int-vs-int (incl.
+ * V_BIGINT) is compared exactly, never through f64; anything with a float goes
+ * through f64 (mirrors the interpreter's compare()). op: 0 <, 1 >, 2 <=, 3 >=.
+ * Returns 1/0, or -1 on error (NaN / non-number). */
+static inline int a_cmp_op(Value a, Value b, int op) {
+  if (a_is_int(a) && a_is_int(b)) {
+    int c = int_order(&a, &b);
+    switch (op) {
+    case 0:
+      return c < 0;
+    case 1:
+      return c > 0;
+    case 2:
+      return c <= 0;
+    default:
+      return c >= 0;
+    }
+  }
   if (!a_is_num(a) || !a_is_num(b)) {
     a_num_fail(a, b);
-    return 0;
+    return -1;
   }
-  *px = a.tag == V_INT ? (double)a.u.i : a.u.f;
-  *py = b.tag == V_INT ? (double)b.u.i : b.u.f;
-  if (isnan(*px) || isnan(*py)) {
+  double x = as_f64(&a);
+  if (g_err)
+    return -1;
+  double y = as_f64(&b);
+  if (g_err)
+    return -1;
+  if (isnan(x) || isnan(y)) {
     set_err("cannot compare NaN");
-    return 0;
+    return -1;
   }
-  return 1;
+  switch (op) {
+  case 0:
+    return x < y;
+  case 1:
+    return x > y;
+  case 2:
+    return x <= y;
+  default:
+    return x >= y;
+  }
 }
 static inline Value a_lt(Value a, Value b) {
-  double x, y;
-  if (!a_cmp_ok(a, b, &x, &y))
-    return v_nil();
-  return v_bool(x < y);
+  int r = a_cmp_op(a, b, 0);
+  return r < 0 ? v_nil() : v_bool(r);
 }
 static inline Value a_gt(Value a, Value b) {
-  double x, y;
-  if (!a_cmp_ok(a, b, &x, &y))
-    return v_nil();
-  return v_bool(x > y);
+  int r = a_cmp_op(a, b, 1);
+  return r < 0 ? v_nil() : v_bool(r);
 }
 static inline Value a_le(Value a, Value b) {
-  double x, y;
-  if (!a_cmp_ok(a, b, &x, &y))
-    return v_nil();
-  return v_bool(x <= y);
+  int r = a_cmp_op(a, b, 2);
+  return r < 0 ? v_nil() : v_bool(r);
 }
 static inline Value a_ge(Value a, Value b) {
-  double x, y;
-  if (!a_cmp_ok(a, b, &x, &y))
-    return v_nil();
-  return v_bool(x >= y);
+  int r = a_cmp_op(a, b, 3);
+  return r < 0 ? v_nil() : v_bool(r);
 }
 static inline Value a_eq2(Value a, Value b) { return v_bool(values_eq(&a, &b)); }
 static inline Value a_mod(Value a, Value b) {
-  if (a.tag != V_INT || b.tag != V_INT) {
+  if (!a_is_int(a) || !a_is_int(b)) {
     set_err("mod expects (mod int int)");
     return v_nil();
   }
-  int64_t x = a.u.i, y = b.u.i;
-  if (y == 0) {
+  BigNum *ta = (a.tag == V_INT) ? bignum_i64_to_big(a.u.i)
+                                : bignum_clone_ref(a.u.bn);
+  BigNum *tb = (b.tag == V_INT) ? bignum_i64_to_big(b.u.i)
+                                : bignum_clone_ref(b.u.bn);
+  if (bignum_is_zero(tb)) {
     set_err("mod by zero");
+    bignum_unref(ta);
+    bignum_unref(tb);
     return v_nil();
   }
-  if (y == -1)
-    return v_int(0);
-  int64_t r = x % y;
-  if (r < 0)
-    r += (y < 0) ? -y : y; /* Euclidean: result in [0, |y|) */
-  return v_int(r);
+  BigNum *r = bignum_mod(ta, tb);
+  bignum_unref(ta);
+  bignum_unref(tb);
+  return v_from_bignum(r);
 }
 
 /* Copy a dense slot and take a ref (yields an owned Value). */

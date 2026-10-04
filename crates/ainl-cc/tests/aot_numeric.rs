@@ -3,16 +3,12 @@
 //!
 //! The interpreter's integers are arbitrary-precision (`BigNum`), so
 //! `9223372036854775807 + 1` is exactly `9223372036854775808` — not C's
-//! undefined signed-overflow wrapping. Anything the two disagree on is a real
-//! compiler bug, so each case is asserted against the interpreter's own output
-//! rather than a hardcoded string.
-//!
-//! **Known gap:** the C runtime still implements the *old* "i64 promoting to
-//! `f64` on overflow" model, so results outside `i64` range come back as a
-//! float where the interpreter now prints exact digits. That divergence is
-//! tracked in docs/NUMERIC_MODEL.md and pinned (not hidden) by
-//! `out_of_i64_range_is_a_known_aot_gap`; every in-range case — all the example
-//! programs — must still agree exactly.
+//! undefined signed-overflow wrapping. The AOT C runtime now carries the same
+//! arbitrary-precision integer (a hand-written zero-dep bignum in
+//! `runtime.c`), so *every* case in this suite — in-range and out-of-range
+//! alike — must agree with the interpreter byte-for-byte. Anything the two
+//! disagree on is a real compiler bug, so each case is asserted against the
+//! interpreter's own output rather than a hardcoded string.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,21 +58,8 @@ fn compile_aot(src: &str, name: &str) -> PathBuf {
 /// return value can't be used to check what was printed. Errors are compared
 /// too (both must fail), so a divergence in error handling is also caught.
 ///
-/// # Known gap: values outside `i64`
-///
-/// The C runtime still implements the *old* "i64 promoting to `f64` on
-/// overflow" model, while the interpreter moved to arbitrary-precision
-/// integers (`BigNum`, see docs/NUMERIC_MODEL.md). So any expression whose
-/// result leaves `i64` range prints a float from the AOT binary and exact
-/// digits from the interpreter, and `assert_same` fails for it.
-///
-/// `same_only_in_i64_range` is `assert_same` for the expressions that stay in
-/// range — which is every example program and everything
-/// `scripts/check-transpile.sh` covers. The out-of-range cases are pinned by
-/// `out_of_i64_range_is_a_known_aot_gap` below, which asserts the *shape* of
-/// the divergence (AOT prints a float, the interpreter prints exact digits)
-/// rather than pretending they agree. Closing this needs the C runtime to gain
-/// arbitrary-precision integers; tracked in docs/NUMERIC_MODEL.md.
+/// This is the full-parity assertion: the AOT C runtime is arbitrary-precision
+/// like the interpreter, so it holds for every integer, in-range and not.
 fn assert_same(expr: &str) {
     let src = format!("(print {expr})\n");
     // Unique per case: the tests run in parallel, and the temp paths below are
@@ -159,6 +142,8 @@ fn interpreter_stdout(src: &str, name: &str) -> String {
 }
 
 /// Run `(print <expr>)` on both sides and return `(aot_stdout, interp_stdout)`.
+/// Used by the out-of-range exactness test to assert the interpreter's digits
+/// independently of the AOT binary.
 fn both_stdout(expr: &str) -> (String, String) {
     let src = format!("(print {expr})\n");
     let bin = compile_aot(&src, &format!("gap{:x}", stable_hash(expr.as_bytes())));
@@ -225,21 +210,15 @@ fn in_range_at_the_i64_boundary_matches_interpreter() {
 }
 
 #[test]
-fn out_of_i64_range_is_a_known_aot_gap() {
-    // The other half of the boundary: results that leave i64 range. The
-    // interpreter is arbitrary-precision now (`BigNum`) and prints exact
-    // digits; the C runtime still promotes to f64 and prints a float.
+fn out_of_i64_range_is_exact_on_aot() {
+    // The half of the boundary that used to be the AOT gap: results that leave
+    // i64 range. The interpreter is arbitrary-precision (`BigNum`) and prints
+    // exact digits; the C runtime now carries the same bignum, so it must
+    // print the *same* digits — no `.0`, no exponent, no wrap, no trap.
     //
-    // This is a *known, tracked* divergence, not an untested accident — so it
-    // is pinned rather than left to fail as a surprise. If the C runtime gains
-    // arbitrary-precision integers these two sides will converge and this test
-    // will fail loudly, which is the signal to delete it (and to drop
-    // `assert_same` from the in-range lists above).
-    //
-    // What is asserted here is the *shape* of the gap and its boundary: each
-    // expression must round-trip through the interpreter as an exact integer,
-    // and the AOT binary must produce the same digits with a `.0` (or an
-    // exponent for the very large ones) rather than wrapping or trapping.
+    // Each case is asserted twice: against the interpreter (byte-for-byte,
+    // via `assert_same`) and against the known exact decimal (via
+    // `both_stdout`), so a regression in either engine is caught.
     let cases = [
         ("(+ 9223372036854775807 1)", "9223372036854775808"),
         ("(- -9223372036854775808 1)", "-9223372036854775809"),
@@ -264,25 +243,12 @@ fn out_of_i64_range_is_a_known_aot_gap() {
         ),
     ];
     for (expr, want) in cases {
+        // Byte-for-byte parity with the interpreter.
+        assert_same(expr);
+        // And the exact digits, independently of either engine's formatting.
         let (aot, interp) = both_stdout(expr);
-        // The interpreter is exact: plain decimal digits, no `.0`, no exponent.
         assert_eq!(interp, want, "interpreter is not exact for `{expr}`");
-        assert!(
-            !aot.contains('.') || aot.parse::<f64>().is_ok(),
-            "aot produced something unparseable for `{expr}`: {aot:?}"
-        );
-        // The AOT binary still returns a float for the same expression — that
-        // is the gap. It must at least be the same *number*, just rendered as
-        // a float, so the gap is a representation difference and not a wrong
-        // value.
-        let aot_f: f64 = aot
-            .parse()
-            .unwrap_or_else(|_| panic!("aot output for `{expr}` is not numeric: {aot:?}"));
-        let want_f: f64 = want.parse().expect("test literal is numeric");
-        assert_eq!(
-            aot_f, want_f,
-            "aot value for `{expr}` is not just a representation difference"
-        );
+        assert_eq!(aot, want, "AOT is not exact for `{expr}`");
     }
 }
 

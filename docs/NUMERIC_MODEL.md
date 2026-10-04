@@ -87,38 +87,40 @@ integer arithmetic, the `i64` boundary in `+`/`-`/`*`, float shortest-round-trip
 formatting (`(/ 1.0 3)`, `(+ 0.1 0.2)`), int/float mixing and cross-type
 comparison, and runtime type errors.
 
-**Known gap (tracked, not fixed here).** The C runtime still implements the
-*old* "i64 promoting to `f64` on overflow" model, so on values outside `i64`
-range it now diverges from the interpreter: the C runtime's own overflow test
-is correct for the model it implements (it neither wraps nor traps), but it
-prints a float where the interpreter now prints exact digits. For example
-`(+ 9223372036854775807 1)` gives `9223372036854775808` in the interpreter and
-`9223372036854775808.0` from the AOT binary. Two of the cases in
-`aot_numeric.rs` (`i64_overflow_promotes_to_float_not_wrap` and
-`int64_min_magnitude_boundary`) are the ones that cross the boundary and are
-therefore expected to fail until the C runtime gains arbitrary-precision
-integers. The in-range cases — every example program, and everything
-`scripts/check-transpile.sh` covers — still agree exactly, which is what the
-rest of that file's tests assert.
+**Closed.** The C runtime now carries the same arbitrary-precision integer as
+the interpreter: a hand-written, zero-dependency bignum in
+`crates/ainl-cc/src/runtime.c` (signed-magnitude, 32-bit limbs, with an
+allocation-free `i64` fast path that keeps the common small-integer case off
+the heap). An operation that leaves `i64` range widens to a bignum and stays
+exact, so `(+ 9223372036854775807 1)` now prints `9223372036854775808` from the
+AOT binary — the same digits the interpreter prints, no `.0`, no exponent, no
+wrap, no trap. The old "promote to `f64` on overflow" model is gone from the C
+runtime, and the two cases that used to cross the boundary
+(`aot_numeric.rs::out_of_i64_range_is_exact_on_aot`,
+`aot_stdlib.rs::aot_abs_of_i64_min_is_exact`) now assert *exact* parity with the
+interpreter instead of pinning the divergence.
 
 Writing the C runtime to that model surfaced three genuine defects, all of which
-returned plausible-looking wrong answers rather than failing loudly (they were
-bugs under the old promoting-to-`f64` model, and remain bugs of the same kind
-under the new one — the C runtime still implements the promoting model):
+returned plausible-looking wrong answers rather than failing loudly:
 
 - `(* 2 -9223372036854775808)` returned `0` instead of
-  `-18446744073709551616.0`. The overflow check computed the unsigned magnitude
+  `-18446744073709551616`. The overflow check computed the unsigned magnitude
   product first — `2 × 2^63` wraps `uint64` to `0` — and the wrapped `0` then
   *passed* the range test. The check is now a division (`ub > limit / ua`), so
   the product is formed only once it is known to fit.
 - Any product landing exactly on `2^63` in magnitude (e.g.
-  `(* -1 -9223372036854775808)`, which is in range and equals
-  `9223372036854775808.0`) hit `-(int64_t)ur`, which is undefined behaviour at
-  that magnitude (not representable as `int64_t`); clang folded it to `0`.
+  `(* -1 -9223372036854775808)`) hit `-(int64_t)ur`, which is undefined
+  behaviour at that magnitude (not representable as `int64_t`); clang folded it
+  to `0`.
 - The hot-path arithmetic inlines (`a_add`/`a_sub2`/`a_mul`/`a_div`) skipped the
   operand type check, reinterpreting a `V_STR`'s pointer as a `double`. That is
   a silent union-type-confusion read — `(+ 1 "a")` returned `1.0` rather than
   raising `expected a number, got str`.
+
+The bignum port also had to keep the AOT compute loop at its pre-bignum speed:
+`numeric_fold` (the `+`/`*` hot path) now does checked `i64` accumulation with
+no allocation and only widens to the bignum path when an operand actually
+overflows `i64`, so `aot_perf.rs`'s 30×-faster-than-tree-walk gate still holds.
 
 So the transpiler divergence table above is a property of *cross-language*
 targets; within the AINL toolchain (interpreter, bytecode VM, and AOT binary)
@@ -172,18 +174,18 @@ drift.
 
 ## Options for what is still open (tracked here for whoever picks it up)
 
-1. **Make the AOT C runtime arbitrary-precision**, matching the interpreter.
-   Same reasoning as the interpreter change, in `crates/ainl-cc/src/runtime.c`:
-   the emitted C would need a small bignum implementation and a dynamic `Value`
-   payload for the big case. This is what closes the remaining in-toolchain
-   gap, and the two failing cases in `aot_numeric.rs` are the fixture.
+1. ~~**Make the AOT C runtime arbitrary-precision**, matching the
+   interpreter.~~ **Done** — see "The AOT compiler targets the *interpreter's*
+   model" above. The C runtime now carries a zero-dependency bignum with an
+   `i64` fast path, and `aot_numeric.rs` / `aot_stdlib.rs` assert exact parity
+   out of `i64` range.
 2. **Make JS match**, by emitting `BigInt`-based arithmetic instead of native
    `number` for the JS target. Loses JS-native ergonomics (no mixing with
    `Math.*`, `JSON`, etc. without explicit conversion) in exchange for integer
    fidelity. This is the only remaining *cross-language* divergence.
-3. **Accept and scope the JS claim** (current state): the interpreter, the VM
-   and the Python/Ruby targets are exact for all integers; JavaScript is not,
-   because `f64` cannot be. §"Measured divergence" above is a regression
-   fixture (`crates/ainl-transpile/tests/numeric_divergence.rs`) so a future
-   change to any target's arithmetic doesn't silently drift without a test
-   noticing.
+3. **Accept and scope the JS claim** (current state): the interpreter, the VM,
+   the AOT binary and the Python/Ruby targets are exact for all integers;
+   JavaScript is not, because `f64` cannot be. §"Measured divergence" above is
+   a regression fixture (`crates/ainl-transpile/tests/numeric_divergence.rs`)
+   so a future change to any target's arithmetic doesn't silently drift without
+   a test noticing.
