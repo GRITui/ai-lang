@@ -239,12 +239,22 @@ impl BTree {
     /// would make `db-select` return whichever copy it happened to reach.
     pub fn insert(&mut self, k: &str, v: &str) -> bool {
         if self.get(k).is_some() {
-            // A replace is checked by the equality of the two probes rather
-            // than by a `Split` variant: the point of the assertion is that
-            // `insert_into` did not split, and `matches!` says that without
-            // needing `PartialEq` on a type that owns a whole node.
+            // The call is NOT inside the assert: `debug_assert!` is stripped in
+            // release, and the value update happens *inside* `insert_into`
+            // (`node.vals[i] = v.to_string()`). Gating the call on the assert
+            // made replace a silent no-op in the mode that ships — the old row
+            // survived a re-insert on the interpreter and the VM while the AOT
+            // C port updated it, a 3-backend parity violation. The call now
+            // runs in every profile; the assert only checks its result.
+            //
+            // The check stays a `matches!` on the `Split` variant rather than
+            // a comparison of the two probes, because the point of the
+            // assertion is that `insert_into` did not split, and `matches!`
+            // says that without needing `PartialEq` on a type that owns a
+            // whole node.
+            let s = Self::insert_into(&mut self.root, k, v);
             debug_assert!(
-                matches!(Self::insert_into(&mut self.root, k, v), Split::Nothing),
+                matches!(s, Split::Nothing),
                 "replacing a value cannot overflow a node"
             );
             return false;

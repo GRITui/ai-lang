@@ -65,6 +65,25 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+      # `cargo test` is DEBUG by default, and `debug_assert!` is stripped in
+      # release — so a test suite that only ever runs in debug cannot see a
+      # behavior that exists *only* in debug. That is not hypothetical: the
+      # B-tree's replace-on-an-existing-key path had its update gated behind a
+      # `debug_assert!` argument, so `db-insert` on an existing primary key
+      # overwrote the row in debug and silently kept the old row in release,
+      # while the AOT C port (an unconditional `if`) disagreed with both. The
+      # bug shipped because the whole suite was green in the one profile CI
+      # ran, and the three tests that caught it already existed.
+      #
+      # So the core lib runs in BOTH profiles. The release half is the gate;
+      # the debug half is kept because `debug_assert!`s elsewhere are real
+      # assertions, and `--lib` scopes this to the unit tests — the release
+      # profile of the parity suites shells out to the `ainl` CLI, which needs
+      # the release binary this job builds above, and that is covered by the
+      # `kv-aot` and `aot` jobs rather than duplicated here.
+      - name: Test (release profile — debug-only asserts hide release behavior)
+        run: cargo test --release -p ainl-core --lib --verbose
+
   transpile-equivalence:
     name: transpilers byte-equal (python · node · ruby)
     runs-on: ubuntu-latest

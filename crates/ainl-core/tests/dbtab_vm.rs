@@ -273,6 +273,177 @@ fn an_empty_table_survives_a_reopen_on_the_vm() {
     assert_eq!(i_out, "()", "the table must exist and be empty, not absent");
 }
 
+// ---- replace on an existing key --------------------------------------------
+
+/// Re-inserting an existing primary key replaces the row, on both evaluators.
+///
+/// # Why asserting that the two evaluators agree was not enough
+///
+/// The bug this pins had its update gated behind a `debug_assert!` argument in
+/// `BTree::insert`, so a replace ran in debug and was stripped in release: the
+/// old row survived a re-insert in the mode that ships, and the AOT C port —
+/// which used an unconditional `if` and was right in both — disagreed with
+/// both. `cargo test` is debug, so the entire suite was green.
+///
+/// The version of this test that only compared the interpreter against the VM
+/// would have stayed green too, and would have stayed green *under the bug*:
+/// the two evaluators share the table layer as the same Rust, so they agree by
+/// construction, and "both returned the stale row" is a perfectly consistent
+/// pair of answers. A parity test that cannot fail is a test that does not
+/// exist, so this one asserts the value — that `second` came back and `first`
+/// did not — on each evaluator separately, and then that they agree.
+#[test]
+fn replacing_an_existing_key_replaces_the_row_on_both_evaluators() {
+    let s = Scratch::new("replace");
+    let src = format!(
+        r#"(do
+      (def h (db-open "{path}"))
+      (def t (db-create-table h "t"))
+      (db-insert h t (list "k" "first"))
+      (db-insert h t (list "k" "second"))
+      (def got (list (db-select h t "k") (db-all-rows h t)))
+      (db-close h)
+      got)"#,
+        path = s.db()
+    );
+    let (i_out, i_err) = run_interp(&src);
+    assert!(i_err.is_none(), "the interpreter failed: {i_err:?}");
+    let (v_out, v_err) = run_vm(&src);
+    assert!(v_err.is_none(), "the VM failed: {v_err:?}");
+
+    // The value, on each evaluator. A dropped replace leaves the row present
+    // and single-keyed, so only the value distinguishes the two.
+    for (who, out) in [("interpreter", &i_out), ("VM", &v_out)] {
+        assert!(
+            out.contains("second"),
+            "the {who} kept the OLD row after re-inserting an existing primary \
+             key: {out}"
+        );
+        assert!(
+            !out.contains("first"),
+            "the {who} index still holds the replaced value: {out}"
+        );
+    }
+    assert_eq!(
+        i_out, v_out,
+        "the interpreter and the VM disagree on a replace"
+    );
+}
+
+/// The same replace in a tree deep enough that the replaced key is not in the
+/// root, so the update walks more than one level.
+///
+/// The first version of this test deleted `k007` and re-inserted it, and it
+/// **passed under the bug**. That was not luck and not a near miss: a
+/// `db-delete-row` removes the key from the tree, so the re-insert that follows
+/// is an insert of a *new* key and takes the code path below this `if`. The
+/// test was named "replaced a row" and was structurally incapable of exercising
+/// a replace. It is now a plain re-insert of a key that is still present,
+/// which is the operation `db-insert` documents as last-write-wins.
+#[test]
+fn a_replaced_row_comes_back_new_from_a_deep_tree() {
+    let s = Scratch::new("replace-deep");
+    let mut ins = String::new();
+    for i in (0..40).rev() {
+        ins.push_str(&format!("(db-insert h t (list \"k{i:03}\" {i}))\n"));
+    }
+    let src = format!(
+        r#"(do
+      (def h (db-open "{path}"))
+      (def t (db-create-table h "t"))
+      {ins}
+      (db-insert h t (list "k007" "replaced"))
+      (def got (list (db-select h t "k007") (db-all-rows h t)))
+      (db-close h)
+      got)"#,
+        path = s.db()
+    );
+    let (i_out, i_err) = run_interp(&src);
+    assert!(i_err.is_none(), "the interpreter failed: {i_err:?}");
+    let (v_out, v_err) = run_vm(&src);
+    assert!(v_err.is_none(), "the VM failed: {v_err:?}");
+
+    for (who, out) in [("interpreter", &i_out), ("VM", &v_out)] {
+        assert!(
+            out.contains("\"k007\" \"replaced\""),
+            "the {who} did not return the re-inserted value: {out}"
+        );
+        assert!(
+            !out.contains("\"k007\" 7"),
+            "the {who} returned the pre-replace value for a re-inserted key: {out}"
+        );
+    }
+    assert_eq!(
+        i_out, v_out,
+        "the interpreter and the VM disagree on a deep replace"
+    );
+}
+
+/// The replaced value has to be on disk, not only in the index a process is
+/// holding: close, reopen in a *separate* run, and the new value must be what
+/// comes back.
+///
+/// # This test cannot catch a live-index replace bug, and that is not a defect
+///
+/// It is a persistence gate, and it is worth saying what it is blind to
+/// because the blindness is structural rather than accidental.
+///
+/// `Db::put` maintains its own flat `HashMap<String, String>` index alongside
+/// the log — see `db.rs:339`, `self.index.insert(key, value)` on every write.
+/// That map is last-write-wins, so by the time a reopen calls
+/// `TableSet::rebuild`, the map already holds only the *newest* value for the
+/// key. `rebuild` therefore feeds the tree one insert per surviving key, and
+/// every one of them is an insert into an empty tree: the replace branch in
+/// `BTree::insert` is never reached, no matter what the bug in it is.
+///
+/// So a dropped replace is invisible to any reopen-based check, in every
+/// backend. What this test can catch is a replace that is not *durable* — a
+/// value that reads back correctly in-process and never reaches the file, which
+/// is a real and separate defect, and the reason
+/// `a_table_survives_a_reopen_on_the_vm` exists. The in-process tests above
+/// are what hold the replace path, and each was checked by reverting the fix
+/// and watching it fail.
+#[test]
+fn a_replaced_row_survives_a_reopen_on_the_vm() {
+    let s = Scratch::new("replace-reopen");
+    let path = s.db();
+    let write = format!(
+        r#"(do
+      (def h (db-open "{path}"))
+      (def t (db-create-table h "t"))
+      (db-insert h t (list "k" "first"))
+      (db-insert h t (list "k" "second"))
+      (db-close h))"#,
+        path = path
+    );
+    let (_, i_err) = run_interp(&write);
+    assert!(i_err.is_none(), "the interpreter write failed: {i_err:?}");
+
+    let read = format!(
+        r#"(do
+      (def h (db-open "{path}"))
+      (def got (list (db-select h "t" "k") (db-all-rows h "t")))
+      (db-close h)
+      got)"#,
+        path = path
+    );
+    let (i_out, i_err) = run_interp(&read);
+    assert!(i_err.is_none(), "the interpreter read failed: {i_err:?}");
+    let (v_out, v_err) = run_vm(&read);
+    assert!(v_err.is_none(), "the VM read failed: {v_err:?}");
+
+    for (who, out) in [("interpreter", &i_out), ("VM", &v_out)] {
+        assert!(
+            out.contains("second") && !out.contains("first"),
+            "the {who} did not read back the replaced value after a reopen: {out}"
+        );
+    }
+    assert_eq!(
+        i_out, v_out,
+        "the two evaluators disagree about a replaced row after a reopen"
+    );
+}
+
 /// Every table refusal, on both evaluators, with the same message.
 ///
 /// The message is compared after the interpreter's `runtime error: ` / `at line
