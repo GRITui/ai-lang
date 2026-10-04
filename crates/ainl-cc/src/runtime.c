@@ -5720,9 +5720,12 @@ static Value builtin_db_delete_row(Value *args, int nargs) {
 
 /* The grammar, quoted in every "not supported in v1" message. One string, so
  * the message cannot disagree with the parser about what is supported. Must
- * match SUBSET in dbquery.rs byte for byte. */
+ * match SUBSET in dbquery.rs byte for byte — dbq_aot.rs compares a refusal from
+ * each engine as bytes, so a space of difference here fails a test rather than
+ * a program. */
 #define DBQ_SUBSET                                                            \
-  "SELECT <* | col, ...> FROM <table> [WHERE <col> <op> <value> "               \
+  "SELECT <* | col, ...> FROM <table> [INNER|LEFT JOIN <table> ON "           \
+  "<alias>.<col> <op> <alias>.<col>] [WHERE <col> <op> <value> "              \
   "[AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]"
 
 typedef enum { DBQ_EQ, DBQ_NE, DBQ_LT, DBQ_LE, DBQ_GT, DBQ_GE } DbqOp;
@@ -5734,6 +5737,10 @@ typedef enum {
   DBQ_T_STR,
   DBQ_T_STAR,
   DBQ_T_COMMA,
+  /* The qualifier separator in a join's ON clause: `<table>.<position>`. Its own
+   * token because the two sides are read by different parsers — the left is a
+   * table name, the right a column number. Mirrors `Tok::Dot`. */
+  DBQ_T_DOT,
   DBQ_T_OP,
   DBQ_T_LPAREN,
   DBQ_T_RPAREN,
@@ -5772,6 +5779,36 @@ typedef struct DbqCond {
   struct DbqCond *a, *b;
 } DbqCond;
 
+/* ---- the join (Tier 5) ------------------------------------------------- */
+
+/* Which rows of the left table survive when the ON matches nothing. Mirrors
+ * `JoinKind` in dbquery.rs. */
+typedef enum { DBQ_INNER, DBQ_LEFT } DbqJoinKind;
+
+/* One side of a qualified column: the table it names and the position within
+ * *that* table's row. The name is a borrowed slice of the query — the builtin
+ * holds the query text for the whole call, so nothing here owns anything. */
+typedef struct {
+  const char *table;
+  int table_len;
+  DbqCol col;
+} DbqQualCol;
+
+typedef struct {
+  DbqQualCol left;
+  DbqOp op;
+  DbqQualCol right;
+} DbqOn;
+
+/* The join clause. One table pair only: a second JOIN would need the third
+ * table's columns at a known offset in the combined row, and v1 has no AS to
+ * name it, so the combined row is unambiguous only for two. */
+typedef struct {
+  DbqJoinKind kind;
+  char *table; /* malloc'd; freed by dbq_query_free */
+  DbqOn on;
+} DbqJoin;
+
 /* A parsed query. The projections are a fixed vector because the count is
  * bounded by the query text and a program that wants a million columns is not
  * a program this layer can help; the bound is named so the refusal is a
@@ -5779,10 +5816,12 @@ typedef struct DbqCond {
 #define DBQ_MAX_COLS 64
 
 typedef struct {
-  int star;              /* SELECT * */
-  int ncols;             /* else, the projection */
+  int star; /* SELECT * */
+  int ncols; /* else, the projection */
   DbqCol cols[DBQ_MAX_COLS];
   char *table; /* malloc'd; freed by dbq_query_free */
+  int has_join;
+  DbqJoin join; /* valid only when has_join */
   DbqCond *filter; /* malloc'd tree, or NULL */
   int has_order;
   DbqCol order_col;
@@ -5803,21 +5842,22 @@ static void dbq_cond_free(DbqCond *c) {
  * close-matches something legal is a typo with a fix, and only a word that
  * matches nothing legal is an out-of-scope construct. Mirrors UNSUPPORTED in
  * dbquery.rs — the two lists are asserted to have the same first column by
- * dbq_aot.rs, so a keyword added to one and not the other fails there. */
+ * dbq_aot.rs, so a keyword added to one and not the other fails there.
+ *
+ * `JOIN`, `INNER`, `LEFT` and `ON` are **not** here: Tier 5 made them parse, so
+ * they are part of the subset and belong in DBQ_SUBSET. The join types that stay
+ * out of scope remain, each with the words that could follow it, so `CROSS JOIN`
+ * is still named rather than ignored. */
 typedef struct {
   const char *kw;
   const char *next[8]; /* NULL-terminated */
 } DbqKw;
 
 static const DbqKw DBQ_UNSUPPORTED[] = {
-    {"JOIN", {"ON", "USING", "WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
-    {"INNER", {"JOIN", "ON", "WHERE", "ORDER", "LIMIT", NULL}},
-    {"LEFT", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
     {"RIGHT", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
     {"FULL", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
     {"OUTER", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
     {"CROSS", {"JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT", NULL}},
-    {"ON", {"WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
     {"USING", {"WHERE", "ORDER", "GROUP", "LIMIT", NULL}},
     {"GROUP", {"BY", "WHERE", "ORDER", "LIMIT", NULL}},
     {"HAVING", {"WHERE", "ORDER", "LIMIT", NULL}},
@@ -5870,10 +5910,18 @@ static const struct {
 };
 
 /* The words the subset does accept. A "did you mean" is only useful if the
- * reader can type the suggestion and have it accepted. Mirrors LEGAL_WORDS. */
-static const char *DBQ_LEGAL[] = {"SELECT", "FROM", "WHERE", "ORDER", "BY",
-                                   "LIMIT",  "ASC",   "DESC",  "AND",   "OR",
-                                   "true",   "false", "nil",   "null",  NULL};
+ * reader can type the suggestion and have it accepted. Mirrors LEGAL_WORDS.
+ *
+ * The join keywords are legal as of Tier 5, so a near miss of one (`JION`,
+ * `LFET`) is a typo with a fix rather than an unknown word — the same treatment
+ * `WHERE` gets. The order does not matter: `dbq_close_match` ranks by edit
+ * distance, then shared prefix, then alphabetically, so it is a total order that
+ * does not depend on the sequence here. */
+static const char *DBQ_LEGAL[] = {
+    "SELECT", "FROM",  "WHERE", "ORDER", "BY",   "LIMIT", "ASC",
+    "DESC",   "AND",   "OR",    "true",  "false", "nil",   "null",
+    /* Tier 5: the join grammar. */
+    "JOIN",   "INNER", "LEFT",  "ON",    NULL};
 
 /* A query error, built in one place. The four parts are in this order because a
  * reader who takes only the first sentence still knows the rule they broke.
@@ -6234,6 +6282,16 @@ static DbqTok *dbq_tokenize(const char *who, const char *sql, int *out_n) {
       col++;
       continue;
     }
+    /* A `.` is a qualifier separator. Reached only when it cannot be part of a
+     * number — the number path below consumes `1.5` whole, so a dot between a
+     * digit and a letter is this branch. Mirrors the `simple` match in
+     * dbquery.rs, which is reached on the same condition. */
+    if (c == '.') {
+      DBQ_PUSH(DBQ_T_DOT, sl, sc);
+      i++;
+      col++;
+      continue;
+    }
     if (c == '(') {
       DBQ_PUSH(DBQ_T_LPAREN, sl, sc);
       i++;
@@ -6427,6 +6485,9 @@ static char *dbq_describe(const DbqTok *t) {
     break;
   case DBQ_T_COMMA:
     snprintf(buf, sizeof(buf), "','");
+    break;
+  case DBQ_T_DOT:
+    snprintf(buf, sizeof(buf), "'.'");
     break;
   case DBQ_T_OP:
     snprintf(buf, sizeof(buf), "'%s'",
@@ -6737,9 +6798,231 @@ static int dbq_condition(DbqP *p, DbqCond **out) {
 
 static void dbq_query_free(DbqQuery *q) {
   free(q->table);
+  if (q->has_join) {
+    free(q->join.table);
+    q->join.table = NULL;
+    q->has_join = 0;
+  }
   dbq_cond_free(q->filter);
   q->table = NULL;
   q->filter = NULL;
+}
+
+/* ---- the join parser (Tier 5) ------------------------------------------ */
+
+/* A table name, taken **literally** — no keyword check, so a table called
+ * `order`, `key` or `group` is selectable. A keyword is a keyword only where the
+ * grammar expects one, and after `FROM` (or after `JOIN`) the grammar expects a
+ * name. `SELECT 1 FROM people GROUP BY 1` is still refused on `GROUP`, because
+ * by then `people` has been read and the clause loop is looking for a clause.
+ *
+ * A quoted name is accepted here too, as in `FROM`. */
+static int dbq_table_name(DbqP *p, char **out) {
+  DbqTok *t = dbq_peek(p);
+  DbqTok copy = *t;
+  char *s;
+  if (copy.kind != DBQ_T_WORD && copy.kind != DBQ_T_STR) {
+    char detail[512];
+    char *d = dbq_describe(&copy);
+    snprintf(detail, sizeof(detail), "expected a table name after FROM, got %s", d);
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  s = (char *)malloc((size_t)copy.text_len + 1);
+  if (!s) {
+    set_err("%s: out of memory", p->who);
+    return 0;
+  }
+  memcpy(s, copy.text, (size_t)copy.text_len);
+  s[copy.text_len] = 0;
+  p->i++;
+  *out = s;
+  return 1;
+}
+
+/* One side of an ON: `<table>.<position>`.
+ *
+ * The qualifier is **required** on both sides. A bare number here would be a
+ * column of the *combined* row, which does not exist yet while the join is being
+ * decided — so accepting one would be a reference to a row shape that depends on
+ * the answer. `left_name`/`right_name` are passed so the refusal can name the two
+ * tables the reader actually wrote.
+ *
+ * The table name is a borrowed slice of the query, not a copy: the builtin holds
+ * the query text for the whole call, so nothing here outlives it. */
+static int dbq_on_side(DbqP *p, const char *left_name, const char *right_name,
+                       DbqQualCol *out) {
+  DbqTok *t = dbq_peek(p);
+  DbqTok copy = *t;
+  DbqTok dot;
+  if (copy.kind != DBQ_T_WORD) {
+    char detail[512];
+    snprintf(detail, sizeof(detail),
+             "a column in a join's ON clause is written <table>.<column> — here "
+             "'%s' and '%s' — got %s",
+             left_name, right_name, dbq_describe(&copy));
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  out->table = copy.text;
+  out->table_len = copy.text_len;
+  p->i++;
+  dot = *dbq_peek(p);
+  if (dot.kind != DBQ_T_DOT) {
+    char detail[512];
+    snprintf(detail, sizeof(detail),
+             "expected '.' after '%.*s' in a join's ON clause, got %s — a column "
+             "in ON names the table it comes from",
+             out->table_len, out->table, dbq_describe(&dot));
+    dbq_error(p->who, p->sql, &dot, detail, NULL);
+    return 0;
+  }
+  p->i++;
+  return dbq_column(p, &out->col);
+}
+
+/* Is the next word one that starts a join clause this layer has?
+ *
+ * Only the three that begin a **supported** join. The out-of-scope types
+ * (`CROSS`, `RIGHT`, `FULL`, `OUTER`) and `USING` are deliberately absent, so
+ * they are not consumed here and fall through to the clause loop, which refuses
+ * them by name — a refusal that names the word the reader has to change is worth
+ * more than one that asks for an `ON` it could never have. */
+static int dbq_starts_join(DbqP *p) {
+  DbqTok *t = dbq_peek(p);
+  if (t->kind != DBQ_T_WORD)
+    return 0;
+  return dbq_streq_ci(t->text, "JOIN", t->text_len, 4) ||
+         dbq_streq_ci(t->text, "INNER", t->text_len, 5) ||
+         dbq_streq_ci(t->text, "LEFT", t->text_len, 4);
+}
+
+/* The join clause: `[INNER|LEFT] JOIN <table> ON <t1>.<col> <op> <t2>.<col>`.
+ * `left_table` is the table already read by `FROM`. */
+static int dbq_join(DbqP *p, const char *left_table, DbqJoin *out) {
+  DbqJoinKind kind = DBQ_INNER;
+  const char *spelled = "JOIN";
+  DbqTok *t;
+  DbqTok copy;
+  DbqOp op;
+  if (dbq_eat(p, "INNER")) {
+    kind = DBQ_INNER;
+    spelled = "INNER";
+  } else if (dbq_eat(p, "LEFT")) {
+    kind = DBQ_LEFT;
+    spelled = "LEFT";
+  }
+  /* A bare JOIN is an INNER join, which is SQL's own default. */
+  if (!dbq_eat(p, "JOIN")) {
+    /* `INNER t …` / `LEFT t …` — the type was written without its keyword. A
+     * missing word, not an unknown one, so it is named. */
+    char detail[512];
+    t = dbq_peek(p);
+    snprintf(detail, sizeof(detail), "%s must be followed by JOIN; got %s", spelled,
+             dbq_describe(t));
+    dbq_error(p->who, p->sql, t, detail, "JOIN");
+    return 0;
+  }
+  if (!dbq_table_name(p, &out->table))
+    return 0;
+  if (!dbq_keyword(p, "ON"))
+    return 0;
+  if (!dbq_on_side(p, left_table, out->table, &out->on.left))
+    return 0;
+  /* Only the six operators are legal here, and the sentence names all six. A word
+   * in this position is deliberately NOT routed to the keyword refusal: inside an
+   * ON the reader is mid-comparison, and naming the operators tells them what to
+   * type where "'IN' is not supported in v1" would send them looking for a clause
+   * they did not write. Mirrors the Rust `join`. */
+  t = dbq_peek(p);
+  copy = *t;
+  if (copy.kind != DBQ_T_OP) {
+    char detail[512];
+    snprintf(detail, sizeof(detail),
+             "expected one of '=', '!=', '<', '<=', '>', '>=' between the two columns "
+             "of a join's ON clause, got %s",
+             dbq_describe(&copy));
+    dbq_error(p->who, p->sql, &copy, detail, NULL);
+    return 0;
+  }
+  op = copy.op;
+  p->i++;
+  if (!dbq_on_side(p, left_table, out->table, &out->on.right))
+    return 0;
+  /* ON is exactly one comparison. A second one is a different query rather than a
+   * longer ON, and AND/OR are WHERE's job — so the word is consumed here and the
+   * refusal points at what follows it. */
+  if (dbq_eat(p, "AND") || dbq_eat(p, "OR")) {
+    char detail[512];
+    t = dbq_peek(p);
+    snprintf(detail, sizeof(detail),
+             "a join's ON clause is one comparison; AND and OR belong in WHERE");
+    dbq_error(p->who, p->sql, t, detail, NULL);
+    return 0;
+  }
+  out->kind = kind;
+  out->on.op = op;
+  return 1;
+}
+
+/* Are both ON qualifiers the two tables in this query?
+ *
+ * Checked here rather than in the evaluator so the message can name the two
+ * legal qualifiers: one that silently matched nothing would make every row a
+ * LEFT-join nil-pad, which reads as an answer rather than as a mistake.
+ *
+ * Both sides must also name **different** tables. With two different table names
+ * the qualifier check does not guarantee it — `FROM a JOIN b ON a.1 = a.2`
+ * qualifies both sides with `a`, which compares a column with itself and so
+ * matches every pair or none: a cross product, not a join. The same shape is a
+ * self-join (`FROM people JOIN people`), which v1 cannot express usefully
+ * because there is no AS to give the two copies different names. It is refused
+ * rather than answered, because a self-join whose two sides cannot be told apart
+ * has two plausible answers and the reader cannot tell which they got. */
+static int dbq_check_qualifiers(const char *who, const char *sql, const DbqQuery *q) {
+  const DbqQualCol *sides[2];
+  int i;
+  sides[0] = &q->join.on.left;
+  sides[1] = &q->join.on.right;
+  for (i = 0; i < 2; i++) {
+    const DbqQualCol *s = sides[i];
+    int ok_left = dbq_streq_ci(s->table, q->table, s->table_len, (int)strlen(q->table));
+    int ok_right = dbq_streq_ci(s->table, q->join.table, s->table_len,
+                                (int)strlen(q->join.table));
+    DbqTok at;
+    char detail[512];
+    if (ok_left || ok_right)
+      continue;
+    at.kind = DBQ_T_WORD;
+    at.text = s->table;
+    at.text_len = s->table_len;
+    at.line = s->col.line;
+    at.col = s->col.col;
+    snprintf(detail, sizeof(detail),
+             "'%.*s' is not a table in this join — a column in ON is qualified with "
+             "the name of one of the tables it joins, and these are '%s' and '%s'",
+             s->table_len, s->table, q->table, q->join.table);
+    dbq_error(who, sql, &at, detail, NULL);
+    return 0;
+  }
+  if (dbq_streq_ci(q->join.on.left.table, q->join.on.right.table,
+                   q->join.on.left.table_len, q->join.on.right.table_len)) {
+    DbqTok at;
+    char detail[512];
+    const DbqQualCol *s = &q->join.on.left;
+    at.kind = DBQ_T_WORD;
+    at.text = s->table;
+    at.text_len = s->table_len;
+    at.line = s->col.line;
+    at.col = s->col.col;
+    snprintf(detail, sizeof(detail),
+             "both sides of the ON comparison name '%.*s', so it compares a column "
+             "with itself — one side must be qualified with '%s' and the other with '%s'",
+             s->table_len, s->table, q->table, q->join.table);
+    dbq_error(who, sql, &at, detail, NULL);
+    return 0;
+  }
+  return 1;
 }
 
 /* Parse `sql` into `out`, or set g_err. Caller calls `dbq_query_free`. */
@@ -6806,26 +7089,47 @@ static int dbq_parse(const char *who, const char *sql, DbqQuery *out) {
   /* The table name, taken literally: no keyword check, so a table called
    * `order` or `key` is selectable. */
   copy = *dbq_peek(&p);
-  if (copy.kind == DBQ_T_WORD || copy.kind == DBQ_T_STR) {
-    out->table = (char *)malloc((size_t)copy.text_len + 1);
-    if (!out->table) {
-      set_err("%s: out of memory", who);
+  if (copy.kind == DBQ_T_LPAREN) {
+    dbq_unsupported(who, sql, &copy,
+                    "a subquery or a parenthesised table in FROM");
+    goto fail;
+  }
+  if (!dbq_table_name(&p, &out->table))
+    goto fail;
+
+  /* The join, if there is one. Read **before** the clause loop and only when the
+   * next word actually starts a supported join — the out-of-scope join types
+   * (`CROSS`, `RIGHT`, `FULL`, `OUTER`) and `USING` are *not* consumed here, so
+   * they fall through to the loop and are refused by name with the subset
+   * sentence. That is the difference between "JOIN is not supported in v1" and
+   * "'CROSS' is not supported in v1", and the second is the one that tells the
+   * reader which word to change. */
+  if (dbq_starts_join(&p)) {
+    if (!dbq_join(&p, out->table, &out->join))
+      goto fail;
+    out->has_join = 1;
+    if (!dbq_check_qualifiers(who, sql, out))
+      goto fail;
+    /* One join. A second is out of scope and is refused **by name**, here rather
+     * than by the clause loop below — which would report the second `JOIN` as an
+     * unexpected word, a sentence that is true but useless: `JOIN` on its own is
+     * legal, so the reader has no way to learn that it is the *second* one, or
+     * that three tables are what is out of scope.
+     *
+     * The reason three tables are out of scope is not effort: a position in `ON`
+     * resolves against a table, and after two joins a column's table does not
+     * tell you its offset in the combined row without the offsets of the tables
+     * before it. That is exactly what an alias would fix, and v1 has no `AS`. */
+    if (dbq_starts_join(&p)) {
+      DbqTok *t = dbq_peek(&p);
+      char detail[512];
+      snprintf(detail, sizeof(detail),
+               "a query may join **one** table in v1, so this is the second JOIN "
+               "clause \xe2\x80\x94 with three tables a column's name no longer says where it "
+               "sits in the combined row");
+      dbq_error(who, sql, t, detail, "JOIN");
       goto fail;
     }
-    memcpy(out->table, copy.text, (size_t)copy.text_len);
-    out->table[copy.text_len] = 0;
-    p.i++;
-  } else if (copy.kind == DBQ_T_LPAREN) {
-    dbq_unsupported(who, sql, &copy,
-                    "a subquery or a parenthesised table (a join) in FROM");
-    goto fail;
-  } else {
-    char detail[512];
-    char *d = dbq_describe(&copy);
-    snprintf(detail, sizeof(detail), "expected a table name after FROM, got %s",
-             d);
-    dbq_error(who, sql, &copy, detail, NULL);
-    goto fail;
   }
 
   /* The clauses, in the order SQL requires them. The order is enforced, not
@@ -7180,6 +7484,250 @@ static void dbq_collect_cb(const char *key, const char *val, void *ctx) {
   dbq_collect_push(c, val);
 }
 
+/* ---- the join evaluator (Tier 5) -------------------------------------- */
+
+/* Which of the two rows a qualified ON column refers to. Mirrors `Side`. */
+typedef enum { DBQ_SIDE_LEFT, DBQ_SIDE_RIGHT } DbqSide;
+
+/* Resolve a qualifier to a side.
+ *
+ * `left_table` is the query's first table and `right_table` the joined one. The
+ * Rust `parse` checks both qualifiers against both names and refuses the query
+ * before here, so the fallthrough is unreachable — it returns RIGHT rather than
+ * signalling, so the function is total and a future caller that skips the check
+ * gets a wrong-but-defined answer instead of reading past the end of anything.
+ * Mirrors `resolve_side`, which returns an error there. */
+static DbqSide dbq_side_of(const DbqQualCol *q, const char *left_table,
+                           const char *right_table) {
+  if (dbq_streq_ci(q->table, left_table, q->table_len, (int)strlen(left_table)))
+    return DBQ_SIDE_LEFT;
+  (void)right_table;
+  return DBQ_SIDE_RIGHT;
+}
+
+/* Does the ON hold for this pair of rows?
+ *
+ * The same comparison rules as a WHERE (`=` and `!=` never order, the four
+ * ordering operators need two orderable values and say so), because the values
+ * here are the same values and a second set of rules would be a second answer for
+ * the same comparison. A LEFT join's nil-padded right columns are only ever seen
+ * **after** a non-match, never in this function.
+ *
+ * Returns 1 for a match, 0 for no match, -1 with g_err set. The message is
+ * spelled the same as the Rust `eval_on` — the alias, the position, and both type
+ * names — because `dbq_aot.rs` compares it byte for byte. */
+static int dbq_eval_on(const char *who, const DbqOn *on, ConsCell *lrow, ConsCell *rrow,
+                      DbqSide lside, DbqSide rside) {
+  Value lval, rval, *lp, *rp;
+  char why[256];
+  int ord;
+  lp = dbq_nth(lside == DBQ_SIDE_LEFT ? lrow : rrow, on->left.col.idx);
+  rp = dbq_nth(rside == DBQ_SIDE_RIGHT ? rrow : lrow, on->right.col.idx);
+  lval = lp ? *lp : v_nil();
+  if (lp)
+    v_ref(&lval);
+  rval = rp ? *rp : v_nil();
+  if (rp)
+    v_ref(&rval);
+  ord = dbq_order_of(&lval, &rval, why, sizeof(why));
+  if (ord == 2) {
+    if (on->op == DBQ_EQ || on->op == DBQ_NE) {
+      int eq = values_eq(&lval, &rval);
+      if (lp)
+        v_unref(&lval);
+      if (rp)
+        v_unref(&rval);
+      return on->op == DBQ_NE ? !eq : eq;
+    }
+    set_err("%s: at line %u, col %u: the ON column %.*s.%d is a %s and %.*s.%d is a %s "
+            "\xe2\x80\x94 a column that is compared with <, <=, > or >= has to hold one "
+            "type in every row it is compared with (%s)",
+            who, on->left.col.line, on->left.col.col, on->left.table_len,
+            on->left.table, on->left.col.idx + 1, type_name(&lval),
+            on->right.table_len, on->right.table, on->right.col.idx + 1,
+            type_name(&rval), why);
+    if (lp)
+      v_unref(&lval);
+    if (rp)
+      v_unref(&rval);
+    return -1;
+  }
+  switch (on->op) {
+  case DBQ_EQ:
+    ord = ord == 0;
+    break;
+  case DBQ_NE:
+    ord = ord != 0;
+    break;
+  case DBQ_LT:
+    ord = ord < 0;
+    break;
+  case DBQ_LE:
+    ord = ord <= 0;
+    break;
+  case DBQ_GT:
+    ord = ord > 0;
+    break;
+  default:
+    ord = ord >= 0;
+    break;
+  }
+  if (lp)
+    v_unref(&lval);
+  if (rp)
+    v_unref(&rval);
+  return ord;
+}
+
+/* One row of the joined result: the left table's columns, then the right table's.
+ *
+ * `right` is NULL for a LEFT join's miss, and the padding is nil — the
+ * out-of-range-is-nil convention a projection already inherits, applied here to a
+ * row that genuinely does not have those columns. `right_width` is the widest row
+ * the right table has, so the padding is the same width whichever left row failed
+ * to match; otherwise a padded row's columns would depend on which left row it
+ * was, and two engines that walked the tables in a different order would disagree
+ * about the shape of the answer rather than its contents.
+ *
+ * Takes ownership of nothing: it refs each cell it copies and the caller unrefs
+ * the row with `v_unref`. Returns nil with g_err set on an allocation failure,
+ * which is why `who` is a parameter — the projection builder further down in
+ * `dbq_execute` is the other place that mallocs a flat array, and it names the
+ * builtin the same way. */
+static Value dbq_concat(const char *who, ConsCell *lrow, ConsCell *rrow, int right_width) {
+  Value *flat;
+  int lwidth = lrow ? lrow->len : 0;
+  int total = lwidth + (rrow ? rrow->len : right_width);
+  int j = 0;
+  Value out;
+  ConsCell *cur;
+  flat = (Value *)malloc(sizeof(Value) * (size_t)(total ? total : 1));
+  if (!flat) {
+    set_err("%s: out of memory", who);
+    return v_nil();
+  }
+  for (cur = lrow; cur && cur->len > 0; cur = cur->tail) {
+    flat[j++] = cur->head;
+    v_ref(&flat[j - 1]);
+  }
+  for (cur = rrow; cur && cur->len > 0; cur = cur->tail) {
+    flat[j++] = cur->head;
+    v_ref(&flat[j - 1]);
+  }
+  /* The padding. `total - j` is `right_width` when `rrow` is NULL, because
+   * `total` was computed as `lwidth + right_width` on that path. */
+  while (j < total) {
+    flat[j++] = v_nil();
+  }
+  out = v_list_from_array(flat, total);
+  free(flat);
+  return out;
+}
+
+/* The nested loop: every row of the left table against every row of the right.
+ *
+ * **Left first, then right** — SQL's own order, and what makes the output
+ * deterministic without a sort. Both inputs are already in primary-key order (the
+ * B-tree walk), so the pairs come out left-major, right-minor.
+ *
+ * An INNER join emits only the pairs the ON holds. A LEFT join emits every left
+ * row, and a left row with no match is padded with nil in the right table's
+ * columns — **once**, no matter how many right rows failed, which is the
+ * difference between a left join and a cross product that was filtered.
+ *
+ * A right table with no rows is not an error: an INNER join of it returns nothing
+ * and a LEFT join returns every left row nil-padded, which is the only answer
+ * that is right.
+ *
+ * On success `*out` is a malloc'd array of `*n` rows, each owning one ref per
+ * cell, which the caller frees with `dbq_rows_free`. Returns 0 with g_err set on
+ * a decode failure, a comparison failure, or an allocation failure. */
+struct DbqJoinRows {
+  Value *rows;
+  int n;
+  int cap;
+};
+
+/* Append a row, taking ownership of its refs.
+ *
+ * Returns 0 on an allocation failure, having **unref'd** `row` — so a caller that
+ * bails out on 0 has not leaked the row it just built. Doing the unref here rather
+ * than at the call site is the point: there are two call sites, and a future one
+ * that forgot would leak a whole combined row per failed pair without any test
+ * noticing (a leak is invisible in a passing run). */
+static int dbq_join_push(struct DbqJoinRows *jr, Value row) {
+  if (jr->n >= jr->cap) {
+    Value *grown;
+    jr->cap = jr->cap ? jr->cap * 2 : 16;
+    grown = (Value *)realloc(jr->rows, sizeof(Value) * (size_t)jr->cap);
+    if (!grown) {
+      v_unref(&row);
+      return 0;
+    }
+    jr->rows = grown;
+  }
+  jr->rows[jr->n++] = row;
+  return 1;
+}
+
+static void dbq_join_rows_free(struct DbqJoinRows *jr) {
+  int i;
+  for (i = 0; i < jr->n; i++)
+    v_unref(&jr->rows[i]);
+  free(jr->rows);
+  jr->rows = NULL;
+  jr->n = 0;
+  jr->cap = 0;
+}
+
+static int dbq_nested_loop(const char *who, const char *left_table, const DbqJoin *join,
+                           Value *left, int nleft, Value *right, int nright,
+                           struct DbqJoinRows *jr) {
+  DbqSide lside = dbq_side_of(&join->on.left, left_table, join->table);
+  DbqSide rside = dbq_side_of(&join->on.right, left_table, join->table);
+  int right_width = 0;
+  int i, j;
+  /* The widest right row, so a padded row has the same shape as a matched one —
+   * floored at the position the ON clause names on this table. The floor is what
+   * a **LEFT** join of an *empty* table pads to: measured alone it says zero, and
+   * then the combined row would be just the left table's columns and `SELECT 4`
+   * would answer nil for a column the query plainly referenced. The parser has
+   * already refused a query whose two qualifiers are the same, so exactly one of
+   * the two sides names the joined table. Mirrors `widest` in dbquery.rs. */
+  for (j = 0; j < nright; j++)
+    if (right[j].u.l && right[j].u.l->len > right_width)
+      right_width = right[j].u.l->len;
+  if (dbq_streq_ci(join->on.right.table, join->table, join->on.right.table_len,
+                   (int)strlen(join->table))) {
+    if (join->on.right.col.idx + 1 > right_width)
+      right_width = join->on.right.col.idx + 1;
+  } else if (join->on.left.col.idx + 1 > right_width) {
+    right_width = join->on.left.col.idx + 1;
+  }
+  for (i = 0; i < nleft; i++) {
+    int matched = 0;
+    for (j = 0; j < nright; j++) {
+      int r = dbq_eval_on(who, &join->on, left[i].u.l, right[j].u.l, lside, rside);
+      if (r < 0)
+        return 0;
+      if (!r)
+        continue;
+      matched = 1;
+      if (!dbq_join_push(jr, dbq_concat(who, left[i].u.l, right[j].u.l, right_width)))
+        return 0;
+      if (g_err)
+        return 0;
+    }
+    if (!matched && join->kind == DBQ_LEFT) {
+      if (!dbq_join_push(jr, dbq_concat(who, left[i].u.l, NULL, right_width)))
+        return 0;
+      if (g_err)
+        return 0;
+    }
+  }
+  return 1;
+}
+
 static Value dbq_execute(Db *db, const char *who, const char *sql, int want_count) {
   DbqQuery q;
   DbtSet *s;
@@ -7201,9 +7749,14 @@ static Value dbq_execute(Db *db, const char *who, const char *sql, int want_coun
 
   /* The rows to consider: one point lookup, or the tree's own walk — the
    * latter already in primary-key order, which is what makes the sort below
-   * stable *and* what makes an unordered query's output deterministic. */
-  if (q.filter && q.filter->kind == DBQ_CMP && q.filter->cmp.left.idx == 0 &&
-      q.filter->cmp.op == DBQ_EQ &&
+   * stable *and* what makes an unordered query's output deterministic.
+   *
+   * A join never takes the lookup path: the index answers about **one** table,
+   * and a joined query reads two. Taking it would ignore the second table, which
+   * is the one answer a join can never give. Mirrors `index_literal`, which
+   * returns None for a join on the Rust side. */
+  if (!q.has_join && q.filter && q.filter->kind == DBQ_CMP &&
+      q.filter->cmp.left.idx == 0 && q.filter->cmp.op == DBQ_EQ &&
       q.filter->cmp.right.tag != V_LIST && q.filter->cmp.right.tag != V_MAP) {
     /* The one shape that reads a single key: `WHERE 1 = <scalar>`. Column 1
      * is the primary key, so this is the B-tree lookup `db-select` does, and
@@ -7260,6 +7813,68 @@ static Value dbq_execute(Db *db, const char *who, const char *sql, int want_coun
     free(rows);
     dbq_query_free(&q);
     return v_nil();
+  }
+
+  /* The join, before the WHERE. The order matters and is not negotiable: a WHERE
+   * on a joined query addresses the **combined** row, so it can only be evaluated
+   * once the two rows have been combined. Filtering the left table first would be
+   * faster, and would silently change the answer for any query whose WHERE names
+   * a right-table column. Mirrors the `match &q.join` stage in `execute`. */
+  if (q.has_join) {
+    DbtTable *rt = dbt_set_find(s, q.join.table);
+    struct DbqCollect rc = {NULL, 0, 0, 0, 0};
+    struct DbqJoinRows jr = {NULL, 0, 0};
+    if (!rt) {
+      set_err("%s: no table named '%s' in this database", who, q.join.table);
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    dbt_walk(rt->tree->root, dbq_collect_cb, &rc);
+    if (rc.oom) {
+      free(rc.items);
+      set_err("%s: out of memory", who);
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    if (rc.failed) {
+      for (i = 0; i < rc.n; i++)
+        v_unref(&rc.items[i]);
+      free(rc.items);
+      set_err("%s: a row of '%s' is not readable; it was not written by db-insert",
+              who, q.join.table);
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    if (!dbq_nested_loop(who, q.table, &q.join, rows, nrows, rc.items, rc.n, &jr)) {
+      dbq_join_rows_free(&jr);
+      for (i = 0; i < rc.n; i++)
+        v_unref(&rc.items[i]);
+      free(rc.items);
+      for (i = 0; i < nrows; i++)
+        v_unref(&rows[i]);
+      free(rows);
+      dbq_query_free(&q);
+      return v_nil();
+    }
+    for (i = 0; i < rc.n; i++)
+      v_unref(&rc.items[i]);
+    free(rc.items);
+    /* `dbq_nested_loop` owns nothing from `rows` — it copies cells — so the left
+     * rows are released here and the joined rows take their place. */
+    for (i = 0; i < nrows; i++)
+      v_unref(&rows[i]);
+    free(rows);
+    rows = jr.rows;
+    nrows = jr.n;
   }
 
   /* The filter, in one pass that compacts in place.

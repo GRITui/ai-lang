@@ -74,6 +74,7 @@ pub const SQL_BUILTINS: &[&str] = &[DB_QUERY, DB_QUERY_COUNT];
 /// supported — the failure mode this module exists to prevent, which is exactly
 /// as likely to appear in a message as in a code path.
 pub const SUBSET: &str = "SELECT <* | col, ...> FROM <table> \
+[INNER|LEFT JOIN <table> ON <alias>.<col> <op> <alias>.<col>] \
 [WHERE <col> <op> <value> [AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]";
 
 /// Keywords v1 recognises and refuses, each with the words that could legally
@@ -85,16 +86,19 @@ pub const SUBSET: &str = "SELECT <* | col, ...> FROM <table> \
 /// when `ON` is a typo and "`JOIN` is not supported in v1" when it is not.
 /// Deciding that from the *next* token is what tells the two apart, and it is
 /// why this is a table rather than a list of words.
+///
+/// `JOIN`, `INNER`, `LEFT` and `ON` are **not** here: Tier 5 made them parse, so
+/// they are part of the subset and belong in [`SUBSET`]. The join types that stay
+/// out of scope remain, each with the words that could follow it, so
+/// `CROSS JOIN` is still named rather than ignored.
 const UNSUPPORTED: &[(&str, &[&str])] = &[
-    // Joins.
-    ("JOIN", &["ON", "USING", "WHERE", "ORDER", "GROUP", "LIMIT"]),
-    ("INNER", &["JOIN", "ON", "WHERE", "ORDER", "LIMIT"]),
-    ("LEFT", &["JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT"]),
+    // Join types outside v1. `RIGHT`/`FULL`/`OUTER`/`CROSS` and `USING` remain
+    // refused by name: the nested loop matches on one qualified comparison, and
+    // none of these can be expressed by it.
     ("RIGHT", &["JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT"]),
     ("FULL", &["JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT"]),
     ("OUTER", &["JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT"]),
     ("CROSS", &["JOIN", "ON", "USING", "WHERE", "ORDER", "LIMIT"]),
-    ("ON", &["WHERE", "ORDER", "GROUP", "LIMIT"]),
     ("USING", &["WHERE", "ORDER", "GROUP", "LIMIT"]),
     // Grouping and aggregation.
     ("GROUP", &["BY", "WHERE", "ORDER", "LIMIT"]),
@@ -164,6 +168,10 @@ const UNSUPPORTED: &[(&str, &[&str])] = &[
 const LEGAL_WORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "ASC", "DESC", "AND", "OR", "true", "false",
     "nil", "null",
+    // Tier 5. The join keywords are legal, so a near miss of one (`JION`, `LFET`)
+    // is a typo with a fix rather than an unknown word — the same treatment
+    // `WHERE` gets.
+    "JOIN", "INNER", "LEFT", "ON",
 ];
 
 /// The aggregate functions, refused with the name of the builtin that does the
@@ -232,6 +240,13 @@ enum Tok {
     Str(String),
     Star,
     Comma,
+    /// The qualifier separator in a join's `ON` clause: `<alias>.<position>`.
+    ///
+    /// Its own token rather than punctuation on the word, because the two sides
+    /// are read by different parsers — the left is a table name, the right is a
+    /// column number — and folding them into one token would mean re-lexing the
+    /// dot to tell a qualified reference from an unqualified one.
+    Dot,
     Op(CmpOp),
     LParen,
     RParen,
@@ -257,6 +272,7 @@ impl Token {
             Tok::Str(s) => format!("'{s}'"),
             Tok::Star => "'*'".to_string(),
             Tok::Comma => "','".to_string(),
+            Tok::Dot => "'.'".to_string(),
             Tok::Op(o) => format!("'{}'", o.text()),
             Tok::LParen => "'('".to_string(),
             Tok::RParen => "')'".to_string(),
@@ -305,11 +321,57 @@ enum Dir {
     Desc,
 }
 
+/// Which rows of the left table survive when the `ON` matches nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinKind {
+    Inner,
+    Left,
+}
+
+/// One side of a qualified column reference: `alias` is the table it came from,
+/// `col` the position **within that table's row**.
+#[derive(Clone, Debug)]
+struct QualCol {
+    /// Case-insensitive match, as everything else in the grammar is.
+    alias: String,
+    col: Col,
+}
+
+/// The `ON` clause: exactly one qualified comparison, `<a>.<c> <op> <b>.<c>`.
+///
+/// Both sides are qualified and both sides are columns, which is what makes a
+/// join different from a `WHERE`: a `WHERE` compares a column against a *value*
+/// and is evaluated once per row of one table, while an `ON` compares two tables'
+/// rows and is what decides whether the two are combined at all.
+#[derive(Clone, Debug)]
+struct OnCond {
+    left: QualCol,
+    op: CmpOp,
+    right: QualCol,
+}
+
+/// The join clause, if the query has one.
+///
+/// One table pair only: a second `JOIN` would need the third table's columns to
+/// sit at a known offset in the combined row, and v1 has no `AS` to name it, so
+/// the combined row is unambiguous only for two.
+#[derive(Clone, Debug)]
+struct Join {
+    kind: JoinKind,
+    /// The right table's name, taken literally like the first table's.
+    table: String,
+    on: OnCond,
+}
+
 #[derive(Clone, Debug)]
 struct Query {
     /// The projected columns, or `None` for `*`.
     cols: Option<Vec<Col>>,
     table: String,
+    /// The join, or `None` for a single-table query — which is bit-for-bit what
+    /// this layer did before Tier 5, so a query with no `JOIN` clause takes the
+    /// same path it always did.
+    join: Option<Join>,
     filter: Option<Cond>,
     order: Option<(Col, Dir)>,
     limit: Option<usize>,
@@ -324,6 +386,14 @@ impl Query {
     /// filtered by the rest, and pretending otherwise would be a filter that can
     /// disagree with the plan.
     fn index_literal(&self) -> Option<&Value> {
+        // A join reads two tables, so there is one B-tree that could answer it
+        // and no single key that would. Refused here rather than at the call
+        // site: the lookup and the join would otherwise share a path where the
+        // second table is silently ignored, which is the one answer a join can
+        // never give.
+        if self.join.is_some() {
+            return None;
+        }
         let Cond::One(c) = self.filter.as_ref()? else {
             return None;
         };
@@ -523,10 +593,13 @@ fn tokenize(who: &str, sql: &str) -> Result<Vec<Token>> {
             continue;
         }
 
-        // Single-character punctuation.
+        // Single-character punctuation. `.` is a qualifier separator, and it is
+        // only reached here when it cannot be part of a number — the number path
+        // above consumes `1.5` whole, so a dot after an integer is this branch.
         let simple = match c {
             b'*' => Some(Tok::Star),
             b',' => Some(Tok::Comma),
+            b'.' => Some(Tok::Dot),
             b'(' => Some(Tok::LParen),
             b')' => Some(Tok::RParen),
             _ => None,
@@ -945,7 +1018,7 @@ impl<'a> P<'a> {
             // "expected a value": the reader wrote SQL on purpose, and the
             // answer is that this layer has no subqueries.
             Tok::LParen => Err(unsupported(self.who, self.sql, &t, "a subquery as a value")),
-            Tok::Op(_) | Tok::RParen | Tok::Comma | Tok::Star => Err(sql_error(
+            Tok::Op(_) | Tok::RParen | Tok::Comma | Tok::Star | Tok::Dot => Err(sql_error(
                 self.who,
                 self.sql,
                 &t,
@@ -1052,6 +1125,183 @@ impl<'a> P<'a> {
         }
         Ok(Some(cols))
     }
+
+    /// A table name, taken **literally** — no keyword check, so a table called
+    /// `order`, `key` or `group` is selectable. This is the one place where
+    /// treating a word as a name regardless of its spelling is not merely
+    /// allowed but necessary: a keyword is a keyword only where the grammar
+    /// expects one, and after `FROM` the grammar expects a name.
+    ///
+    /// The same applies to the table a `JOIN` names. `FROM people GROUP BY 1` is
+    /// still refused on `GROUP`, because by then `people` has been read and the
+    /// clause loop is looking for a clause — not because `GROUP` is a keyword
+    /// that could have been a table name.
+    fn table_name(&mut self) -> Result<String> {
+        let t = self.peek().clone();
+        match t.tok.clone() {
+            Tok::Word(w) => {
+                self.next();
+                Ok(w)
+            }
+            Tok::Str(s) => {
+                self.next();
+                Ok(s)
+            }
+            // A parenthesised source is a subquery, which v1 does not have.
+            // Saying so beats "expected a table name": the reader wrote SQL on
+            // purpose, and the answer names the missing feature. A parenthesised
+            // *join* is the same thing here — v1 joins are spelled
+            // `… JOIN t2 ON …`, never `(SELECT …) JOIN t2`.
+            Tok::LParen => Err(unsupported(
+                self.who,
+                self.sql,
+                &t,
+                "a subquery or a parenthesised table in FROM",
+            )),
+            _ => Err(sql_error(
+                self.who,
+                self.sql,
+                &t,
+                format!("expected a table name after FROM, got {}", t.describe()),
+                None,
+            )),
+        }
+    }
+
+    /// One side of an `ON`: `<alias>.<position>`.
+    ///
+    /// The qualifier is **required** on both sides, and `left_name`/`right_name`
+    /// are the two table names so the refusal can name them: a bare number here
+    /// would be a column of the *combined* row, which does not exist yet while
+    /// the join is being decided — so accepting one would be a reference to a
+    /// row shape that depends on the answer.
+    fn on_side(&mut self, left_name: &str, right_name: &str) -> Result<QualCol> {
+        let t = self.peek().clone();
+        let Tok::Word(alias) = t.tok.clone() else {
+            return Err(sql_error(
+                self.who,
+                self.sql,
+                &t,
+                format!(
+                    "a column in a join's ON clause is written <table>.<column> — \
+                     here '{left_name}' and '{right_name}' — got {}",
+                    t.describe()
+                ),
+                None,
+            ));
+        };
+        self.next();
+        let dot = self.peek().clone();
+        if !matches!(dot.tok, Tok::Dot) {
+            return Err(sql_error(
+                self.who,
+                self.sql,
+                &dot,
+                format!(
+                    "expected '.' after '{alias}' in a join's ON clause, got {} — \
+                     a column in ON names the table it comes from",
+                    dot.describe()
+                ),
+                None,
+            ));
+        }
+        self.next();
+        let col = self.column()?;
+        Ok(QualCol { alias, col })
+    }
+
+    /// Is the next word one that starts a join clause this layer has?
+    ///
+    /// Only the three that begin a **supported** join. The out-of-scope types
+    /// are deliberately absent, so they are not consumed here and fall through to
+    /// the clause loop, which refuses them by name — a refusal that names the
+    /// word the reader has to change is worth more than one that asks for the
+    /// `ON` it can never have.
+    fn starts_join(&self) -> bool {
+        let Some(w) = self.peek().word() else {
+            return false;
+        };
+        matches!(w.to_ascii_uppercase().as_str(), "JOIN" | "INNER" | "LEFT")
+    }
+
+    /// The join clause: `[INNER|LEFT] JOIN <table> ON <t1>.<col> <op> <t2>.<col>`.
+    ///
+    /// `left_table` is the table already read by `FROM`. The join types v1 does
+    /// not have are **not** consumed here: `CROSS`/`RIGHT`/`FULL`/`OUTER` and
+    /// `USING` are refused by name through [`Self::refuse_unsupported`], so the
+    /// reader is told which word is out of scope rather than being asked for an
+    /// `ON` it could never satisfy.
+    fn join(&mut self, left_table: &str) -> Result<Join> {
+        let (kind, spelled) = if self.eat("INNER") {
+            (JoinKind::Inner, "INNER")
+        } else if self.eat("LEFT") {
+            (JoinKind::Left, "LEFT")
+        } else {
+            // A bare `JOIN` is an INNER join, which is SQL's own default.
+            (JoinKind::Inner, "JOIN")
+        };
+        if !self.eat("JOIN") {
+            // `INNER t …` / `LEFT t …` — the type was written without its
+            // keyword. A missing word, not an unknown one, so it is named.
+            let t = self.peek().clone();
+            return Err(sql_error(
+                self.who,
+                self.sql,
+                &t,
+                format!("{spelled} must be followed by JOIN; got {}", t.describe()),
+                Some("JOIN"),
+            ));
+        }
+        let right_table = self.table_name()?;
+        self.keyword("ON")?;
+        let on_left = self.on_side(left_table, &right_table)?;
+        let t = self.peek().clone();
+        // Only the six operators are legal here, and the sentence names all six.
+        // A word in this position is not routed to the keyword refusal: inside an
+        // `ON` the reader is mid-comparison, and "expected one of '=', '!=', …"
+        // tells them what to type where "'IN' is not supported in v1" would send
+        // them looking for a clause they did not write.
+        let op = match &t.tok {
+            Tok::Op(o) => *o,
+            _ => {
+                return Err(sql_error(
+                    self.who,
+                    self.sql,
+                    &t,
+                    format!(
+                        "expected one of '=', '!=', '<', '<=', '>', '>=' between the two \
+                         columns of a join's ON clause, got {}",
+                        t.describe()
+                    ),
+                    None,
+                ))
+            }
+        };
+        self.next();
+        let on_right = self.on_side(left_table, &right_table)?;
+        // `ON` is exactly one comparison. A second one is a different query
+        // rather than a longer `ON`, and `AND`/`OR` are `WHERE`'s job — so the
+        // word is consumed here and the refusal points at what follows it.
+        if self.eat("AND") || self.eat("OR") {
+            let t = self.peek().clone();
+            return Err(sql_error(
+                self.who,
+                self.sql,
+                &t,
+                "a join's ON clause is one comparison; AND and OR belong in WHERE",
+                None,
+            ));
+        }
+        Ok(Join {
+            kind,
+            table: right_table,
+            on: OnCond {
+                left: on_left,
+                op,
+                right: on_right,
+            },
+        })
+    }
 }
 
 /// Parse a query, or explain what is wrong with it and where.
@@ -1073,42 +1323,42 @@ fn parse(who: &str, sql: &str) -> Result<Query> {
     p.keyword("SELECT")?;
     let cols = p.projection()?;
     p.keyword("FROM")?;
+    let table = p.table_name()?;
 
-    // The table name. A quoted string or a bare word, taken **literally** — no
-    // keyword check, so a table called `order` or `key` is selectable. This is
-    // the one place where treating a word as a name regardless of its spelling
-    // is not merely allowed but necessary.
-    let t = p.peek().clone();
-    let table = match t.tok.clone() {
-        Tok::Word(w) => {
-            p.next();
-            w
-        }
-        Tok::Str(s) => {
-            p.next();
-            s
-        }
-        // A parenthesised source is a subquery or a join, and both are out of
-        // scope. Saying so is the whole difference between a model that knows
-        // what to do next and one that retries the same shape.
-        Tok::LParen => {
-            return Err(unsupported(
-                who,
-                sql,
-                &t,
-                "a subquery or a parenthesised table (a join) in FROM",
-            ))
-        }
-        _ => {
-            return Err(sql_error(
-                who,
-                sql,
-                &t,
-                format!("expected a table name after FROM, got {}", t.describe()),
-                None,
-            ))
-        }
+    // The join, if there is one. Read **before** the clause loop and only when
+    // the next word actually starts a join — the out-of-scope join types
+    // (`CROSS`, `RIGHT`, `FULL`, `OUTER`) and `USING` are *not* consumed here,
+    // so they fall through to the loop and are refused by name with the subset
+    // sentence. That is the difference between "JOIN is not supported in v1"
+    // and "'CROSS' is not supported in v1", and the second is the one that
+    // tells the reader which word to change.
+    let join = if p.starts_join() {
+        Some(p.join(&table)?)
+    } else {
+        None
     };
+    // One join. A second is out of scope and is refused **by name**, here rather
+    // than by the clause loop below — which would report the second `JOIN` as an
+    // unexpected word, a sentence that is true but useless: `JOIN` on its own is
+    // legal, so the reader has no way to learn that it is the *second* one, or
+    // that three tables are what is out of scope.
+    //
+    // The reason three tables are out of scope is not effort: a position in `ON`
+    // resolves against a table, and after two joins a column's table does not
+    // tell you its offset in the combined row without the offsets of the tables
+    // before it. That is exactly what an alias would fix, and v1 has no `AS`.
+    if p.starts_join() {
+        let t = p.peek().clone();
+        return Err(sql_error(
+            who,
+            sql,
+            &t,
+            "a query may join **one** table in v1, so this is the second JOIN \
+             clause — with three tables a column's name no longer says where it \
+             sits in the combined row",
+            Some("JOIN"),
+        ));
+    }
 
     let mut filter = None;
     let mut order = None;
@@ -1249,9 +1499,65 @@ fn parse(who: &str, sql: &str) -> Result<Query> {
         return Err(p.refuse_unsupported(&t));
     }
 
+    // The two `ON` qualifiers have to name the two tables actually in the query.
+    // An unknown qualifier is refused here rather than in the evaluator so the
+    // message can name the two legal ones: a qualifier that silently matched
+    // nothing would make every row a `LEFT`-join nil-pad, which reads as an
+    // answer rather than as a mistake.
+    if let Some(j) = &join {
+        for side in [&j.on.left, &j.on.right] {
+            if side.alias.eq_ignore_ascii_case(&table) || side.alias.eq_ignore_ascii_case(&j.table)
+            {
+                continue;
+            }
+            return Err(sql_error(
+                who,
+                sql,
+                &Token {
+                    tok: Tok::Word(side.alias.clone()),
+                    line: side.col.line,
+                    col: side.col.col,
+                },
+                format!(
+                    "'{}' is not a table in this join — a column in ON is qualified with \
+                     the name of one of the tables it joins, and these are '{}' and '{}'",
+                    side.alias, table, j.table
+                ),
+                None,
+            ));
+        }
+        // Both sides must come from **different tables**. With two different
+        // table names the check above does not guarantee it: `FROM a JOIN b ON
+        // a.1 = a.2` qualifies both sides with `a`, which compares a column with
+        // itself and so matches every pair or none — a cross product, not a join.
+        // The same shape appears in a self-join (`FROM people JOIN people`),
+        // which v1 cannot express usefully: there is no `AS`, so both copies
+        // share one name and neither can be named in `ON`. It is refused rather
+        // than answered, because a self-join whose two sides cannot be told apart
+        // has two plausible answers and the reader cannot tell which they got.
+        if j.on.left.alias.eq_ignore_ascii_case(&j.on.right.alias) {
+            return Err(sql_error(
+                who,
+                sql,
+                &Token {
+                    tok: Tok::Word(j.on.left.alias.clone()),
+                    line: j.on.left.col.line,
+                    col: j.on.left.col.col,
+                },
+                format!(
+                    "both sides of the ON comparison name '{}', so it compares a column with \
+                     itself — one side must be qualified with '{}' and the other with '{}'",
+                    j.on.left.alias, table, j.table
+                ),
+                None,
+            ));
+        }
+    }
+
     Ok(Query {
         cols,
         table,
+        join,
         filter,
         order,
         limit,
@@ -1338,6 +1644,184 @@ fn eval_cond(cond: &Cond, row: &ConsCell, who: &str) -> Result<bool> {
     }
 }
 
+// ---- the join ---------------------------------------------------------------
+
+/// Which of the two rows a qualified `ON` column refers to.
+///
+/// Resolved once per query rather than per row: the qualifier names a table, not
+/// a row, so deciding it inside the loop would repeat the same two string
+/// comparisons for every pair — and, worse, make it look like the alias could
+/// change per row, which it cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// The two sides of an `ON`, already resolved to sides of the row pair.
+fn resolve_side(q: &QualCol, left_table: &str, right_table: &str) -> Result<Side> {
+    if q.alias.eq_ignore_ascii_case(left_table) {
+        Ok(Side::Left)
+    } else if q.alias.eq_ignore_ascii_case(right_table) {
+        Ok(Side::Right)
+    } else {
+        // Unreachable: `parse` checks both qualifiers against both names and
+        // returns before a query with an unknown qualifier can reach here. Kept
+        // as an error rather than a default so a future caller that skips the
+        // check cannot silently swap one table's column for the other's.
+        Err(Error::runtime(format!(
+            "db-query: '{}' is not a table in this join",
+            q.alias
+        )))
+    }
+}
+
+/// Does `on` hold for this pair of rows?
+///
+/// The same comparison rules as a `WHERE` (`=` and `!=` never order, the four
+/// ordering operators need two orderable values and say so), because the values
+/// here are the same values and a second set of rules would be a second answer
+/// for the same comparison. A `LEFT` join's nil-padded right columns are only
+/// ever seen **after** a non-match, never in this function.
+///
+/// `left_side` is the side the first qualifier named, and `right_side` the side
+/// the second did — so the comparison reads left-value-op-right-value whichever
+/// order the writer used the two tables in. `parse` refuses a query whose two
+/// qualifiers name the same table, so the `(Left, Left)` / `(Right, Right)` arms
+/// are unreachable here; they are folded rather than panicking on so a future
+/// relaxation of that check cannot silently compare the wrong two cells.
+fn eval_on(
+    on: &OnCond,
+    lrow: &ConsCell,
+    rrow: &ConsCell,
+    left_side: Side,
+    right_side: Side,
+    who: &str,
+) -> Result<bool> {
+    let lval = if left_side == Side::Left {
+        lrow.nth(on.left.col.idx).unwrap_or(&Value::Nil)
+    } else {
+        rrow.nth(on.left.col.idx).unwrap_or(&Value::Nil)
+    };
+    let rval = if right_side == Side::Right {
+        rrow.nth(on.right.col.idx).unwrap_or(&Value::Nil)
+    } else {
+        lrow.nth(on.right.col.idx).unwrap_or(&Value::Nil)
+    };
+    match order_of(lval, rval) {
+        Ok(ord) => Ok(on.op.holds(ord)),
+        // Same rule as `eval_cmp`: `=` and `!=` across types are a false answer,
+        // not a type error.
+        Err(_) if matches!(on.op, CmpOp::Eq | CmpOp::Ne) => {
+            Ok(matches!(on.op, CmpOp::Ne) && lval != rval)
+        }
+        Err(e) => Err(Error::runtime(format!(
+            "{who}: at line {}, col {}: the ON column {}.{} is a {} and {}.{} is a {} — a \
+             column that is compared with <, <=, > or >= has to hold one type in every \
+             row it is compared with ({})",
+            on.left.col.line,
+            on.left.col.col,
+            on.left.alias,
+            on.left.col.idx + 1,
+            lval.type_name(),
+            on.right.alias,
+            on.right.col.idx + 1,
+            rval.type_name(),
+            e.message()
+        ))),
+    }
+}
+
+/// The nested loop: every row of the left table against every row of the right.
+///
+/// **Left first, then right** — SQL's own order, and it is what makes the output
+/// deterministic without a sort. Both inputs are already in primary-key order
+/// (the B-tree walk), so the pairs come out left-major, right-minor.
+///
+/// An `INNER` join emits only the pairs the `ON` holds. A `LEFT` join emits
+/// every left row, and a left row with no match is padded with `nil` in the
+/// right table's columns — **once**, no matter how many right rows failed, which
+/// is the difference between a left join and a cross product that was filtered.
+///
+/// A right table that is empty is not an error: an `INNER` join of it returns
+/// nothing and a `LEFT` join returns every left row nil-padded, which is the
+/// only answer that is right.
+fn nested_loop(
+    left: &[Value],
+    right: &[Value],
+    join: &Join,
+    left_table: &str,
+    right_width: usize,
+    who: &str,
+) -> Result<Vec<Value>> {
+    let lside = resolve_side(&join.on.left, left_table, &join.table)?;
+    let rside = resolve_side(&join.on.right, left_table, &join.table)?;
+    let mut out = Vec::new();
+    for lrow in left {
+        let lcell = cell_of(lrow);
+        let mut matched = false;
+        for rrow in right {
+            let rcell = cell_of(rrow);
+            if !eval_on(&join.on, &lcell, &rcell, lside, rside, who)? {
+                continue;
+            }
+            matched = true;
+            out.push(concat_rows(&lcell, Some(&rcell), right_width));
+        }
+        if !matched && join.kind == JoinKind::Left {
+            out.push(concat_rows(&lcell, None, right_width));
+        }
+    }
+    Ok(out)
+}
+
+/// The combined row: the left table's columns, then the right table's.
+///
+/// `right` is `None` for a `LEFT` join's miss, and the padding is `nil` — the
+/// out-of-range-is-`nil` convention a projection already inherits, applied here
+/// to a row that genuinely does not have those columns. That is what makes a
+/// padded row answerable rather than an error: a projection of column 4 on a
+/// padded row is `nil`, the same answer a short row gives.
+fn concat_rows(left: &ConsCell, right: Option<&ConsCell>, right_width: usize) -> Value {
+    let mut items: Vec<Value> = left.iter().cloned().collect();
+    match right {
+        Some(r) => items.extend(r.iter().cloned()),
+        // `right_width` is the widest row the right table has, so the padding is
+        // the same width whichever left row failed to match — otherwise a padded
+        // row's columns would depend on which left row it was, and two engines
+        // that walked the tables in a different order would disagree about the
+        // shape of the answer rather than its contents.
+        None => items.extend(std::iter::repeat_n(Value::Nil, right_width)),
+    }
+    Value::List(ConsCell::from_values(items))
+}
+
+/// The width of the widest row in `rows`, in columns, but never less than the
+/// positions the query's own `ON` names on that table.
+///
+/// The `ON` clause may name a column only the widest row has, so the combined
+/// row has to be that wide even when the pair that produced it was narrower —
+/// otherwise the same logical row would have different widths depending on which
+/// right row matched, and `SELECT`/`ORDER BY` positions would point at different
+/// columns on different rows.
+///
+/// `on_col` is the one-based position the `ON` clause names on this table, or 0
+/// when the query has no `ON`. It is a **floor**, not a replacement for the
+/// measurement: an `ON` can name column 1 of a three-column table, and the
+/// measurement is what says the row is three wide. But when the table has **no
+/// rows** the measurement says zero, and a `LEFT` join of an empty table would
+/// then pad to nothing — the combined row would be just the left table's columns,
+/// and `SELECT 4` would answer `nil` for a column that the query plainly
+/// referenced. The floor keeps the shape a reader can see in the query even when
+/// there is no data to show it.
+fn widest(rows: &[Value], on_col: usize) -> usize {
+    rows.iter()
+        .map(|r| cell_of(r).len)
+        .max()
+        .unwrap_or(0)
+        .max(on_col)
+}
+
 /// Bottom-up stable merge, mirroring [`crate::collections`]'s `sort_merge` and
 /// the C runtime's `sort_merge`.
 ///
@@ -1388,6 +1872,31 @@ where
     Ok(())
 }
 
+/// Decode stored JSON row texts into values, checking each is a list.
+///
+/// A helper rather than an inline loop because a join decodes **two** tables and
+/// the check — a stored row that is not a list — has to say which table it came
+/// from. Inlined, the second call would have had to duplicate the message with a
+/// different table name, and a copy is exactly where the two would drift.
+fn decode_rows(texts: &[String], who: &str, table: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(texts.len());
+    for t in texts {
+        let row = dbtab::decode_row(t, who, table)?;
+        if !matches!(row, Value::List(_)) {
+            // The log layer only ever writes a list here, and `db-insert`
+            // refuses anything else, so a non-list means the file was written by
+            // something else — which `decode_row` already covers for unreadable
+            // JSON. This arm is the belt to that braces.
+            return Err(Error::runtime(format!(
+                "{who}: a row of '{table}' is not a list; it was not written by {}",
+                dbtab::DB_INSERT
+            )));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 /// Run a parsed query against an open database.
 pub fn execute(db: &mut Db, who: &str, sql: &str, mode: Mode) -> Result<Exec> {
     let q = parse(who, sql)?;
@@ -1408,24 +1917,45 @@ pub fn execute(db: &mut Db, who: &str, sql: &str, mode: Mode) -> Result<Exec> {
         None => (db.tables().rows(&q.table, who)?, false),
     };
 
-    let mut full: Vec<Value> = Vec::with_capacity(texts.len());
-    for t in &texts {
-        let row = dbtab::decode_row(t, who, &q.table)?;
-        let Value::List(cell) = &row else {
-            // The log layer only ever writes a list here, and `db-insert`
-            // refuses anything else, so a non-list means the file was written by
-            // something else — which `decode_row` already covers for unreadable
-            // JSON. This arm is the belt to that braces.
-            return Err(Error::runtime(format!(
-                "{who}: a row of '{}' is not a list; it was not written by {}",
-                q.table,
-                dbtab::DB_INSERT
-            )));
-        };
-        if q.matches(cell, who)? {
-            full.push(row);
+    let left = decode_rows(&texts, who, &q.table)?;
+
+    // The join, before the `WHERE`. The order matters and is not negotiable: a
+    // `WHERE` on a joined query addresses the **combined** row, so it can only be
+    // evaluated once the two rows have been combined. Filtering the left table
+    // first would be faster, and would silently change the answer for any query
+    // whose `WHERE` names a right-table column.
+    let full = match &q.join {
+        None => left,
+        Some(join) => {
+            let right_texts = db.tables().rows(&join.table, who)?;
+            let right = decode_rows(&right_texts, who, &join.table)?;
+            // The width floor is the ON column the **joined** table's name
+            // appears on. The parser has already refused a query whose two
+            // qualifiers are the same, so exactly one of the two sides names the
+            // joined table — and reading both rather than choosing one means the
+            // floor cannot depend on which side was written first.
+            let floor = if join.on.right.alias.eq_ignore_ascii_case(&join.table) {
+                join.on.right.col.idx + 1
+            } else {
+                join.on.left.col.idx + 1
+            };
+            nested_loop(&left, &right, join, &q.table, widest(&right, floor), who)?
         }
-    }
+    };
+
+    // The filter, on the combined row.
+    let mut full: Vec<Value> = match q.filter {
+        None => full,
+        Some(_) => {
+            let mut kept = Vec::with_capacity(full.len());
+            for row in full {
+                if q.matches(&cell_of(&row), who)? {
+                    kept.push(row);
+                }
+            }
+            kept
+        }
+    };
 
     if let Some((col, dir)) = q.order {
         // Every row must actually **have** the column, checked separately from
@@ -1663,6 +2193,60 @@ mod tests {
             .expect("encode");
         db.put(&dbtab::row_key(table, &key), &encoded).expect("put");
         db.tables().put(table, &key, &encoded).expect("tree");
+    }
+
+    /// A `people` table plus a `cities` table, for the join battery.
+    ///
+    /// The join key is **column 3**, not column 1, so a query that addressed the
+    /// combined row as if the tables were stacked the other way round would get a
+    /// plausible answer — that is the failure this fixture exists to catch.
+    ///
+    /// The rows are chosen so the join is not 1:1 on the right:
+    ///
+    /// ```text
+    /// people                     cities
+    ///   1 ada   36 "london"        1 london   "uk"
+    ///   2 bob   41 "london"        2 sydney   "au"
+    ///   3 grace 45 "sydney"
+    /// ```
+    ///
+    /// ada and bob share "london" (one right row matches two left rows), and
+    /// grace's "sydney" matches too. Every left row matches, so the `LEFT` miss is
+    /// produced by the tests that add a row the right table cannot satisfy.
+    fn join_fixture(tag: &str) -> (Scratch, Db) {
+        let s = Scratch::new(tag);
+        let mut db = Db::open(&s.path()).expect("open");
+        for t in ["people", "cities"] {
+            db.tables().create(t);
+            db.put(&dbtab::row_key(t, TABLE_MARKER_KEY), "")
+                .expect("marker");
+        }
+        for row in [
+            vec![
+                Value::str("ada"),
+                Value::Int(BigNum::small(36)),
+                Value::str("london"),
+            ],
+            vec![
+                Value::str("bob"),
+                Value::Int(BigNum::small(41)),
+                Value::str("london"),
+            ],
+            vec![
+                Value::str("grace"),
+                Value::Int(BigNum::small(45)),
+                Value::str("sydney"),
+            ],
+        ] {
+            insert(&mut db, "people", row);
+        }
+        for row in [
+            vec![Value::str("london"), Value::str("uk")],
+            vec![Value::str("sydney"), Value::str("au")],
+        ] {
+            insert(&mut db, "cities", row);
+        }
+        (s, db)
     }
 
     fn q(db: &mut Db, sql: &str) -> Vec<Value> {
@@ -2084,8 +2668,24 @@ mod tests {
     fn recognised_but_unsupported_sql_is_refused_by_name() {
         let (_s, mut db) = fixture("unsupported");
         for (sql, must_contain) in [
-            ("SELECT * FROM people JOIN t2 ON 1 = 1", "JOIN"),
-            ("SELECT * FROM people LEFT JOIN t2 ON 1 = 1", "LEFT"),
+            // Tier 5 promoted `JOIN`/`INNER`/`LEFT`/`ON` into the subset, so the
+            // join types that stay out of scope are the ones refused here.
+            (
+                "SELECT * FROM people CROSS JOIN cities ON 1 = 1",
+                "'CROSS' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people RIGHT JOIN cities ON 1 = 1",
+                "'RIGHT' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people FULL OUTER JOIN cities ON 1 = 1",
+                "'FULL' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people JOIN cities USING (1)",
+                "'USING' is not supported in v1",
+            ),
             ("SELECT DISTINCT 1 FROM people", "DISTINCT"),
             ("SELECT 1 FROM people GROUP BY 1", "GROUP"),
             ("SELECT 1 FROM people GROUP BY 1 HAVING 1 = 1", "GROUP"),
@@ -2328,5 +2928,622 @@ mod tests {
         // Columns count characters, so a multi-byte word advances one column.
         let t = tokenize(DB_QUERY, "日本 語").expect("lexes");
         assert_eq!(t[1].col, 4, "one column per character, not per byte");
+        // A `.` is a qualifier separator. `people.3` lexes as three tokens — the
+        // bare word stops at the dot, because a word is alphanumerics and `_` and
+        // the dot is neither — so the `ON` parser sees exactly what it needs.
+        // `1.5` stays one number: the number path has to win there.
+        let t = tokenize(DB_QUERY, "people.3 1.5").expect("lexes");
+        let kinds: Vec<&Tok> = t.iter().map(|x| &x.tok).collect();
+        assert_eq!(
+            kinds[0],
+            &Tok::Word("people".into()),
+            "a bare word stops at the dot"
+        );
+        assert_eq!(kinds[1], &Tok::Dot, "the dot is its own token");
+        assert_eq!(kinds[2], &Tok::Int(3), "the column number follows the dot");
+        assert!(
+            matches!(kinds[3], Tok::Float(f) if *f == 1.5),
+            "a digit after a dot is a decimal, not a qualifier: {:?}",
+            kinds[3]
+        );
+        // A dot with no digit after it is not part of a number, so it is the
+        // separator even where it starts a token.
+        let t = tokenize(DB_QUERY, ". 1").expect("lexes");
+        assert_eq!(t[0].tok, Tok::Dot);
+        assert_eq!(t[1].tok, Tok::Int(1));
+    }
+
+    // ---- the join (Tier 5) ------------------------------------------------
+
+    /// An INNER join returns the combined rows: the left table's columns, then
+    /// the right table's, one row per matching pair.
+    ///
+    /// "london" matches two left rows, so the answer has **four** rows for three
+    /// left rows — a join is not a lookup, and an implementation that kept one row
+    /// per left row would quietly answer a different question.
+    #[test]
+    fn an_inner_join_returns_the_combined_rows() {
+        let (_s, mut db) = join_fixture("inner");
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT * FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("ada"),
+                    Value::Int(BigNum::small(36)),
+                    Value::str("london"),
+                    Value::str("london"),
+                    Value::str("uk"),
+                ])),
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("bob"),
+                    Value::Int(BigNum::small(41)),
+                    Value::str("london"),
+                    Value::str("london"),
+                    Value::str("uk"),
+                ])),
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("grace"),
+                    Value::Int(BigNum::small(45)),
+                    Value::str("sydney"),
+                    Value::str("sydney"),
+                    Value::str("au"),
+                ])),
+            ],
+            "the combined row is the left columns then the right columns, one row per pair"
+        );
+        // `INNER` spelled out and a bare `JOIN` are the same query — SQL's own
+        // default, and a reader who writes either must get the same answer.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 5 FROM people INNER JOIN cities ON people.3 = cities.1"
+            ),
+            q(
+                &mut db,
+                "SELECT 5 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            "a bare JOIN and INNER JOIN are the same query"
+        );
+        // The pair order is left-major: both people rows that match "london" come
+        // before grace, in primary-key order. That is the B-tree walk order, and
+        // it is what makes an unordered join deterministic.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![Value::str("ada")])),
+                Value::List(ConsCell::from_values(vec![Value::str("bob")])),
+                Value::List(ConsCell::from_values(vec![Value::str("grace")])),
+            ]
+        );
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            3
+        );
+    }
+
+    /// A LEFT join keeps every left row and nil-pads the right table's columns on
+    /// a miss — **once**, no matter how many right rows failed to match.
+    ///
+    /// The `oslo` row is in `people` and in no `cities` row, so the `LEFT` answer
+    /// has four rows where the `INNER` answer has three. The padded columns are
+    /// `nil` rather than absent, so `SELECT 5` is `nil` rather than an error —
+    /// the out-of-range-is-`nil` convention a projection already inherits.
+    #[test]
+    fn a_left_join_keeps_every_left_row_and_nil_pads_the_miss() {
+        let (_s, mut db) = join_fixture("left");
+        insert(
+            &mut db,
+            "people",
+            vec![
+                Value::str("oslo"),
+                Value::Int(BigNum::small(1)),
+                Value::str("oslo"),
+            ],
+        );
+        // An INNER join of the same data drops oslo; a LEFT join keeps it. Both
+        // are asserted on the same fixture so the difference is the join type and
+        // nothing else.
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            3,
+            "an INNER join drops the row with no match"
+        );
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people LEFT JOIN cities ON people.3 = cities.1"
+            ),
+            4,
+            "a LEFT join keeps the row with no match"
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 1, 5 FROM people LEFT JOIN cities ON people.3 = cities.1 \
+                 WHERE 1 = 'oslo'"
+            ),
+            vec![Value::List(ConsCell::from_values(vec![
+                Value::str("oslo"),
+                Value::Nil,
+            ]))],
+            "the right table's columns are nil-padded on a miss"
+        );
+        // A padded row is still a row of the combined width: `SELECT *` shows the
+        // nils rather than dropping the columns, so the answer's shape does not
+        // depend on which left row missed.
+        let padded = q(
+            &mut db,
+            "SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1 WHERE 1 = 'oslo'",
+        );
+        assert_eq!(
+            padded,
+            vec![Value::List(ConsCell::from_values(vec![
+                Value::str("oslo"),
+                Value::Int(BigNum::small(1)),
+                Value::str("oslo"),
+                Value::Nil,
+                Value::Nil,
+            ]))],
+            "a padded row has the same width as a matched one"
+        );
+    }
+
+    /// A right table with no rows at all: an INNER join returns nothing and a LEFT
+    /// join returns every left row nil-padded.
+    ///
+    /// Not an error, and not an empty result for the LEFT — an empty right table
+    /// is the extreme case of "no match", and answering "no rows" for it would be
+    /// the one case where the two join types agree when they must not.
+    ///
+    /// The padding is **one column**, not two, because the right table has no rows
+    /// to measure and the ON clause names column 1 of it. That is a deliberate
+    /// floor rather than an accident: `SELECT 4` — a right-table column — is then
+    /// `nil` rather than an out-of-range position, and the combined row keeps the
+    /// shape the query describes even with no data to show it.
+    #[test]
+    fn an_empty_right_table_is_not_an_error() {
+        let s = Scratch::new("empty-right");
+        let mut db = Db::open(&s.path()).expect("open");
+        for t in ["people", "cities"] {
+            db.tables().create(t);
+            db.put(&dbtab::row_key(t, TABLE_MARKER_KEY), "")
+                .expect("marker");
+        }
+        for row in [
+            vec![
+                Value::str("ada"),
+                Value::Int(BigNum::small(36)),
+                Value::str("london"),
+            ],
+            vec![
+                Value::str("bob"),
+                Value::Int(BigNum::small(41)),
+                Value::str("london"),
+            ],
+        ] {
+            insert(&mut db, "people", row);
+        }
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            0
+        );
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people LEFT JOIN cities ON people.3 = cities.1"
+            ),
+            2,
+            "a LEFT join of an empty table keeps every left row"
+        );
+        // The ON column's position is the floor for the padding, so the combined
+        // row is `people`'s three columns plus one — the column the query named —
+        // and reading that column answers nil rather than being out of range.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 4 FROM people LEFT JOIN cities ON people.3 = cities.1"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![Value::Nil])),
+                Value::List(ConsCell::from_values(vec![Value::Nil])),
+            ],
+            "a right-table column of an empty table is nil, not out of range"
+        );
+    }
+
+    /// A second `JOIN` is refused **as the second one**, naming three tables as
+    /// what is out of scope.
+    ///
+    /// The tempting message here is "unexpected 'JOIN'", and it is both true and
+    /// useless: `JOIN` on its own is legal as of Tier 5, so a reader who saw that
+    /// would have no way to learn that it is the *second* clause that v1 does not
+    /// have. The refusal names the count instead.
+    #[test]
+    fn a_second_join_clause_is_refused_as_the_second_one() {
+        let (_s, mut db) = join_fixture("second-join");
+        let msg = bad(
+            &mut db,
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 \
+             JOIN towns ON cities.1 = towns.1",
+        );
+        assert!(
+            msg.contains("may join **one** table in v1"),
+            "the refusal must name the limit: {msg}"
+        );
+        assert!(
+            msg.contains("second JOIN clause"),
+            "the refusal must say which JOIN is the problem: {msg}"
+        );
+        assert!(
+            !msg.contains("unexpected 'JOIN'"),
+            "a legal word cannot be reported as unexpected: {msg}"
+        );
+        // `INNER` and `LEFT` open a join clause too, so a second one spelled
+        // either way is refused the same way.
+        for sql in [
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 \
+             LEFT JOIN towns ON cities.1 = towns.1",
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 \
+             INNER JOIN towns ON cities.1 = towns.1",
+        ] {
+            assert!(
+                bad(&mut db, sql).contains("second JOIN clause"),
+                "for {sql:?} the refusal must name the second clause"
+            );
+        }
+    }
+
+    /// Every operator works in an `ON`, and the comparison reads the two columns
+    /// in the order they were written.
+    #[test]
+    fn every_operator_works_in_an_on_clause() {
+        let (_s, mut db) = join_fixture("on-ops");
+        // `=` on the join key: three pairs match.
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"
+            ),
+            3
+        );
+        // `!=` on the join key: three left rows × two right rows is six pairs, and
+        // three of them match, so the other three. A `!=` join is a real join, not
+        // the negation of an answer — the rows it keeps are the *pairs* that fail
+        // the comparison, not the complements of the rows an `=` join returned.
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 != cities.1"
+            ),
+            3,
+            "six pairs, three of which match, so three do not"
+        );
+        // The ordering operators work when both columns are orderable, and name
+        // both types when they are not. `people.2` is an age and `cities.1` a
+        // name, so `<` across the two is an error — not a silent false, which
+        // would answer "no rows match" for a comparison nobody can evaluate.
+        let msg = bad(
+            &mut db,
+            "SELECT 1 FROM people JOIN cities ON people.2 < cities.1",
+        );
+        assert!(
+            msg.contains("people.2 is a int") && msg.contains("cities.1 is a str"),
+            "an ordering comparison across types names both:\n  {msg}"
+        );
+        // The comparison is written left-to-right, so the reverse spelling has the
+        // types the other way round and is a *different* message.
+        let msg = bad(
+            &mut db,
+            "SELECT 1 FROM people JOIN cities ON cities.1 < people.2",
+        );
+        assert!(
+            msg.contains("cities.1 is a str") && msg.contains("people.2 is a int"),
+            "the message follows the order the columns were written:\n  {msg}"
+        );
+    }
+
+    /// A join combined with `WHERE`, `ORDER BY` and `LIMIT` — and the combined row
+    /// is what the bare positions address.
+    ///
+    /// Column 5 is `cities.2` (the country), column 2 is `people.2` (the age). A
+    /// `WHERE` naming column 5 cannot be evaluated before the join, which is why
+    /// the join runs first.
+    #[test]
+    fn a_join_combines_with_where_order_by_and_limit() {
+        let (_s, mut db) = join_fixture("clauses");
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 5 FROM people JOIN cities ON people.3 = cities.1 \
+                 WHERE 5 = 'uk'"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![Value::str("uk")])),
+                Value::List(ConsCell::from_values(vec![Value::str("uk")])),
+            ],
+            "a WHERE on a right-table column sees the combined row"
+        );
+        // ORDER BY on a combined-row column, DESC: the two "uk" rows first, in
+        // primary-key order — ada then bob, not reversed.
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 ORDER BY 5 DESC"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![Value::str("ada")])),
+                Value::List(ConsCell::from_values(vec![Value::str("bob")])),
+                Value::List(ConsCell::from_values(vec![Value::str("grace")])),
+            ]
+        );
+        assert_eq!(
+            q(
+                &mut db,
+                "SELECT 1, 2 FROM people JOIN cities ON people.3 = cities.1 \
+                 ORDER BY 2 DESC LIMIT 2"
+            ),
+            vec![
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("grace"),
+                    Value::Int(BigNum::small(45)),
+                ])),
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("bob"),
+                    Value::Int(BigNum::small(41)),
+                ])),
+            ],
+            "ORDER BY runs on the combined row, then LIMIT"
+        );
+        // `db-query-count` counts the same rows the query returns.
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 \
+                 WHERE 5 = 'uk' LIMIT 1"
+            ),
+            1
+        );
+    }
+
+    /// The join types v1 does not have are refused **by name**, with the subset
+    /// sentence — never silently treated as an INNER join.
+    ///
+    /// This is the failure Tier 5 exists to avoid on the other side: an engine
+    /// that read `CROSS JOIN` as a plain join would answer a cross product while
+    /// the reader believed they had asked for something else.
+    #[test]
+    fn a_refused_join_type_is_named() {
+        let (_s, mut db) = join_fixture("refuse-type");
+        for (sql, must_contain) in [
+            (
+                "SELECT * FROM people CROSS JOIN cities ON people.3 = cities.1",
+                "'CROSS' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people RIGHT JOIN cities ON people.3 = cities.1",
+                "'RIGHT' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people FULL OUTER JOIN cities ON people.3 = cities.1",
+                "'FULL' is not supported in v1",
+            ),
+            (
+                "SELECT * FROM people JOIN cities USING (3)",
+                "'USING' is not supported in v1",
+            ),
+        ] {
+            let msg = bad(&mut db, sql);
+            assert!(
+                msg.contains(must_contain),
+                "for {sql:?} the refusal must name {must_contain:?}\n  got: {msg}"
+            );
+            assert!(
+                msg.contains("the supported subset is:"),
+                "for {sql:?} the refusal must print the supported subset\n  got: {msg}"
+            );
+        }
+    }
+
+    /// A malformed `ON` is refused with a message that says what an `ON` is,
+    /// rather than failing on a token the reader did not know was a token.
+    #[test]
+    fn a_malformed_on_clause_is_explained() {
+        let (_s, mut db) = join_fixture("bad-on");
+        for (sql, must_contain) in [
+            // An unqualified column: the combined row does not exist yet.
+            (
+                "SELECT 1 FROM people JOIN cities ON 1 = 1",
+                "is written <table>.<column>",
+            ),
+            (
+                "SELECT 1 FROM people JOIN cities ON 3 = cities.1",
+                "is written <table>.<column>",
+            ),
+            // A missing dot.
+            (
+                "SELECT 1 FROM people JOIN cities ON people = cities.1",
+                "expected '.'",
+            ),
+            // Two comparisons in the ON.
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 AND people.2 = 36",
+                "one comparison",
+            ),
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 OR people.2 = 36",
+                "one comparison",
+            ),
+            // A value on the right of the operator, not a qualified column.
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 = 1",
+                "is written <table>.<column>",
+            ),
+            // No operator at all: the sentence names the six that are legal,
+            // rather than blaming the word that happened to follow.
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 cities.1",
+                "between the two columns of a join's ON clause",
+            ),
+            // A join type with no JOIN.
+            (
+                "SELECT 1 FROM people LEFT cities ON people.3 = cities.1",
+                "must be followed by JOIN",
+            ),
+            // A qualifier that is not one of the two tables.
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 = towns.1",
+                "is not a table in this join",
+            ),
+            // Both sides on one table: a column compared with itself.
+            (
+                "SELECT 1 FROM people JOIN cities ON people.3 = people.2",
+                "compares a column with itself",
+            ),
+            // A missing ON entirely.
+            (
+                "SELECT 1 FROM people JOIN cities",
+                "the query ended, but ON is required",
+            ),
+        ] {
+            let msg = bad(&mut db, sql);
+            assert!(
+                msg.contains(must_contain),
+                "for {sql:?} the refusal must say {must_contain:?}\n  got: {msg}"
+            );
+        }
+    }
+
+    /// A self-join is refused with a reason, not silently answered.
+    ///
+    /// The spec allows a self-join (one table under two names), but v1 has no
+    /// `AS`, so both copies share the one name and neither can be named in `ON` —
+    /// which is why this shape is refused by name rather than answered with a
+    /// cross product. The refusal says exactly that, so the reader knows what to
+    /// add.
+    #[test]
+    fn a_self_join_is_refused_because_there_is_no_as() {
+        let (_s, mut db) = join_fixture("self");
+        let msg = bad(
+            &mut db,
+            "SELECT 1 FROM people JOIN people ON people.1 = people.2",
+        );
+        assert!(msg.contains("compares a column with itself"), "got: {msg}");
+        // An alias written with `AS` is still refused — `AS` is out of scope — but
+        // it is refused as the out-of-scope keyword it is, not as a join problem.
+        let msg = bad(
+            &mut db,
+            "SELECT 1 FROM people JOIN people AS p ON people.1 = p.2",
+        );
+        assert!(msg.contains("'AS' is not supported in v1"), "got: {msg}");
+    }
+
+    /// A single-table query is byte-for-byte what it was before Tier 5: the same
+    /// rows, the same order, the same count, and the index path still chosen.
+    ///
+    /// Asserted against the **fixture that has two tables**, so a join that leaked
+    /// into a query with no `JOIN` clause would change an answer rather than pass
+    /// unnoticed.
+    #[test]
+    fn a_query_with_no_join_is_unchanged() {
+        let (_s, mut db) = join_fixture("no-join");
+        // The `people` rows here have three columns, unlike the single-table
+        // fixture, so this asserts the values rather than a shape.
+        assert_eq!(
+            q(&mut db, "SELECT * FROM people"),
+            vec![
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("ada"),
+                    Value::Int(BigNum::small(36)),
+                    Value::str("london"),
+                ])),
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("bob"),
+                    Value::Int(BigNum::small(41)),
+                    Value::str("london"),
+                ])),
+                Value::List(ConsCell::from_values(vec![
+                    Value::str("grace"),
+                    Value::Int(BigNum::small(45)),
+                    Value::str("sydney"),
+                ])),
+            ]
+        );
+        assert_eq!(n(&mut db, "SELECT 1 FROM people"), 3);
+        // The point-lookup path is still chosen for a single-table query — a join
+        // must not have disabled it — and a join must not take it, because the
+        // index answers about one table and the query reads two.
+        let e = execute(
+            &mut db,
+            DB_QUERY,
+            "SELECT 1 FROM people WHERE 1 = 'ada'",
+            Mode::Rows,
+        )
+        .expect("indexed");
+        assert!(
+            e.used_index,
+            "a single-table point lookup still uses the index"
+        );
+        let e = execute(
+            &mut db,
+            DB_QUERY,
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 WHERE 1 = 'ada'",
+            Mode::Rows,
+        )
+        .expect("joined");
+        assert!(
+            !e.used_index,
+            "a join reads two tables, so no single-key lookup can answer it"
+        );
+        // `cities` is still a plain table when nothing joins it.
+        assert_eq!(n(&mut db, "SELECT 1 FROM cities"), 2);
+    }
+
+    /// The `SUBSET` sentence a refusal prints is the grammar that is actually
+    /// accepted, so a join has to be in it — and the same string is compared
+    /// byte-for-byte against the C runtime's `DBQ_SUBSET` by `dbq_aot.rs`.
+    #[test]
+    fn the_subset_sentence_documents_the_join() {
+        assert!(
+            SUBSET.contains("LEFT JOIN <table> ON"),
+            "the subset sentence must show the join clause: {SUBSET}"
+        );
+        assert!(
+            !SUBSET.contains("GROUP BY") && !SUBSET.contains("COUNT"),
+            "the subset sentence must not advertise what it refuses: {SUBSET}"
+        );
+        // Every keyword the join grammar uses is a legal word, so a near miss of
+        // one is a typo with a fix.
+        for kw in ["JOIN", "INNER", "LEFT", "ON"] {
+            assert!(
+                LEGAL_WORDS.contains(&kw),
+                "{kw} is in the grammar, so it must be a legal word"
+            );
+        }
+        // And the join types that stay out of scope are still in the refusal table.
+        for kw in ["RIGHT", "FULL", "OUTER", "CROSS", "USING"] {
+            assert!(
+                UNSUPPORTED.iter().any(|(k, _)| *k == kw),
+                "{kw} is still out of scope and must be refused by name"
+            );
+        }
+        assert!(
+            !UNSUPPORTED.iter().any(|(k, _)| *k == "JOIN"),
+            "JOIN is supported now and must not be in the refusal table"
+        );
     }
 }

@@ -1950,6 +1950,7 @@ A small, deliberately defined SQL subset over §3m's tables:
 
 ```ainl
 SELECT <* | col, ...> FROM <table>
+  [[INNER|LEFT] JOIN <table> ON <table>.<col> <op> <table>.<col>]
   [WHERE <col> <op> <value> [AND|OR <cond>]]
   [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
 
@@ -2044,6 +2045,144 @@ asymmetry is intentional: a projection inherits the out-of-range-is-`nil`
 convention `nth` already has, while `ORDER BY` is a claim about the table's
 shape and a false claim is an error.
 
+### Joining two tables
+
+A query may join **one** second table, with `INNER` (the default, so a bare `JOIN`
+means it) or `LEFT`:
+
+```ainl
+(def h (db-open "j.db"))
+(def p (db-create-table h "people"))
+(def c (db-create-table h "cities"))
+(db-insert h p (list "ada" 36 "london"))
+(db-insert h p (list "bob" 41 "london"))
+(db-insert h p (list "grace" 45 "sydney"))
+(db-insert h p (list "oslo" 1 "oslo"))
+(db-insert h c (list "london" "uk"))
+(db-insert h c (list "sydney" "au"))
+
+(print (db-query h "SELECT * FROM people JOIN cities ON people.3 = cities.1"))
+; (("ada" 36 "london" "london" "uk")
+;  ("bob" 41 "london" "london" "uk")
+;  ("grace" 45 "sydney" "sydney" "au"))
+
+(print (db-query h "SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1"))
+; (("ada" 36 "london" "london" "uk")
+;  ("bob" 41 "london" "london" "uk")
+;  ("grace" 45 "sydney" "sydney" "au")
+;  ("oslo" 1 "oslo" nil nil))
+```
+
+Three things in that output are worth stating rather than leaving to be inferred.
+
+**A join is not a lookup.** `"london"` matches two `people` rows and one
+`cities` row, so an `INNER` join returns one row *per pair*. An implementation that
+kept one row per left row would answer a different question while looking
+correct, which is why the count is asserted rather than eyeballed.
+
+**The combined row is `people`'s columns then `cities`'s.** So `cities.1` is
+position 4 and `cities.2` is position 5, and after the join **bare positions
+address the combined row** — `WHERE 5 = 'uk'` is a filter on the country. That is
+why a join runs *before* its `WHERE` and not after: a `WHERE` naming a
+right-table column is not answerable until the two rows are one row.
+
+**A `LEFT` join's miss is padded, once.** `oslo` matches nothing, so it appears
+with `nil` in the right table's columns — and appears **once**, not once per
+unmatched `cities` row. Padding per failed match would make a `LEFT` join of an
+empty table return `n × 0 = 0` rows and quietly become an `INNER` join.
+
+The pairing is a **nested loop**, left row against right row, and the pairs come
+out **left-major, right-minor** because both tables are walked in primary-key
+order. So an unordered join is deterministic without a sort:
+
+```ainl
+(print (db-query h "SELECT 1 FROM people JOIN cities ON people.3 = cities.1"))
+; (("ada") ("bob") ("grace"))
+```
+
+A right table with **no rows at all** is not an error: an `INNER` join of it
+returns nothing, and a `LEFT` join returns every left row padded. The padding is
+one column wide — the column the `ON` named — because there are no rows to measure
+the width from, and the shape the query describes is the one a reader can see in
+the query even when there is no data to show it.
+
+### `ON` takes exactly one qualified comparison
+
+Both sides of the comparison name the table they come from, because the combined
+row does not exist yet while the join is being decided — a bare number here would
+be a position in a row whose shape depends on the answer:
+
+```
+db-query: at line 1, col 37: a column in a join's ON clause is written
+<table>.<column> — here 'people' and 'cities' — got 1 in the query
+"SELECT 1 FROM people JOIN cities ON 1 = 1"
+```
+
+One comparison, with the six operators of a `WHERE`. `AND` and `OR` are **not**
+allowed in an `ON` — they belong in the `WHERE` that follows, which addresses the
+combined row and can use unqualified positions:
+
+```
+db-query: at line 1, col 61: a join's ON clause is one comparison; AND and OR
+belong in WHERE in the query
+"SELECT 1 FROM people JOIN cities ON people.3 = cities.1 AND people.2 = 36"
+```
+
+A qualifier that is neither table is refused rather than treated as a match
+failure, because a typo that silently matched nothing would make every row a
+`LEFT`-join nil-pad — which reads as an answer rather than as a mistake:
+
+```
+db-query: at line 1, col 54: 'towns' is not a table in this join — a column in ON
+is qualified with the name of one of the tables it joins, and these are 'people'
+and 'cities' in the query
+"SELECT 1 FROM people JOIN cities ON people.3 = towns.1"
+```
+
+An ordering comparison in an `ON` obeys the same rules as one in a `WHERE`, so a
+`str` compared with an `int` names both types instead of quietly matching nothing:
+
+```
+db-query: at line 1, col 44: the ON column people.2 is a int and cities.1 is a str
+— a column that is compared with <, <=, > or >= has to hold one type in every row
+it is compared with (db-query: cannot order a int and a str)
+```
+
+### What a join deliberately does not have
+
+`RIGHT`, `FULL`, `OUTER`, `CROSS` and `USING` are refused **by name**, the same as
+`GROUP BY`:
+
+```
+db-query: at line 1, col 22: 'CROSS' is not supported in v1; the supported subset
+is: … in the query "SELECT * FROM people CROSS JOIN cities ON people.3 = cities.1"
+```
+
+A **second** `JOIN` is refused as the second one, because `JOIN` on its own is
+legal and "unexpected 'JOIN'" would leave a reader with no way to tell that it is
+the *second* clause that v1 does not have:
+
+```
+db-query: at line 1, col 57: a query may join **one** table in v1, so this is the
+second JOIN clause — with three tables a column's name no longer says where it
+sits in the combined row in the query
+"SELECT 1 FROM people JOIN cities ON people.3 = cities.1 JOIN towns ON cities.1 = towns.1"
+```
+
+That refusal is about **three** tables, and the reason is the same one aliases
+would fix: after two joins a position in `ON` resolves against a table, but a
+column's table no longer says where it sits in the combined row without knowing the
+offsets of the tables before it. v1 has no `AS`, so a self-join is refused too —
+both sides would carry one name, and `people.3 = people.2` compares a column with
+itself:
+
+```
+db-query: at line 1, col 44: both sides of the ON comparison name 'people', so it
+compares a column with itself — one side must be qualified with 'people' and the
+other with 'cities' in the query
+"SELECT 1 FROM people JOIN cities ON people.3 = people.2"
+```
+
 ### Unsupported SQL is refused by name
 
 A clause this layer does not have is **named**, never ignored — silently
@@ -2052,13 +2191,19 @@ The refusal carries the supported subset, so the next query is writeable from it
 
 ```
 db-query: at line 1, col 22: 'GROUP' is not supported in v1; the supported
-subset is: SELECT <* | col, ...> FROM <table> [WHERE <col> <op> <value>
-[AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>] in the query
+subset is: SELECT <* | col, ...> FROM <table> [INNER|LEFT JOIN <table> ON
+<alias>.<col> <op> <alias>.<col>] [WHERE <col> <op> <value> [AND|OR <cond>]]
+[ORDER BY <col> [ASC|DESC]] [LIMIT <n>] in the query
 "SELECT * FROM people GROUP BY 1"
 ```
 
-Joins, `GROUP BY`, `HAVING`, `DISTINCT`, set operations, subqueries, `IN`,
-`LIKE`, `BETWEEN`, `IS`, `EXISTS`, `OFFSET`, `CASE`, aliases, `NULLS FIRST`/`LAST`,
+The sentence is the grammar that is **actually** accepted, and both engines carry
+it as one string compared byte for byte: if the C runtime's copy and the Rust's
+disagreed by a space, a refusal would differ between the interpreter and a compiled
+binary, and `dbq_aot.rs` fails there.
+
+`GROUP BY`, `HAVING`, `DISTINCT`, set operations, subqueries, `IN`, `LIKE`,
+`BETWEEN`, `IS`, `EXISTS`, `OFFSET`, `CASE`, aliases, `NULLS FIRST`/`LAST`,
 and every `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER` are all refused this
 way — the last group because the query layer is **read-only**: §3m's log has one
 writer and one row encoding, and a second write path would break both claims.

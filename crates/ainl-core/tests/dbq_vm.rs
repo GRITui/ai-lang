@@ -211,6 +211,98 @@ fn fixture(tag: &str, query: &str) -> String {
     )
 }
 
+/// The join (Tier 5) fixture: **two** tables, with a left row that matches
+/// nothing on the right.
+///
+/// `people` is ada/bob/grace/oslo and `cities` is london/sydney, so `"london"`
+/// matches two left rows and the INNER and LEFT answers differ by exactly one
+/// row. Returns the rows and the count as a pair, like `fixture`.
+fn join_fixture(tag: &str, query: &str) -> String {
+    format!(
+        r#"(do
+      (def h (db-open "{path}"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (db-insert h p (list "grace" 45 "sydney"))
+      (db-insert h p (list "oslo" 1 "oslo"))
+      (db-insert h c (list "london" "uk"))
+      (db-insert h c (list "sydney" "au"))
+      (def got (list (db-query h "{query}")
+                    (db-query-count h "{query}")))
+      (db-close h)
+      got)"#,
+        path = db_path(tag),
+        query = query
+    )
+}
+
+/// A join returns the same **rows** on the interpreter and the VM.
+///
+/// `assert_parity` compares the two engines' outputs, and the expected value is
+/// written out here too — otherwise a join that was wrong in the same way on both
+/// sides would pass. The VM runs the same `dbquery::execute` rather than a second
+/// implementation, so the claim under test is that the join works on the VM at
+/// all, and that the two evaluators agree on which pairs it produced.
+#[test]
+fn a_join_agrees_between_the_interpreter_and_the_vm() {
+    for (tag, query) in [
+        (
+            "vm-join-inner",
+            "SELECT * FROM people JOIN cities ON people.3 = cities.1",
+        ),
+        (
+            "vm-join-left",
+            "SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1",
+        ),
+        (
+            "vm-join-where",
+            "SELECT 1, 5 FROM people JOIN cities ON people.3 = cities.1 WHERE 5 = 'uk'",
+        ),
+        (
+            "vm-join-order",
+            "SELECT 1, 2 FROM people JOIN cities ON people.3 = cities.1 ORDER BY 2 DESC LIMIT 2",
+        ),
+        (
+            "vm-join-inner-spelled",
+            "SELECT 1 FROM people INNER JOIN cities ON people.3 = cities.1",
+        ),
+    ] {
+        // The Scratch has to outlive the program that names its path, so it is
+        // held here rather than inside `join_fixture` — see `db_path`. Held to
+        // `_s` deliberately: it is removed on drop, and a `db-open` on a path whose
+        // directory is gone reports a missing file instead of the answer.
+        let _s = Scratch::new(tag);
+        let out = assert_parity(&join_fixture(tag, query), tag);
+        // The count is the second element of the pair, so rows and count are
+        // checked together — a join that returned the right rows and the wrong
+        // count would otherwise pass.
+        assert!(!out.is_empty(), "the {tag} program returned nothing: {out}");
+        // And the rows themselves, **compared exactly** rather than by substring:
+        // the output is the `( (rows…) count )` pair the fixture returns, so an
+        // exact match pins the order, the count, and the nil-padding at once.
+        // Parity alone would pass on a join that was wrong the same way on both
+        // sides, which is the failure this file exists to catch.
+        let rows = match tag {
+            "vm-join-inner" => {
+                r#"(("ada" 36 "london" "london" "uk") ("bob" 41 "london" "london" "uk") ("grace" 45 "sydney" "sydney" "au"))"#
+            }
+            "vm-join-left" => {
+                r#"(("ada" 36 "london" "london" "uk") ("bob" 41 "london" "london" "uk") ("grace" 45 "sydney" "sydney" "au") ("oslo" 1 "oslo" nil nil))"#
+            }
+            _ => continue,
+        };
+        let count = if tag == "vm-join-left" { "4" } else { "3" };
+        assert_eq!(
+            out.trim(),
+            format!("({rows} {count})"),
+            "the {tag} join did not return the combined rows the nested loop \
+             produces"
+        );
+    }
+}
+
 /// Both query builtins are bound on the VM.
 ///
 /// The direct version of the "for free" claim: a name installed for the
@@ -337,9 +429,38 @@ fn refusals_agree_between_the_interpreter_and_the_vm() {
             "SELECT * FROM people GROUP BY 1",
             "'GROUP' is not supported in v1",
         ),
+        // The join types v1 does not have, refused **by name**. Tier 5 made
+        // `JOIN` itself parse, so it left the unsupported table and these are what
+        // joined the rest of it.
         (
-            "SELECT * FROM people JOIN people p ON 1 = 1",
-            "'JOIN' is not supported",
+            "SELECT * FROM people CROSS JOIN people ON people.3 = people.1",
+            "'CROSS' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people RIGHT JOIN people ON people.3 = people.1",
+            "'RIGHT' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people JOIN people USING (3)",
+            "'USING' is not supported in v1",
+        ),
+        // A second join clause — refused as the second one, since `JOIN` alone is
+        // legal now and "unexpected 'JOIN'" would not say which JOIN is the problem.
+        (
+            "SELECT * FROM people JOIN people ON people.3 = people.1 \
+             JOIN people ON people.1 = people.1",
+            "second JOIN clause",
+        ),
+        // Both sides of an ON on one table: a self-join without an `AS` to tell
+        // the two copies apart, so a column compared with itself.
+        (
+            "SELECT * FROM people JOIN people ON people.3 = people.2",
+            "compares a column with itself",
+        ),
+        // An alias is out of scope, so it is refused as the keyword it is.
+        (
+            "SELECT * FROM people JOIN people p ON people.3 = people.1",
+            "unexpected 'p'",
         ),
         (
             "SELECT DISTINCT 1 FROM people",

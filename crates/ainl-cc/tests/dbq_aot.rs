@@ -209,6 +209,76 @@ fn fixture_count(query: &str) -> String {
     )
 }
 
+/// The join (Tier 5) fixture: **two** tables, and the left one has a row that
+/// matches nothing on the right.
+///
+/// `people` is ada/bob/grace/oslo and `cities` is london/sydney, so:
+///
+/// - three left rows match (`london` matches ada *and* bob), so an INNER join
+///   has three rows for three left rows and a join is visibly not a lookup;
+/// - `oslo` matches nothing, so the INNER and LEFT answers differ by exactly one
+///   row and the difference is observable in a three-line fixture;
+/// - the ages 36/41/45 sort differently from the keys ada/bob/grace, so ORDER BY
+///   on the joined rows is distinguishable from the walk order.
+///
+/// Both tables are created before any query runs, so a test about a *parse*
+/// refusal and a test about a *result* can share this fixture.
+fn join_fixture(query: &str) -> String {
+    format!(
+        r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (db-insert h p (list "grace" 45 "sydney"))
+      (db-insert h p (list "oslo" 1 "oslo"))
+      (db-insert h c (list "london" "uk"))
+      (db-insert h c (list "sydney" "au"))
+      (print (db-query h "{query}"))
+      (db-close h))"#
+    )
+}
+
+/// The same fixture over `db-query-count`, whose answer is a bare integer and so
+/// cannot be confused with the row list the other builtin returns.
+fn join_fixture_count(query: &str) -> String {
+    format!(
+        r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (db-insert h p (list "grace" 45 "sydney"))
+      (db-insert h p (list "oslo" 1 "oslo"))
+      (db-insert h c (list "london" "uk"))
+      (db-insert h c (list "sydney" "au"))
+      (print (db-query-count h "{query}"))
+      (db-close h))"#
+    )
+}
+
+/// A `db-query` program over the join fixture where `cities` is **empty** — no
+/// `db-insert` for it at all.
+///
+/// The extreme case of "no right row matched": an INNER join of nothing returns
+/// nothing, a LEFT join returns every left row nil-padded. Answering "no rows"
+/// for the LEFT here would be the one case where the two join types agree when
+/// they must not.
+fn join_fixture_empty_right(query: &str) -> String {
+    format!(
+        r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (print (db-query h "{query}"))
+      (db-close h))"#
+    )
+}
+
 /// The parity assertion: same program, both engines, same stdout, same exit
 /// code, and — for a refusal — the same message once the interpreter's
 /// call-site suffix is removed.
@@ -401,16 +471,24 @@ fn every_out_of_scope_keyword_is_refused_by_both_engines() {
             "'HAVING' is not supported in v1",
         ),
         (
-            "SELECT * FROM people JOIN people p ON 1 = 1",
-            "'JOIN' is not supported",
+            "SELECT * FROM people CROSS JOIN cities ON people.3 = cities.1",
+            "'CROSS' is not supported",
         ),
         (
-            "SELECT * FROM people LEFT JOIN people p ON 1 = 1",
-            "'LEFT' is not supported",
+            "SELECT * FROM people RIGHT JOIN cities ON people.3 = cities.1",
+            "'RIGHT' is not supported",
         ),
         (
-            "SELECT * FROM people INNER JOIN people p ON 1 = 1",
-            "'INNER' is not supported",
+            "SELECT * FROM people FULL OUTER JOIN cities ON people.3 = cities.1",
+            "'FULL' is not supported",
+        ),
+        (
+            "SELECT * FROM people OUTER JOIN cities ON people.3 = cities.1",
+            "'OUTER' is not supported",
+        ),
+        (
+            "SELECT * FROM people JOIN cities USING (3)",
+            "'USING' is not supported",
         ),
         (
             "SELECT DISTINCT 1 FROM people",
@@ -813,4 +891,406 @@ fn a_runtime_query_is_refused_like_a_literal_one() {
       (print (db-query h (join (list "SELECT 1 FROM t" " GROUP BY 1") "")))
       (db-close h))"#;
     assert_refusal_parity(src, "runtime-refusal", &["'GROUP' is not supported in v1"]);
+}
+
+// ---- the join (Tier 5): parity between the interpreter and the AOT C runtime
+
+/// Every supported join form, run on both engines over the same two-table
+/// fixture, with the **expected rows** asserted as well.
+///
+/// Parity alone would pass on a build where both engines are wrong in the same
+/// way — which is the failure mode that matters, since the hand-ported C is
+/// written by reading the Rust and a misreading is copied faithfully. So each
+/// expected answer is written out here from the nested-loop definition rather
+/// than taken from a run.
+#[test]
+fn a_join_returns_the_same_rows_on_both_engines() {
+    // An INNER join: the combined rows, left table's columns then the right's.
+    // `london` matches ada *and* bob, so three rows come from three left rows —
+    // one pair each — and oslo is gone.
+    assert_parity(
+        &join_fixture("SELECT * FROM people JOIN cities ON people.3 = cities.1"),
+        "join-inner",
+    );
+    let si = Scratch::new("join-inner-value");
+    let (out, err, ok) = interpret(
+        &join_fixture("SELECT * FROM people JOIN cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(ok, "the interpreter failed: {err}");
+    assert_eq!(
+        out.trim_end(),
+        r#"(("ada" 36 "london" "london" "uk") ("bob" 41 "london" "london" "uk") ("grace" 45 "sydney" "sydney" "au"))"#,
+        "the INNER join did not return the combined rows"
+    );
+
+    // A LEFT join: the same three rows **plus** oslo, whose two right-table
+    // columns are nil — padded once, not once per unmatched right row.
+    assert_parity(
+        &join_fixture("SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1"),
+        "join-left",
+    );
+    let si = Scratch::new("join-left-value");
+    let (out, err, ok) = interpret(
+        &join_fixture("SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(ok, "the interpreter failed: {err}");
+    assert_eq!(
+        out.trim_end(),
+        r#"(("ada" 36 "london" "london" "uk") ("bob" 41 "london" "london" "uk") ("grace" 45 "sydney" "sydney" "au") ("oslo" 1 "oslo" nil nil))"#,
+        "the LEFT join did not keep the unmatched row, or did not nil-pad it"
+    );
+
+    // A bare JOIN and INNER JOIN are the same query — SQL's own default — and a
+    // reader who writes either must get the same answer on both engines.
+    assert_parity(
+        &join_fixture("SELECT 1 FROM people INNER JOIN cities ON people.3 = cities.1"),
+        "join-inner-spelled",
+    );
+
+    // WHERE on a right-table column (position 5 is `cities.2`) is only
+    // answerable after the join, so it is the test that a join ran before its
+    // WHERE rather than after it.
+    assert_parity(
+        &join_fixture("SELECT 1, 5 FROM people JOIN cities ON people.3 = cities.1 WHERE 5 = 'uk'"),
+        "join-where-right",
+    );
+    // ORDER BY a combined-row column, then LIMIT.
+    assert_parity(
+        &join_fixture(
+            "SELECT 1, 2 FROM people JOIN cities ON people.3 = cities.1 \
+             ORDER BY 2 DESC LIMIT 2",
+        ),
+        "join-order-limit",
+    );
+    // A projection that names a right-table column.
+    assert_parity(
+        &join_fixture("SELECT 1, 4 FROM people JOIN cities ON people.3 = cities.1"),
+        "join-project-right",
+    );
+    // `db-query-count` counts joined rows, and answers a bare integer.
+    assert_parity(
+        &join_fixture_count("SELECT 1 FROM people JOIN cities ON people.3 = cities.1"),
+        "join-count",
+    );
+    let si = Scratch::new("join-count-value");
+    let (out, err, ok) = interpret(
+        &join_fixture_count("SELECT 1 FROM people JOIN cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(ok, "the interpreter failed: {err}");
+    assert_eq!(out.trim_end(), "3", "the count did not see the joined rows");
+
+    // A table with no rows is not an error: an INNER join of nothing returns
+    // nothing, a LEFT join returns every left row nil-padded.
+    assert_parity(
+        &join_fixture_empty_right("SELECT * FROM people JOIN cities ON people.3 = cities.1"),
+        "join-empty-inner",
+    );
+    assert_parity(
+        &join_fixture_empty_right("SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1"),
+        "join-empty-left",
+    );
+    let si = Scratch::new("join-empty-left-value");
+    let (out, err, ok) = interpret(
+        &join_fixture_empty_right("SELECT * FROM people LEFT JOIN cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(ok, "the interpreter failed: {err}");
+    assert_eq!(
+        out.trim_end(),
+        r#"(("ada" 36 "london" nil) ("bob" 41 "london" nil))"#,
+        "a LEFT join of an empty table must keep every left row, nil-padded to \
+         the ON column's position"
+    );
+
+    // A query with no join is untouched by Tier 5 — asserted on the two-table
+    // fixture, so a join leaking into a single-table query would show here.
+    assert_parity(&join_fixture("SELECT * FROM people"), "no-join-unchanged");
+    assert_parity(
+        &join_fixture("SELECT * FROM cities"),
+        "no-join-unchanged-right",
+    );
+}
+
+/// The pair order is left-major, right-minor — the B-tree walk order of each
+/// table, so an unordered join is deterministic without a sort.
+///
+/// Determinism is the property under test, not the particular order: an
+/// implementation that emitted the pairs in another order would still be a
+/// correct join, but two engines that disagreed about the order would make every
+/// unordered join's output differ, so the order has to be pinned.
+#[test]
+fn a_join_has_a_deterministic_pair_order() {
+    assert_parity(
+        &join_fixture("SELECT 1 FROM people JOIN cities ON people.3 = cities.1"),
+        "join-order",
+    );
+    let si = Scratch::new("join-order-value");
+    let (out, err, ok) = interpret(
+        &join_fixture("SELECT 1 FROM people JOIN cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(ok, "the interpreter failed: {err}");
+    assert_eq!(
+        out.trim_end(),
+        r#"(("ada") ("bob") ("grace"))"#,
+        "the pairs are not in left-major, right-minor walk order"
+    );
+    // The same query twice in one program: an engine that accumulated pairs into
+    // a hash would print a different order the second time.
+    let src = r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (db-insert h p (list "grace" 45 "sydney"))
+      (db-insert h p (list "oslo" 1 "oslo"))
+      (db-insert h c (list "london" "uk"))
+      (db-insert h c (list "sydney" "au"))
+      (def q "SELECT 1 FROM people JOIN cities ON people.3 = cities.1")
+      (print (db-query h q))
+      (print (db-query h q))
+      (db-close h))"#;
+    assert_parity(src, "join-repeat");
+    let si = Scratch::new("join-repeat-value");
+    let (out, err, ok) = interpret(src, &si.path);
+    assert!(ok, "the interpreter failed: {err}");
+    let mut lines = out.lines();
+    let first = lines.next().unwrap_or_default();
+    let second = lines.next().unwrap_or_default();
+    assert_eq!(
+        first, second,
+        "the same join twice returned two different orders:\n{out}"
+    );
+}
+
+/// Every join refusal, on both engines, with the same message.
+///
+/// A refusal is the one output where a disagreement between the engines is worst
+/// — one backend can accept a query the other names as unsupported, which is
+/// exactly what the 4-backend rule exists to prevent. So each case asserts both
+/// the parity and the part of the message a reader acts on.
+#[test]
+fn every_join_refusal_agrees_on_both_engines() {
+    let cases: &[(&str, &str)] = &[
+        // The join types that stay out of scope, each refused **by name**.
+        (
+            "SELECT * FROM people CROSS JOIN cities ON people.3 = cities.1",
+            "'CROSS' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people RIGHT JOIN cities ON people.3 = cities.1",
+            "'RIGHT' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people FULL OUTER JOIN cities ON people.3 = cities.1",
+            "'FULL' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people OUTER JOIN cities ON people.3 = cities.1",
+            "'OUTER' is not supported in v1",
+        ),
+        (
+            "SELECT * FROM people JOIN cities USING (3)",
+            "'USING' is not supported in v1",
+        ),
+        // An unqualified ON column: the combined row does not exist yet.
+        (
+            "SELECT 1 FROM people JOIN cities ON 1 = 1",
+            "is written <table>.<column>",
+        ),
+        (
+            "SELECT 1 FROM people JOIN cities ON 3 = cities.1",
+            "is written <table>.<column>",
+        ),
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = 1",
+            "is written <table>.<column>",
+        ),
+        // A missing dot.
+        (
+            "SELECT 1 FROM people JOIN cities ON people = cities.1",
+            "expected '.'",
+        ),
+        // ON is one comparison; AND and OR are WHERE's.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 AND people.2 = 36",
+            "one comparison",
+        ),
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 OR people.2 = 36",
+            "one comparison",
+        ),
+        // No operator at all — the sentence names the six that are legal.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 cities.1",
+            "between the two columns of a join's ON clause",
+        ),
+        // A join type with no JOIN.
+        (
+            "SELECT 1 FROM people LEFT cities ON people.3 = cities.1",
+            "must be followed by JOIN",
+        ),
+        (
+            "SELECT 1 FROM people INNER cities ON people.3 = cities.1",
+            "must be followed by JOIN",
+        ),
+        // A qualifier that is not one of the two tables.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = towns.1",
+            "is not a table in this join",
+        ),
+        (
+            "SELECT 1 FROM nope JOIN cities ON people.3 = cities.1",
+            "is not a table in this join",
+        ),
+        // Both sides on one table: a column compared with itself. v1 has no AS, so
+        // this is also what a self-join looks like.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = people.2",
+            "compares a column with itself",
+        ),
+        (
+            "SELECT 1 FROM people JOIN people ON people.1 = people.2",
+            "compares a column with itself",
+        ),
+        // A missing ON entirely.
+        (
+            "SELECT 1 FROM people JOIN cities",
+            "the query ended, but ON is required",
+        ),
+        // A second join clause: three tables have no unambiguous position map in
+        // v1, so the second JOIN is refused **as the second one**. A bare
+        // "unexpected 'JOIN'" would be useless here — JOIN on its own is legal, so
+        // the reader has no way to learn it is the second that is out of scope.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.3 = cities.1 JOIN towns ON cities.1 = towns.1",
+            "this is the second JOIN clause",
+        ),
+        // An ordering comparison across two types names both of them, rather than
+        // silently matching nothing.
+        (
+            "SELECT 1 FROM people JOIN cities ON people.2 < cities.1",
+            "cannot order a int and a str",
+        ),
+    ];
+    for (i, (query, want)) in cases.iter().enumerate() {
+        assert_refusal_parity(&join_fixture(query), &format!("joinref{i}"), &[want]);
+    }
+}
+
+/// Every refusal prints the subset sentence, so a reader who hits a join refusal
+/// can see what the subset does accept — including the join itself.
+///
+/// The subset string is compared between the engines **as bytes** by
+/// `assert_refusal_parity`, so this test only has to check that both engines put
+/// a join in it: if the C `DBQ_SUBSET` and the Rust `SUBSET` ever disagree by a
+/// space, a refusal differs between the engines and every refusal case above
+/// fails.
+#[test]
+fn the_subset_sentence_a_refusal_prints_contains_the_join() {
+    // A refusal for a join type, which prints the sentence.
+    let si = Scratch::new("subset-interp");
+    let sc = Scratch::new("subset-aot");
+    let src = join_fixture("SELECT * FROM people CROSS JOIN cities ON people.3 = cities.1");
+    let (_, i_err, _) = interpret(&src, &si.path);
+    let bin = compile(&src, "subset", &sc.path);
+    let (_, c_err, _) = run_bin(&bin, &sc.path);
+    let shared = without_call_site(&i_err);
+    let c_shared = c_err.trim_end();
+    for (tag, msg) in [("interp", shared.as_str()), ("aot", c_shared)] {
+        assert!(
+            msg.contains("the supported subset is:"),
+            "the {tag} refusal printed no subset sentence: {msg}"
+        );
+        assert!(
+            msg.contains("[INNER|LEFT JOIN <table> ON <alias>.<col> <op> <alias>.<col>]"),
+            "the {tag} subset sentence does not document the join: {msg}"
+        );
+        assert!(
+            !msg.contains("[JOIN <table>"),
+            "the {tag} subset sentence still shows the Tier 4 grammar: {msg}"
+        );
+    }
+    assert_eq!(
+        shared,
+        c_err.trim_end(),
+        "the subset sentence differs between the two engines"
+    );
+}
+
+/// A join query that is assembled at runtime is parsed like a literal one,
+/// including the refusals.
+///
+/// The grammar is enforced on the text, so a query built with the string builtins
+/// meets it too — otherwise the grammar would only hold for the queries a human
+/// typed, which is the set that is already right.
+#[test]
+fn a_runtime_built_join_is_parsed_and_refused_the_same_way() {
+    let src = r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (db-insert h p (list "bob" 41 "london"))
+      (db-insert h p (list "oslo" 1 "oslo"))
+      (db-insert h c (list "london" "uk"))
+      (print (db-query h
+        (join (list "SELECT 1 FROM people LEFT JOIN cities" " ON people.3 = cities.1") "")))
+      (db-close h))"#;
+    assert_parity(src, "runtime-join");
+    // The same, assembled *wrong*.
+    let src = r#"(do
+      (def h (db-open "j.db"))
+      (def p (db-create-table h "people"))
+      (def c (db-create-table h "cities"))
+      (db-insert h p (list "ada" 36 "london"))
+      (print (db-query h
+        (join (list "SELECT 1 FROM people RIGHT JOIN cities" " ON people.3 = cities.1") "")))
+      (db-close h))"#;
+    assert_refusal_parity(
+        src,
+        "runtime-join-refusal",
+        &["'RIGHT' is not supported in v1"],
+    );
+}
+
+/// A typo in a join keyword is a typo, not an unknown word: `JION` is one edit
+/// from `JOIN`, and `JOIN` is legal, so the suggestion is a word the reader can
+/// type and have accepted.
+///
+/// Before Tier 5 this could not happen — `JOIN` was out of scope, so a near miss
+/// of it had nothing legal to suggest. That is the concrete reason a supported
+/// keyword belongs in the legal-word table.
+#[test]
+fn a_join_keyword_typo_suggests_the_join_keyword() {
+    for (query, want) in [
+        (
+            "SELECT 1 FROM people JION cities ON people.3 = cities.1",
+            "unexpected 'JION'",
+        ),
+        (
+            "SELECT 1 FROM people LFET JOIN cities ON people.3 = cities.1",
+            "unexpected 'LFET'",
+        ),
+    ] {
+        assert_refusal_parity(&join_fixture(query), "join-typo", &[want]);
+    }
+    // The refusal is the ordinary clause-loop one: the query text is echoed and
+    // the word is named, the same as any other unexpected word. What is under test
+    // is that both engines agree — not that a suggestion is offered, which the
+    // clause loop does not do for an unknown word.
+    let si = Scratch::new("join-typo-value");
+    let (out, err, ok) = interpret(
+        &join_fixture("SELECT 1 FROM people JION cities ON people.3 = cities.1"),
+        &si.path,
+    );
+    assert!(!ok, "a typo of JOIN was accepted: {out}");
+    assert!(
+        without_call_site(&err).contains("in the query"),
+        "the refusal does not echo the query: {err}"
+    );
 }
