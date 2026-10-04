@@ -1,15 +1,29 @@
 //! Pins the numeric-model behaviour documented in docs/NUMERIC_MODEL.md.
 //!
-//! **What changed (numeric card 4/6):** JavaScript is no longer the odd one
-//! out. An AINL `int` is emitted as a native JS `BigInt`, so JS integers are
-//! exact and unbounded exactly as they are on the interpreter, the bytecode VM,
-//! the AOT C binary, Python and Ruby. All five backends now agree on every
-//! integer AINL can express — this file used to assert the one remaining
-//! divergence and now asserts its absence.
+//! **What this file is (numeric card 5/6):** the integration gate. Cards 1–4
+//! each changed one runtime and re-pinned its own tests; this file is where
+//! **all five backends are held to the same bytes at once, out of range**. Its
+//! purpose is the inverse of what it used to be: before the numeric chain it
+//! pinned the *known divergence* — the interpreter, Python and Ruby were exact
+//! while JavaScript rounded, and the third test asserted that JS "diverges by
+//! design". Card 4 (JS `BigInt`) retired that test, and card 5 (this one)
+//! flipped the file's purpose outright: it now pins that **there is no
+//! divergence**. The centerpiece is
+//! `all_five_backends_agree_byte_for_byte_on_the_headline_corpus`, which runs
+//! the three headline programs through the interpreter, the **AOT C binary**
+//! (the backend this file previously did not include), JS, Python and Ruby,
+//! and asserts byte-for-byte equality on **both** stdout and stderr.
+//!
+//! **What card 4 did (context):** JavaScript is no longer the odd one out. An
+//! AINL `int` is emitted as a native JS `BigInt`, so JS integers are exact and
+//! unbounded exactly as they are on the interpreter, the bytecode VM, the AOT
+//! C binary, Python and Ruby. All five backends now agree on every integer
+//! AINL can express — this file used to assert the one remaining divergence
+//! and now asserts its absence.
 //!
 //! The old file's third test (`the_interpreter_still_diverges_from_js_by_design`)
-//! is what this change retired: it asserted that JS rounded where the other
-//! four were exact, "if this ever fails, JS moved to BigInt and the doc needs
+//! is what card 4 retired: it asserted that JS rounded where the other four
+//! were exact, "if this ever fails, JS moved to BigInt and the doc needs
 //! updating". It failed, and the doc has been updated.
 //!
 //! Two properties are pinned here rather than just the headline numbers:
@@ -33,7 +47,7 @@
 use ainl_transpile::{transpile_js_src, transpile_python_src, transpile_ruby_src};
 use std::process::Command;
 
-/// The corpus from docs/NUMERIC_MODEL.md §"Measured divergence": the two values
+/// The corpus from docs/NUMERIC_MODEL.md §"Measured agreement": the two values
 /// that used to be out of `i64` range, plus 100! for a bignum many limbs wide.
 const SRC: &str = r#"(print (* 9223372036854775807 2))
 (def fact (fn (n) (if (< n 2) 1 (* n (fact (- n 1))))))
@@ -62,34 +76,37 @@ fn exact() -> String {
     s
 }
 
+/// The `ainl` CLI binary (release first, then debug).
+///
+/// Resolved once and shared by the interpreter and AOT helpers below; a missing
+/// binary is a broken checkout, not a skip.
+fn ainl_bin() -> std::path::PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target");
+    ["release", "debug"]
+        .iter()
+        .map(|p| root.join(p).join("ainl"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!("no ainl binary under target/{{release,debug}} — run `cargo build` first")
+        })
+}
+
 /// The interpreter's STDOUT for `src`.
 ///
 /// Not `run_str`, which answers the *value* of the last form: a program that
 /// ends in `(print ...)` therefore returns nil, and a value-only comparison
 /// would assert nil against the printed text. These cases are about what a
 /// program PRINTS, so they read the CLI's stdout.
-///
-/// Resolves the `ainl` binary the same way the other suites do (release first,
-/// then debug) and fails loudly rather than skipping, because the interpreter
-/// is always available — a missing binary is a broken checkout, not a skip.
 fn interp_stdout(src: &str) -> String {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
-    let bin = ["release", "debug"]
-        .iter()
-        .map(|p| root.join(p).join("ainl"))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| {
-            panic!("no ainl binary under target/{{release,debug}} — run `cargo build` first")
-        });
     let tmp = temp_for("interp");
     std::fs::write(&tmp, src).unwrap();
-    let out = Command::new(&bin)
+    let out = Command::new(ainl_bin())
         .arg("run")
         .arg(&tmp)
         .output()
-        .unwrap_or_else(|e| panic!("failed to run {}: {e}", bin.display()));
+        .unwrap_or_else(|e| panic!("failed to run ainl: {e}"));
     let _ = std::fs::remove_file(&tmp);
     assert!(
         out.status.success(),
@@ -97,6 +114,104 @@ fn interp_stdout(src: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The AOT C backend's RAW (stdout, stderr) for `src`.
+///
+/// Compiles `src` to a standalone binary with `ainl compile` — the same path
+/// `scripts/parity5.sh` and `aot_numeric.rs` use — and runs it. Returns None
+/// when `cc` is not installed, matching the graceful-skip of the other runners:
+/// a missing C compiler is an environment gap, not a backend bug.
+///
+/// Raw (untrimmed) bytes: the byte-for-byte comparison in
+/// `all_five_backends_agree_byte_for_byte_on_the_headline_corpus` includes the
+/// trailing newline `print` emits, so nothing is stripped here.
+fn aout(src: &str) -> Option<(String, String)> {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping aot: `cc` not installed");
+        return None;
+    }
+    let src_path = temp_for("aot-src");
+    let bin_path = temp_for("aot-bin");
+    std::fs::write(&src_path, src).unwrap();
+    let compile = Command::new(ainl_bin())
+        .args([
+            "compile",
+            &src_path.to_string_lossy(),
+            "-o",
+            &bin_path.to_string_lossy(),
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to invoke ainl compile: {e}"));
+    let _ = std::fs::remove_file(&src_path);
+    if !compile.status.success() || !bin_path.is_file() {
+        panic!(
+            "ainl compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+    let out = Command::new(&bin_path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run aot binary: {e}"));
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        out.status.success(),
+        "aot binary exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some((
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+/// The interpreter's RAW (stdout, stderr) for `src` — no trim, for the
+/// byte-for-byte comparison.
+fn interp_raw(src: &str) -> (String, String) {
+    let tmp = temp_for("interp-raw");
+    std::fs::write(&tmp, src).unwrap();
+    let out = Command::new(ainl_bin())
+        .arg("run")
+        .arg(&tmp)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run ainl: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "interpreter errored: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Run `code` under `runner`, returning the RAW (stdout, stderr) — no trim, so
+/// the byte-for-byte comparison includes the trailing newline `print` emits.
+/// Asserts a zero exit: a non-zero exit on one backend while the others print
+/// is itself a divergence. Returns None when the runner isn't installed.
+fn raw_run(runner: &str, code: &str, tag: &str) -> Option<(String, String)> {
+    if Command::new(runner).arg("--version").output().is_err() {
+        eprintln!("skipping {tag}: `{runner}` not installed");
+        return None;
+    }
+    let tmp = temp_for(tag);
+    std::fs::write(&tmp, code).unwrap();
+    let out = Command::new(runner)
+        .arg(&tmp)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {runner}: {e}"));
+    std::fs::remove_file(&tmp).ok();
+    assert!(
+        out.status.success(),
+        "{tag} exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some((
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
 }
 
 /// A temp path unique to this process AND this call.
@@ -213,6 +328,75 @@ fn the_interpreter_agrees_exactly_with_every_transpiler() {
         if let Some(out) = run("ruby", &rb, "ruby-vs-interp") {
             assert_eq!(out, want, "ruby on {expr}");
         }
+    }
+}
+
+#[test]
+fn all_five_backends_agree_byte_for_byte_on_the_headline_corpus() {
+    // THE integration gate (numeric card 5/6). The three headline programs from
+    // docs/NUMERIC_MODEL.md — i64::MAX * 2, (fact 25), (fact 100) — must come
+    // out byte-for-byte identical on EVERY backend, on BOTH streams.
+    //
+    // This is the test the whole chain was built to make true: cards 1–4 each
+    // changed one runtime and re-pinned its own tests, and this is the first
+    // place all five backends are held to the SAME bytes at once, out of range.
+    // It is deliberately the inverse of what this file used to be — before card
+    // 4 it pinned the *divergence* (four different answers); now it pins the
+    // *absence* of one. If any backend drifts, this fails with the two outputs
+    // in the message, so a regression is a visible diff, not a silent one.
+    //
+    // The interpreter is the reference. AOT is compiled with `ainl compile`
+    // (the same path parity5.sh and aot_numeric.rs use); JS/Python/Ruby are
+    // transpiled and run under their host. Each is compared to the
+    // interpreter's RAW stdout and RAW stderr — untrimmed, so the trailing
+    // newline `print` emits is part of the bytes, and a stderr difference
+    // (an error on one backend, a print on another) is caught too.
+    let (i_out, i_err) = interp_raw(SRC);
+
+    // AOT C binary — the backend that was NOT in this file before card 5.
+    if let Some((a_out, a_err)) = aout(SRC) {
+        assert_eq!(
+            a_out, i_out,
+            "AOT stdout diverges from the interpreter.\n--- aot ---\n{a_out}\n--- interp ---\n{i_out}"
+        );
+        assert_eq!(
+            a_err, i_err,
+            "AOT stderr diverges from the interpreter.\n--- aot ---\n{a_err}\n--- interp ---\n{i_err}"
+        );
+    }
+
+    let js = transpile_js_src(SRC).unwrap();
+    let py = transpile_python_src(SRC).unwrap();
+    let rb = transpile_ruby_src(SRC).unwrap();
+    if let Some((out, err)) = raw_run("node", &js, "gate-js") {
+        assert_eq!(
+            out, i_out,
+            "JS stdout diverges.\n--- js ---\n{out}\n--- interp ---\n{i_out}"
+        );
+        assert_eq!(
+            err, i_err,
+            "JS stderr diverges.\n--- js ---\n{err}\n--- interp ---\n{i_err}"
+        );
+    }
+    if let Some((out, err)) = raw_run("python3", &py, "gate-py") {
+        assert_eq!(
+            out, i_out,
+            "Python stdout diverges.\n--- py ---\n{out}\n--- interp ---\n{i_out}"
+        );
+        assert_eq!(
+            err, i_err,
+            "Python stderr diverges.\n--- py ---\n{err}\n--- interp ---\n{i_err}"
+        );
+    }
+    if let Some((out, err)) = raw_run("ruby", &rb, "gate-rb") {
+        assert_eq!(
+            out, i_out,
+            "Ruby stdout diverges.\n--- rb ---\n{out}\n--- interp ---\n{i_out}"
+        );
+        assert_eq!(
+            err, i_err,
+            "Ruby stderr diverges.\n--- rb ---\n{err}\n--- interp ---\n{i_err}"
+        );
     }
 }
 

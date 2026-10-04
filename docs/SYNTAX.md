@@ -230,7 +230,7 @@ everywhere, and `json-parse` returns a tagged float for a decimal/exponential
 literal and a raw int otherwise. JS used to collapse the two (it has one
 `Number` type), which made `(json-serialize 1)` print `1.0` there and `1`
 everywhere else; the tagged-number fix closed that. §3j describes the fix and
-the one divergence that remains (magnitude, not type).
+the magnitude dimension that card 4 of the numeric chain closed on top of it.
 
 ## 3a. `ainl repl` — interactive and scripted
 
@@ -1311,15 +1311,22 @@ gone:
   round trip is byte-identical across backends. §3's JSON note is updated
   accordingly.
 
-### The one divergence that remains
+### The magnitude dimension is closed too
 
-The tag closes the *type* dimension. It does **not** close the *magnitude*
-one: JS still computes in IEEE-754 doubles, so it does not reproduce the
-interpreter's i64-overflow promotion (e.g. `(* 9223372036854775807 2)` is
-`18446744073709552000` on JS and Python/Ruby's exact
-`18446744073709551614`). That is the accepted divergence documented in
-[NUMERIC_MODEL.md](NUMERIC_MODEL.md) and pinned by
-`crates/ainl-transpile/tests/numeric_divergence.rs`.
+The tag closed the *type* dimension; card 4 of the numeric chain closed the
+*magnitude* one. JS integers are now native `BigInt`s, so JS no longer
+rounds out-of-range values — `(* 9223372036854775807 2)` is the exact
+`18446744073709551614` on all five backends, not the f64-rounded
+`18446744073709552000` it used to be. Both dimensions of the JS int/float
+collapse are therefore closed: type via the `_Float` tag (this section),
+range via `BigInt` (card 4). The only remaining JS-vs-interpreter difference
+is the float *display* rule for a **whole** float — the interpreter prints the
+exact binary expansion, JS prints the shortest round-tripping decimal, and Ruby
+(also diverging) prints it in scientific notation; Python, AOT and the
+interpreter agree byte-for-byte. Documented in [NUMERIC_MODEL.md](NUMERIC_MODEL.md)
+("the float display rule") and pinned by
+`crates/ainl-transpile/tests/numeric_divergence.rs`, which now pins the
+*absence* of integer divergence rather than its presence.
 
 ### How it is pinned
 

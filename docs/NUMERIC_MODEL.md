@@ -12,7 +12,7 @@ any of the five, so all five agree byte-for-byte for **any integer value AINL
 can express** — that is what `scripts/check-transpile.sh` and
 `scripts/parity5.sh` verify.
 
-## Measured divergence
+## Measured agreement
 
 ```lisp
 (print (* 9223372036854775807 2))   ; i64::MAX * 2
@@ -68,9 +68,23 @@ the interpreter, the bytecode VM, the AOT binary and the Python, Ruby and
 JavaScript targets all compute the exact mathematical value, because all of
 them use arbitrary-precision integers.
 
-Float behaviour is unchanged and still bounded: `/` returns a float, and float
-arithmetic remains `f64` in every backend. So does one float-*display* rule —
-see "the float display rule" below.
+The full numeric model closes **both** dimensions of the old JS int/float
+collapse. The *type* dimension — a whole float losing its `.0`, a float index
+being accepted, an int being named a float in error text — was closed by the
+`_Float` tag (SYNTAX.md §3j, card 1). The *magnitude* dimension — JS rounding
+out-of-range integers to f64 — was closed by `BigInt` (card 4). With both
+closed, there is no integer value AINL can express on which any backend
+disagrees: `(* 9223372036854775807 2)`, `(fact 25)` and `(fact 100)` are
+byte-identical on all five, on stdout and stderr, which is what
+`crates/ainl-transpile/tests/numeric_divergence.rs` now pins.
+
+The only remaining divergence is a **float-display edge**: for a *whole* float,
+the interpreter, the AOT binary and the Python target all print the exact
+binary expansion, while **JavaScript and Ruby** print the shortest
+round-tripping decimal for the same `f64` (Ruby in scientific notation). See
+"the float display rule" below for the measured table. A non-whole float
+agrees everywhere. Float behaviour is otherwise unchanged and still bounded:
+`/` returns a float, and float arithmetic remains `f64` in every backend.
 
 ## JavaScript uses `BigInt`, and what that costs
 
@@ -133,14 +147,33 @@ Not new, and unchanged by any of the integer work above — recorded here becaus
 it is the one place two backends still print different text for the *same*
 value.
 
-For a float, `print` uses the **exact** binary expansion on the interpreter
-(`{:.1}`, so `(print 1e300)` emits 303 characters) while the transpilers print
-the **shortest** round-tripping decimal. Both read back as the same `f64`; they
-differ only in which decimal is chosen. It shows up only for large magnitudes —
-`(* big 1.5)` prints `27670116110564327424.0` on the interpreter and
-`27670116110564327000.0` on JS, which are the same f64 (the latter is the
-shortest form of it). `json-serialize` uses the shortest form everywhere *by
-design*; see "json-serialize has its own float rule" below for why.
+For a **whole** float, `print` uses the **exact** binary expansion on the
+interpreter (`{:.1}` in `Value`'s `Display`, so `(print 1e300)` emits 303
+characters). The backends do **not** all agree on that, and the split is worth
+being precise about:
+
+| Backend | Whole-float `print` | Rule |
+| --- | --- | --- |
+| interpreter | `27670116110564327424.0` | exact expansion (`{:.1}`) |
+| AOT | `27670116110564327424.0` | exact expansion — matches the interpreter |
+| Python | `27670116110564327424.0` | exact expansion (`'%.1f' % x` in `_disp`) |
+| JavaScript | `27670116110564327000.0` | shortest round-tripping decimal |
+| Ruby | `2.7670116110564327e+19` | shortest round-tripping, scientific |
+
+Python is *not* part of this divergence: its `_disp` mirrors the interpreter's
+whole-float branch (`('%.1f' % x) if x.is_integer() else repr(x)`), so it
+agrees byte-for-byte. The divergence is **JS and Ruby only**, and they are not
+even the same rule — JS prints the shortest form in plain positional notation
+while Ruby falls back to scientific notation for large exponents. All three
+read back as the same `f64`; they differ only in which decimal is chosen.
+
+A **non-whole** float agrees everywhere: `(/ 1.0 3)` is `0.3333333333333333` and
+`(+ 0.1 0.2)` is `0.30000000000000004` on all five, because there the
+interpreter falls through to plain `{}`/`repr()`, which is already the shortest
+round-tripping form.
+
+`json-serialize` uses the shortest form everywhere *by design*; see
+"json-serialize has its own float rule" below for why.
 
 ## The AOT compiler targets the *interpreter's* model, not the transpilers'
 
@@ -272,7 +305,9 @@ both halves so neither can drift.
      differ between the interpreter/AOT and the Python/Ruby transpilers, whose
      host `Integer#%`/`Comparable` apply their own rules.
 
-   §"Measured divergence" above is a regression fixture
+   §"Measured agreement" above is a regression fixture
    (`crates/ainl-transpile/tests/numeric_divergence.rs`) so a future change to
-   any target's arithmetic doesn't silently drift without a test noticing, and
-   `scripts/parity5.sh` runs one program through all five backends and diffs.
+   any target's arithmetic doesn't silently drift without a test noticing — it
+   now pins the *absence* of divergence, including a byte-for-byte five-backend
+   gate on the headline corpus — and `scripts/parity5.sh` runs one program
+   through all five backends and diffs.
