@@ -424,6 +424,14 @@ jobs:
       - name: Documented file-system behavior + 4-backend parity
         run: ./scripts/check-fs-builtins.sh
 
+      # The same gate for `rmdir`, with a program that additionally needs a
+      # symlink the shell creates for it — AINL has no symlink builtin, and
+      # following a link is the one thing the four hosts' recursive deletes all
+      # get differently. Skipped as a soft fail if the runner cannot make a
+      # link; the script reports that as a failure rather than passing quietly.
+      - name: rmdir parity, including the symlink rule
+        run: ./scripts/check-rmdir.sh
+
       # The documentation half: every snippet in SYNTAX.md §3h is run and
       # compared to the answer written beside it, so §3h cannot drift from the
       # language. This section is almost entirely about behavior that is *not*

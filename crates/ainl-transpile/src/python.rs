@@ -180,9 +180,16 @@ impl Py {
         //    byte-for-byte, so every failure must be routed through `_error`,
         //    which raises AINL's own `_AinlError` and therefore stays
         //    catchable by an AINL `catch` instead of leaking the host's type.
-        if ["_mkdir", "_rename", "_copy", "_is_dir", "_file_size"]
-            .iter()
-            .any(|n| self.needed.contains(*n))
+        if [
+            "_mkdir",
+            "_rmdir",
+            "_rename",
+            "_copy",
+            "_is_dir",
+            "_file_size",
+        ]
+        .iter()
+        .any(|n| self.needed.contains(*n))
         {
             self.needed.insert("_Sym");
             self.needed.insert("_error");
@@ -193,6 +200,15 @@ impl Py {
             // 4-backend rule compares that text, so the name has to come from
             // the shared helper rather than from isinstance.
             self.needed.insert("_ainl_tname");
+        }
+        // `_rmdir` pulls in the recursive walk for its `":recursive"` form. It
+        // is a separate entry rather than a branch of `_rmdir` because it is a
+        // loop: inlined, the rule that matters (post-order, never through a
+        // symlink) would sit under string handling. The RUNTIME table is
+        // emitted in declaration order, so the walk is declared after `_rmdir`
+        // and is available wherever the function that names it is.
+        if self.needed.contains("_rmdir") {
+            self.needed.insert("_fs_rm_tree");
         }
         // `errno` is a module, not a helper: `_rename` compares against
         // errno.EXDEV to name the cross-device case. It is imported lazily
@@ -710,6 +726,7 @@ impl Py {
                 "path-dir" => return self.call_builtin("_path_dir", args, Some("_path_dir")),
                 // ---- Tier 3 file system ----
                 "mkdir" => return self.call_builtin("_mkdir", args, Some("_mkdir")),
+                "rmdir" => return self.call_builtin("_rmdir", args, Some("_rmdir")),
                 "rename" => return self.call_builtin("_rename", args, Some("_rename")),
                 "copy" => return self.call_builtin("_copy", args, Some("_copy")),
                 "is-dir" => return self.call_builtin("_is_dir", args, Some("_is_dir")),
@@ -1581,6 +1598,39 @@ const RUNTIME: &[(&str, &str)] = &[
         // reading the code.) _ainl_tname renders the *AINL* type name, so
         // `got int` matches the interpreter rather than `<class 'int'>`.
         "def _mkdir(*args):\n    import os\n    if len(args) < 1 or len(args) > 2: _error('mkdir expects (mkdir path) or (mkdir path option)')\n    path, opt = (list(args) + [None])[:2]\n    if not isinstance(path, str) or isinstance(path, _Sym): _error('mkdir expects a str path, got %s' % _ainl_tname(path))\n    if opt is not None:\n        if not isinstance(opt, str) or isinstance(opt, _Sym): _error('mkdir expects a str option, got %s' % _ainl_tname(opt))\n        if opt != ':recursive': _error(\"mkdir: unknown option '%s'\" % opt)\n    # lexists, not exists: the interpreter's symlink_metadata is an lstat, and a\n    # broken symlink is still a directory entry that mkdir must refuse.\n    if os.path.lexists(_fs_probe(path)):\n        _error(\"mkdir: cannot create '%s': it exists\" % path)\n    try:\n        if opt == ':recursive':\n            # The parents only. A missing parent would raise, but AINL reports\n            # every failure as the same 'cannot create', and a caller that\n            # asked for recursive creation means it.\n            parent = os.path.dirname(path)\n            if parent and not os.path.isdir(parent):\n                try:\n                    os.makedirs(parent, exist_ok=True)\n                except OSError:\n                    pass\n        os.mkdir(path)\n    except OSError:\n        _error(\"mkdir: cannot create '%s'\" % path)",
+    ),
+    (
+        "_rmdir",
+        // The inverse of _mkdir, and the same explicit-rules rule: os.rmdir,
+        // os.rmdir's exception classes and shutil.rmtree all differ, so none of
+        // them may decide anything. See docs/SYNTAX.md §3h.
+        //
+        // The arity guard is inside the helper and uses _error, for the same
+        // reason as _mkdir: a Python TypeError is not an _AinlError, so it would
+        // escape an AINL `catch` and put a traceback on stderr.
+        //
+        // The empty check is made here rather than read off ENOTEMPTY, because
+        // the message has to NAME the entry that blocked it — the one thing
+        // errno cannot carry portably. The name is the first in *byte* order,
+        // matching list-dir: os.listdir returns filesystem order, which differs
+        // per host, so "the first entry" has to be chosen by a rule every
+        // backend can express.
+        //
+        // The recursive case is a hand-rolled walk rather than shutil.rmtree:
+        // rmtree follows a symlinked directory on some platforms and not others,
+        // so a program that deleted through a link would behave differently per
+        // host. lstat here, and remove_file for a non-directory, so a symlink is
+        // unlinked and its target is never touched.
+        "def _rmdir(*args):\n    import os\n    if len(args) < 1 or len(args) > 2: _error('rmdir expects (rmdir path) or (rmdir path option)')\n    path, opt = (list(args) + [None])[:2]\n    if not isinstance(path, str) or isinstance(path, _Sym): _error('rmdir expects a str path, got %s' % _ainl_tname(path))\n    if opt is not None:\n        if not isinstance(opt, str) or isinstance(opt, _Sym): _error('rmdir expects a str option, got %s' % _ainl_tname(opt))\n        if opt != ':recursive': _error(\"rmdir: unknown option '%s'\" % opt)\n    # lexists/islink, not exists/isdir: the interpreter's symlink_metadata is an\n    # lstat, so a symlink to a directory is a symlink and is not a directory.\n    p = _fs_probe(path)\n    if not os.path.lexists(p): _error(\"rmdir: cannot remove '%s': it does not exist\" % path)\n    if os.path.islink(p) or not os.path.isdir(p): _error(\"rmdir: cannot remove '%s': it is not a directory\" % path)\n    if opt == ':recursive':\n        _fs_rm_tree(p)\n        return\n    names = [n for n in os.listdir(p) if n not in ('.', '..')]\n    if names:\n        names.sort(key=lambda s: s.encode('utf-8'))\n        _error(\"rmdir: cannot remove '%s': it is not empty (%s)\" % (path, names[0]))\n    try:\n        os.rmdir(p)\n    except OSError:\n        _error(\"rmdir: cannot remove '%s'\" % path)",
+    ),
+    (
+        // The recursive walk behind _rmdir's ':recursive'. Its own helper for
+        // the same reason _fs_mkdir_p is: it is a loop, and inlining it in the
+        // body above would bury the rule that matters (post-order, never
+        // through a symlink) under string handling. Raises rather than calling
+        // _error, so one message covers the whole walk.
+        "_fs_rm_tree",
+        "def _fs_rm_tree(p):\n    import os\n    for n in os.listdir(p):\n        c = os.path.join(p, n)\n        if os.path.islink(c):\n            # Unlink the link itself. Following it would delete the target's\n            # contents through a path the caller never named.\n            os.remove(c)\n        elif os.path.isdir(c):\n            _fs_rm_tree(c)\n        else:\n            os.remove(c)\n    os.rmdir(p)",
     ),
     (
         "_rename",

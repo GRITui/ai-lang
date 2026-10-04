@@ -867,6 +867,13 @@ fn install_stdlib(env: &Env) {
     // create_dir_all vs Dir.mkdir's two arities), and about whether a
     // trailing separator is legal against a file.
     b!("mkdir", builtin_mkdir);
+    // `rmdir` is the inverse, and the same explicit-POSIX-rules rule applies:
+    // os.rmdir / fs.rmdirSync / Dir.rmdir are all empty-only, so the rule every
+    // backend already agrees on is "empty or nothing" — and the recursive form
+    // is hand-rolled on each side rather than delegated to shutil.rmtree /
+    // fs.rmSync / FileUtils, which disagree about symlinks and about how a
+    // partial failure is reported.
+    b!("rmdir", builtin_rmdir);
     b!("rename", builtin_rename);
     b!("copy", builtin_copy);
     b!("is-dir", builtin_is_dir);
@@ -1655,6 +1662,172 @@ fn builtin_mkdir(args: &[Value]) -> Result<Value> {
         // languages. "cannot create" plus the path is the honest common claim.
         Err(_) => Err(Error::runtime(format!("mkdir: cannot create '{path}'"))),
     }
+}
+
+/// The first entry name in `dir`, in the same byte order `list-dir` returns.
+///
+/// `None` when the directory cannot be read at all — and that case is *not*
+/// reported as empty. "Empty" and "unreadable" are different claims, and the
+/// only reason this exists is to put the right one in an error message: a
+/// directory holding an entry nobody could list is not empty, so `rmdir`
+/// must not tell a caller it is.
+fn fs_first_entry(dir: &std::path::Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|s| s != "." && s != "..")
+        .collect();
+    // Byte order, exactly as `builtin_list_dir` sorts — see the doc comment
+    // there for why the comparison is on bytes rather than characters.
+    names.sort_unstable();
+    names.into_iter().next()
+}
+
+/// `(rmdir path)` / `(rmdir path ":recursive")` → `nil`.
+///
+/// **The inverse of `mkdir`**, and the half of the file-system API that was
+/// missing: a program could create a directory and could not remove one, so a
+/// tool that organized files left its own scaffolding behind forever. `rmdir`
+/// is where a program cleans up after itself.
+///
+/// **The option is a positional string, not a keyword** — the same rule
+/// `mkdir` and `test` follow (see the `mkdir` doc comment and docs/SYNTAX.md
+/// §3h). AINL has no keyword-argument syntax; a bare `:recursive` is an
+/// ordinary symbol and fails at eval time as `unbound symbol ':recursive'`
+/// before `rmdir` is reached, identically on all five backends.
+///
+/// **Without `":recursive"`, only an EMPTY directory can be removed.** This is
+/// POSIX `rmdir(2)`, and the rule is not politeness: the two hosts that have a
+/// recursive delete (`shutil.rmtree`, `Dir.children` + `File.unlink`) also have
+/// one that is *not* recursive, while `os.rmdir`, `fs.rmdirSync` and `Dir.rmdir`
+/// are all empty-only — so an empty-only rule is the one every backend already
+/// agrees on, and the message can be identical rather than host-shaped.
+///
+/// **The refusal names the first entry**, not a count. A count answers a
+/// question the caller did not ask ("how much is in here?"); a name answers the
+/// one it did ("what is stopping me?"), and it is a name the caller can act on
+/// — `(rmdir (path-join p "reports"))` is the next call. The name is the first
+/// in **byte order**, so it is the same entry on every backend — `readdir`
+/// order is filesystem-dependent and differs per host, which is the same
+/// reason `list-dir` sorts.
+///
+/// **`:recursive` is a full subtree delete, and it is not reversible.** It
+/// removes the directory *and every file and directory under it*, by
+/// unlink/rmdir, never by moving anything aside. AINL has no trash and no
+/// undo, so a caller who wants the data kept must `rename` it out first — which
+/// is one syscall and is the correct way to express "archive this".
+///
+/// **Every failure is an AINL error, never `nil`.** A missing path is an error
+/// rather than `nil` even though `is-dir` answers `nil` for the same path:
+/// `is-dir` is a *question* and has one negative answer, while `rmdir` is an
+/// *action* — "delete this" against a typo must not look like a success. A file
+/// is an error too, because `delete-file` exists for that and a caller who
+/// reached for `rmdir` made a mistake worth reporting.
+fn builtin_rmdir(args: &[Value]) -> Result<Value> {
+    // Arity before the option, and the message names the two accepted shapes
+    // without quoting the option token: the transpiler targets' `repr` helpers
+    // do not escape a double quote inside a rendered string (see the same note
+    // on `builtin_mkdir`), so `":recursive"` here would render differently on
+    // python/js/ruby than on the interpreter and the C runtime.
+    let [p, opt @ ..] = args else {
+        return Err(Error::runtime(
+            "rmdir expects (rmdir path) or (rmdir path option)",
+        ));
+    };
+    if opt.len() > 1 {
+        return Err(Error::runtime(
+            "rmdir expects (rmdir path) or (rmdir path option)",
+        ));
+    }
+    let path = as_path_arg(p, "rmdir")?;
+    let mut recursive = false;
+    for o in opt {
+        let Value::Str(s) = o else {
+            return Err(Error::runtime(format!(
+                "rmdir expects a str option, got {}",
+                o.type_name()
+            )));
+        };
+        if s.as_str() != ":recursive" {
+            return Err(Error::runtime(format!("rmdir: unknown option '{s}'")));
+        }
+        recursive = true;
+    }
+
+    // The probes are made here rather than left to the host, so all three
+    // transpiler targets and the C runtime can produce the identical text.
+    // `symlink_metadata` for the same reason as every other fs builtin: a
+    // decision about a symlink is a decision about the *link* (see §3h).
+    let probe = fs_probe_path(path);
+    let meta = match std::fs::symlink_metadata(probe) {
+        Err(_) => {
+            return Err(Error::runtime(format!(
+                "rmdir: cannot remove '{path}': it does not exist"
+            )))
+        }
+        Ok(m) => m,
+    };
+    if !meta.is_dir() {
+        return Err(Error::runtime(format!(
+            "rmdir: cannot remove '{path}': it is not a directory"
+        )));
+    }
+
+    if recursive {
+        // A hand-rolled `remove_dir_all` rather than `std::fs`'s, for the same
+        // reason `builtin_mkdir` hand-rolls `create_dir_all`: the C runtime and
+        // the three hosts each spell this differently, and the *order* of
+        // removal is what has to match. Children before parents, depth-first,
+        // and a directory is rmdir'd only once it is empty — which is the same
+        // post-order walk `rm -r` performs.
+        match fs_remove_tree(std::path::Path::new(probe)) {
+            Ok(()) => Ok(Value::Nil),
+            // One message for every failure, for the reason `mkdir` collapses
+            // its errno zoo: AINL does not surface errno, and the hosts each
+            // name a different one for the same situation.
+            Err(_) => Err(Error::runtime(format!("rmdir: cannot remove '{path}'"))),
+        }
+    } else {
+        // The empty check is made *before* rmdir(2) rather than read off
+        // ENOTEMPTY, so the message can name the entry that blocked it — which
+        // is the one thing errno cannot carry portably.
+        if let Some(first) = fs_first_entry(std::path::Path::new(probe)) {
+            return Err(Error::runtime(format!(
+                "rmdir: cannot remove '{path}': it is not empty ({first})"
+            )));
+        }
+        match std::fs::remove_dir(probe) {
+            Ok(()) => Ok(Value::Nil),
+            Err(_) => Err(Error::runtime(format!("rmdir: cannot remove '{path}'"))),
+        }
+    }
+}
+
+/// Remove `dir` and everything under it, depth-first.
+///
+/// Split out of `builtin_rmdir` so the walk is one function rather than a
+/// closure, and so both the interpreter and the test suite can reason about it
+/// on its own. Returns `Err` on the **first** failure and stops, which is what
+/// makes a partial delete visible to the caller rather than silent — the same
+/// choice `rm -r` makes when it cannot unlink something.
+///
+/// The symlink rule is the one from §3h and it matters most *here*: a symlink
+/// is unlinked, never followed. Following it would delete the target's
+/// *contents* through a link the caller never named, which is the single
+/// worst thing a recursive delete can do.
+fn fs_remove_tree(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        if meta.is_dir() {
+            fs_remove_tree(&entry.path())?;
+        } else {
+            // remove_file unlinks a symlink itself rather than its target, so a
+            // link inside the tree disappears without taking its target with it.
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::remove_dir(dir)
 }
 
 /// `(rename from to)` → `nil`, moving a file or a directory.

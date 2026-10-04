@@ -32,6 +32,7 @@ fn main() {
         .chain(ainl_core::db::DB_BUILTINS.iter().copied())
         .chain(ainl_core::dbkv::KV_BUILTINS.iter().copied())
         .chain(ainl_core::dbtab::TABLE_BUILTINS.iter().copied())
+        .chain(ainl_core::dbquery::SQL_BUILTINS.iter().copied())
         .collect();
     let mut unique: Vec<&str> = refused.clone();
     unique.sort_unstable();

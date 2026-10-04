@@ -20,12 +20,14 @@ fn rb(src: &str) -> String {
 #[test]
 fn file_system_builtins_map_to_their_helpers() {
     let out = rb(r#"(do (mkdir "d" ":recursive")
+             (rmdir "d" ":recursive")
              (rename "a" "b")
              (copy "a" "b")
              (is-dir "d")
              (file-size "a"))"#);
     for call in [
         "_mkdir(\"d\", \":recursive\")",
+        "_rmdir(\"d\", \":recursive\")",
         "_rename(\"a\", \"b\")",
         "_copy(\"a\", \"b\")",
         "_is_dir(\"d\")",
@@ -35,6 +37,7 @@ fn file_system_builtins_map_to_their_helpers() {
     }
     for helper in [
         "_mkdir",
+        "_rmdir",
         "_rename",
         "_copy",
         "_is_dir",
@@ -47,6 +50,149 @@ fn file_system_builtins_map_to_their_helpers() {
             "missing helper {helper}:\n{out}"
         );
     }
+}
+
+#[test]
+fn void_file_builtins_return_nil_ruby_returns_its_last_expression() {
+    // The Ruby-specific trap, and the one bug this projection actually had.
+    //
+    // Ruby returns the value of its last expression, and Ruby's filesystem
+    // calls return something: `Dir.mkdir` and `File.rename` return 0,
+    // `File.write` and `IO.copy_stream` return a byte count. Left as the last
+    // expression of a helper, that value becomes the AINL program's answer —
+    // so `(print (write-file "a.txt" "A"))` printed `1` on ruby and `nil` on the
+    // interpreter, the AOT binary and the python and js ports.
+    //
+    // The existing parity program never *prints* the result of these builtins,
+    // which is why the divergence survived: a void builtin's value is invisible
+    // unless something asks for it. `scripts/check-rmdir.sh` and the fixtures
+    // close that gap, and this test pins the fix at the source.
+    // `file-size` is in the program only so its helper is emitted — it is the
+    // one filesystem builtin that returns a value, and its exception below is
+    // checked against the same output.
+    let out = rb(
+        r#"(do (mkdir "d") (write-file "a" "A") (append-file "a" "B")
+             (rename "a" "b") (copy "b" "c") (delete-file "c") (rmdir "d")
+             (file-size "b"))"#,
+    );
+    for helper in [
+        "_write_file",
+        "_append_file",
+        "_mkdir",
+        "_rename",
+        "_copy",
+        "_delete_file",
+        "_rmdir",
+    ] {
+        let body = out
+            .split(&format!("def {helper}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing helper {helper}:\n{out}"))
+            // Stop at the next `def` so the trailing `nil` is checked in the
+            // right body and not in whatever follows.
+            .split("\ndef ")
+            .next()
+            .unwrap();
+        // The last statement before the closing `end` must be a bare `nil`.
+        // Not the last line: the body's final line is always `end`, and the
+        // explicit nil sits above it. Comparing whole lines (rather than
+        // `body.trim_end().ends_with("nil")`) is what makes "a bare nil" mean
+        // what it says — a body ending in a call whose name happens to end in
+        // "nil" would otherwise pass.
+        let last = body
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty() && *l != "end")
+            .unwrap_or("");
+        assert_eq!(
+            last, "nil",
+            "{helper} must end in an explicit nil so Ruby's last-expression \
+             return cannot leak a host value; its last statement is `{last}`:\n{body}"
+        );
+    }
+    // The one exception, and it is not an oversight: file-size returns a number
+    // on every backend, so its st.size must stay the last expression.
+    //
+    // Truncated at the next `def` for the same reason as the loop above —
+    // otherwise the "last statement" is looked for in whatever helper follows.
+    let size = out
+        .split("def _file_size(")
+        .nth(1)
+        .expect("_file_size must be emitted")
+        .split("\ndef ")
+        .next()
+        .unwrap();
+    let size_last = size
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && *l != "end")
+        .unwrap_or("");
+    assert_eq!(
+        size_last, "st.size",
+        "file-size returns a value, so it must not end in nil:\n{size}"
+    );
+}
+
+#[test]
+fn rmdir_never_reaches_fileutils_and_names_the_blocking_entry() {
+    // FileUtils.rm_rf is quiet about a failure it cannot perform, so a partial
+    // delete would look complete — and it is a `require`, which the transpiler
+    // does not emit. The walk is hand-rolled, and it lstats so a symlink is
+    // unlinked rather than descended into.
+    //
+    // The refusal names the entry, sorted by `n.b` (byte order) — the same key
+    // _list_dir uses, because Dir.children returns filesystem order.
+    let out = rb(r#"(rmdir "d" ":recursive")"#);
+    assert!(
+        !out.contains("FileUtils"),
+        "the host's recursive delete must not be reached:\n{out}"
+    );
+    assert!(
+        out.contains("sort_by { |n| n.b }"),
+        "the named entry must be the first in byte order:\n{out}"
+    );
+    assert!(
+        out.contains("it is not empty (#{names[0]})"),
+        "the refusal must name the entry:\n{out}"
+    );
+    // The walk is post-order, and `st.directory? && !st.symlink?` is what keeps
+    // a link from being descended into.
+    let walk = out
+        .split("def _fs_rm_tree(")
+        .nth(1)
+        .expect("_fs_rm_tree must be emitted");
+    assert!(
+        walk.contains("File.lstat(c)"),
+        "the walk must lstat, not stat:\n{out}"
+    );
+    assert!(
+        walk.contains("st.directory? && !st.symlink?"),
+        "a symlink must be unlinked, not descended into:\n{out}"
+    );
+    let recurse = walk.find("_fs_rm_tree(c)").expect("the recursion");
+    let rmdir = walk.find("Dir.rmdir(p)").expect("the final rmdir");
+    assert!(recurse < rmdir, "children before parents:\n{out}");
+}
+
+#[test]
+fn rmdir_refuses_a_symlink_and_owns_its_arity() {
+    // File.directory? follows a symlink, so `st.symlink? || !st.directory?` is
+    // the whole difference between "unlink the link" and "delete the target".
+    // And the arity guard is inside the helper with *args: a Ruby
+    // ArgumentError is not an AINL error, so it would escape a `catch`.
+    let out = rb(r#"(rmdir "d")"#);
+    assert!(
+        out.contains("st.symlink? || !st.directory?"),
+        "a symlink must not be treated as a directory:\n{out}"
+    );
+    assert!(
+        out.contains("def _rmdir(*args)"),
+        "rmdir must take *args so arity is AINL's error:\n{out}"
+    );
+    assert!(
+        out.contains("it does not exist") && out.contains("it is not a directory"),
+        "both refusals must be AINL's own text:\n{out}"
+    );
 }
 
 #[test]

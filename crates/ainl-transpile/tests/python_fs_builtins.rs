@@ -25,12 +25,14 @@ fn py(src: &str) -> String {
 #[test]
 fn file_system_builtins_map_to_their_helpers() {
     let out = py(r#"(do (mkdir "d" ":recursive")
+             (rmdir "d" ":recursive")
              (rename "a" "b")
              (copy "a" "b")
              (is-dir "d")
              (file-size "a"))"#);
     for call in [
         "_mkdir(\"d\", \":recursive\")",
+        "_rmdir(\"d\", \":recursive\")",
         "_rename(\"a\", \"b\")",
         "_copy(\"a\", \"b\")",
         "_is_dir(\"d\")",
@@ -40,6 +42,7 @@ fn file_system_builtins_map_to_their_helpers() {
     }
     for helper in [
         "_mkdir",
+        "_rmdir",
         "_rename",
         "_copy",
         "_is_dir",
@@ -51,6 +54,17 @@ fn file_system_builtins_map_to_their_helpers() {
             "missing helper {helper}:\n{out}"
         );
     }
+    // The recursive walk is pulled in by _rmdir alone, so a program that only
+    // renames does not carry it.
+    let without = py(r#"(rename "a" "b")"#);
+    assert!(
+        !without.contains("def _fs_rm_tree("),
+        "_fs_rm_tree must not be emitted unless rmdir is used:\n{without}"
+    );
+    assert!(
+        out.contains("def _fs_rm_tree("),
+        "_rmdir must bring its recursive walk:\n{out}"
+    );
 }
 
 #[test]
@@ -179,12 +193,76 @@ fn file_system_failures_go_through_error_not_a_host_exception() {
 }
 
 #[test]
+fn rmdir_never_reaches_shutil_rmtree_and_names_the_blocking_entry() {
+    // Two things, both of which a naive port gets wrong.
+    //
+    // 1. shutil.rmtree follows a symlinked *file* on some platforms and its
+    //    error handling differs by version, so a program that deleted through a
+    //    link would behave differently per host. The walk is hand-rolled.
+    // 2. The refusal must NAME the entry, and in byte order — os.listdir returns
+    //    filesystem order, so "the first entry" has to be chosen by a rule every
+    //    backend can express, the same one list-dir already uses.
+    let out = py(r#"(rmdir "d" ":recursive")"#);
+    assert!(
+        !out.contains("shutil.rmtree"),
+        "the host's recursive delete must not be reached:\n{out}"
+    );
+    assert!(
+        out.contains("names.sort(key=lambda s: s.encode('utf-8'))"),
+        "the named entry must be the first in byte order:\n{out}"
+    );
+    assert!(
+        out.contains("it is not empty (%s)"),
+        "the refusal must name the entry:\n{out}"
+    );
+    // The walk is post-order and never through a link: islink is checked BEFORE
+    // isdir, because a link to a directory would otherwise be descended into.
+    let walk = out
+        .split("def _fs_rm_tree(")
+        .nth(1)
+        .expect("_fs_rm_tree must be emitted");
+    let islink = walk.find("os.path.islink(c)").expect("the islink guard");
+    let isdir = walk.find("os.path.isdir(c)").expect("the isdir branch");
+    assert!(islink < isdir, "islink must be checked first:\n{out}");
+}
+
+#[test]
+fn rmdir_refuses_a_symlink_and_a_missing_path_in_own_words() {
+    // A link to a directory is not a directory (the lstat rule), and a missing
+    // path is an error rather than nil. Both messages are AINL's, raised
+    // through _error, so a `catch` can intercept them.
+    let out = py(r#"(rmdir "d")"#);
+    assert!(
+        out.contains("os.path.islink(p) or not os.path.isdir(p)"),
+        "a symlink must not be treated as a directory:\n{out}"
+    );
+    assert!(
+        out.contains("it does not exist") && out.contains("it is not a directory"),
+        "both refusals must be AINL's own text:\n{out}"
+    );
+    assert!(
+        out.contains("def _rmdir(*args)"),
+        "rmdir must take *args so arity is AINL's error, not a Python one:\n{out}"
+    );
+    // The arity guard must come before the path is used, or a wrong-typed
+    // option would be reported as a path error.
+    let arity = out
+        .find("if len(args) < 1 or len(args) > 2")
+        .expect("arity");
+    let path = out
+        .find("_error('rmdir expects a str path")
+        .expect("path check");
+    assert!(arity < path, "arity must be checked first:\n{out}");
+}
+
+#[test]
 fn the_trailing_separator_is_trimmed_by_the_shared_probe() {
     // "f/" is not a legal way to name a non-directory on any of the four
-    // hosts, so the query path is trimmed. One helper, used by all five
+    // hosts, so the query path is trimmed. One helper, used by all six
     // builtins, is what keeps that consistent.
-    let out =
-        py(r#"(do (is-dir "p") (file-size "p") (mkdir "d") (rename "a" "b") (copy "a" "b"))"#);
+    let out = py(
+        r#"(do (is-dir "p") (file-size "p") (mkdir "d") (rmdir "d") (rename "a" "b") (copy "a" "b"))"#,
+    );
     assert!(
         out.contains("def _fs_probe(path):") && out.contains("path.endswith('/')"),
         "_fs_probe must strip a trailing separator:\n{out}"

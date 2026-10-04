@@ -163,6 +163,20 @@ const BUILTIN_IDS: &[(&str, i32)] = &[
     // one of the things the refusal has to cover.
     ("db-query", 82),
     ("db-query-count", 83),
+    // Tier 3 file system, companion. Appended last for the same reason as every
+    // earlier group: each id keeps the value it has always had, and the `enum`
+    // in runtime.c is extended in exactly this order.
+    //
+    // It is NOT numbered next to `mkdir` (id 62). The rule is "append, never
+    // renumber" — inserting a 63 and shifting `rename` through `db-count` up
+    // by one would keep this table and the enum consistent with each other and
+    // still be a data-format change for anything that ever persisted a
+    // compiled binary's ids. crates/ainl-cc/tests/aot_stdlib.rs checks both
+    // directions of the mapping, so a drift here fails the suite.
+    //
+    // Merged after the Tier 4 table/query layer, so it takes the next free id
+    // (84) rather than the 77 the rmdir branch originally assigned.
+    ("rmdir", 84),
 ];
 
 /// Compile AINL forms to a self-contained C file (runtime + generated code).

@@ -271,14 +271,15 @@ $ ./fib10
     and read back losslessly.</li>
     <li><strong>Lossless interop.</strong> The same AST projects to idiomatic Python,
     JavaScript, and Ruby — byte-equivalent across all four backends.</li>
-    <li><strong>84 builtins</strong> — 67 byte-identical across the interpreter,
+    <li><strong>87 builtins</strong> — 68 byte-identical across the interpreter,
     the AOT binary, and all three transpiler targets; <code>http-get</code> and
     <code>http-post</code> are interpreter-only and the other backends refuse
-    them out loud. The fifteen <code>db-*</code> storage builtins — five for
-    bytes, five for values over them, and five for tables whose primary keys are
-    indexed by a B-tree — run on the interpreter and the AOT binary and are
-    refused by the transpilers, which cannot reproduce an append-only
-    checksummed log on a host <code>open()</code>.</li>
+    them out loud. The seventeen <code>db-*</code> builtins — five for bytes,
+    five for values over them, five for tables whose primary keys are indexed
+    by a B-tree, and two for SQL queries over those tables — run on the
+    interpreter and the AOT binary and are refused by the transpilers, which
+    cannot reproduce an append-only checksummed log on a host
+    <code>open()</code>.</li>
     <li><strong>A test runner.</strong> <code>(test name expr expected)</code>
     asserts, and <code>ainl test</code> runs a directory of test files and exits
     non-zero on any failure — so AINL can check its own output, and CI can

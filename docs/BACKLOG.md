@@ -34,13 +34,6 @@ later, **Blockers** = needs an external resource or decision.
   evaluator (or a bytecode VM).
 - **More transpiler targets**: Go, Rust; and a *reverse* path (Python/JS → AINL).
 - **Editor tooling**: syntax highlighting + an LSP built on the AST + source spans.
-- **JS int/float fidelity note**: JS has one number type, so AINL float division
-  that yields a whole number prints without `.0` (documented limitation).
-- **Numeric model unification**: integer overflow behavior diverges across all
-  four runtimes today — see [NUMERIC_MODEL.md](NUMERIC_MODEL.md). Closing this
-  means either an arbitrary-precision integer type in the (zero-dependency)
-  interpreter, or `BigInt`-based codegen for the JS target; currently the
-  divergence is documented and pinned by tests rather than fixed.
 - **HTTPS for `http-get` / `http-post`**: AINL speaks plain HTTP only, and
   `https://` is refused by name. This was a decision, not an omission — the
   zero-dependency rule is what keeps the AOT binary statically linked, and
@@ -59,6 +52,18 @@ later, **Blockers** = needs an external resource or decision.
   `http-listen`, so two AINL programs cannot talk to each other.
 
 ## Recently completed
+
+**Integrated main head (bignum + Tier 4 tables/SQL + B-tree fix + `rmdir`)** —
+`main` now carries the union of the four divergent lines: arbitrary-precision
+integers (bignum in the interpreter, native `BigInt` in the JS target — all
+five backends agree byte-for-byte on any integer, see
+[NUMERIC_MODEL.md](NUMERIC_MODEL.md)), KV storage, Tier 4 tables
+(`db-create-table`/`db-insert`/`db-select`/`db-all-rows`) and SQL
+(`db-query`/`db-query-count`), the PR #23 B-tree release-profile fix, and
+`rmdir`/`delete-dir`. The two numeric backlog entries above were retired by
+the bignum/BigInt work. 87 prelude builtins (68 portable across all four
+backends; the other 19 are the 2 HTTP builtins every backend refuses and the
+17 `db-*` builtins the AOT C runtime carries but the transpilers refuse).
 
 **HTTP client (`http-get` / `http-post`)** — a hand-written zero-dependency
 HTTP/1.1 client in `ainl-core` (`http.rs`, the normative implementation):

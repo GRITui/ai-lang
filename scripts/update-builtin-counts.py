@@ -4,16 +4,15 @@
 The numbers are MEASURED, not computed: `scripts/measure-prelude.sh` installs
 the real prelude and reports
 
-    total    = 79
+    total    = 80
     refused  = 12 (the 10 db-* names + http-get + http-post)
-    portable = 67
+    portable = 68
 
-The portable number is unchanged from 4.1 — every name this card added is in
-the refused set, so none of them join the four-backend subset. That is the
-point of the layer, and it is why the total moved and the portable count did
-not. Writing "68" here because five builtins were added is exactly the
-arithmetic error 4.1 made, and `measure-prelude.sh` exists so it cannot be
-made twice.
+Neither number is a function of how many builtins a card added: `rmdir` is a
+portable builtin, so it moved both (79/67 -> 80/68), while the ten `db-*` names
+and the two HTTP ones moved only the total. `measure-prelude.sh` exists because
+guessing this arithmetic is how 4.1 got it wrong once already, and a wrong count
+in the README is a claim no test can check.
 
 Run this after any change to the prelude; re-running it is a no-op when the
 numbers are already right.
@@ -23,7 +22,11 @@ import re
 import subprocess
 import sys
 
-REPO = pathlib.Path("/Users/grit/.hermes/kanban/workspaces/t_d75c7bb4/repo")
+# Relative to this file, not an absolute path. An absolute REPO constant is
+# silently wrong the moment a second worktree exists: the script then measures
+# and rewrites a *different checkout* and reports success while doing it, which
+# is how one run of this edited another card's worktree.
+REPO = pathlib.Path(__file__).resolve().parent.parent
 README = REPO / "README.md"
 SITE = REPO / "site/index.html"
 
@@ -46,8 +49,21 @@ print(f"measured: total={total} portable={portable}")
 # ---- README ----------------------------------------------------------------
 src = README.read_text()
 before = src
-src = src.replace("- **74 builtins.** 67 are byte-identical on all four backends",
-                  f"- **{total} builtins.** {portable} are byte-identical on all four backends")
+# Regex, not a literal with the current numbers baked in: the previous version
+# replaced the exact string "- **74 builtins.** 67 are byte-identical…", so once
+# the numbers had moved the replace silently matched nothing and the script
+# still printed "README.md updated" on the next run's no-op. The numbers now come
+# from the measurement; the sentence shape is what stays pinned.
+src, n = re.subn(
+    r"- \*\*\d+ builtins\.\*\* \d+ are byte-identical on all four backends",
+    f"- **{total} builtins.** {portable} are byte-identical on all four backends",
+    src,
+)
+if n == 0:
+    sys.exit(
+        "README.md: no 'N builtins' line matched — the wording changed, so the "
+        "number has to be updated by hand (and check-site.py will confirm it)"
+    )
 # The storage sentence: 4.1 named five; there are ten, and the value layer is
 # a second thing layered on the first rather than a replacement.
 src = src.replace(
@@ -66,25 +82,19 @@ print("README.md updated" if src != before else "README.md already correct")
 # ---- site ------------------------------------------------------------------
 h = SITE.read_text()
 before = h
-h = h.replace(
-    "<strong>74 builtins</strong> — 67 byte-identical across the interpreter,",
+h, n = re.subn(
+    r"<strong>\d+ builtins</strong> — \d+ byte-identical across the interpreter,",
     f"<strong>{total} builtins</strong> — {portable} byte-identical across the interpreter,",
+    h,
 )
-h = h.replace(
-    "<li><strong>A test runner.</strong>",
-    "<li><strong>Ten <code>db-*</code> builtins.</strong> Five for bytes, five for\n"
-    "    values over them, all on an append-only checksummed log.</li>\n"
-    "    <li><strong>A test runner.</strong>",
-    1,
-)
-h = h.replace(
-    "The five <code>db-*</code> storage builtins run on the\n"
-    "    interpreter and the AOT binary and are refused by the transpilers, which\n"
-    "    cannot reproduce an append-only checksummed log on a host <code>open()</code>.",
-    "The ten <code>db-*</code> storage builtins run on the\n"
-    "    interpreter and the AOT binary and are refused by the transpilers, which\n"
-    "    cannot reproduce an append-only checksummed log on a host <code>open()</code>.",
-)
+if n == 0:
+    sys.exit(
+        "site/index.html: no '<strong>N builtins</strong>' matched — the wording "
+        "changed, so the number has to be updated by hand"
+    )
+# The db-* sentence was rewritten once already (74/67 -> 79/67, five -> ten).
+# It is not rewritten again here: a second insert would duplicate the paragraph
+# that already follows it. `check-site.py` is what keeps these numbers honest.
 SITE.write_text(h)
 print("site/index.html updated" if h != before else "site/index.html already correct")
 
@@ -92,19 +102,28 @@ print("site/index.html updated" if h != before else "site/index.html already cor
 # It asserts the numbers appear in BOTH files, so its list has to move too.
 p = REPO / "scripts/check-site.py"
 c = p.read_text()
-c = c.replace(
-    '# "74" and "67" are both required, and both are honest: 74 is the prelude\n'
-    '# size, 67 is the portable subset (the other 7 are the 2 HTTP builtins every\n'
-    '# backend refuses and the 5 `db-*` builtins the AOT C runtime carries but the\n'
-    '# transpilers refuse). Editing one without the other fails here, which is the\n'
-    '# whole point of the check.',
+c, n_comment = re.subn(
+    r'# "\d+" and "\d+" are both required, and both are honest: \d+ is the\s*\n'
+    r"# prelude size, \d+ is the portable subset \(the other \d+\s*\n",
     f'# "{total}" and "{portable}" are both required, and both are honest: {total} is the\n'
-    f'# prelude size, {portable} is the portable subset (the other {int(total) - int(portable)}\n'
-    '# are the 2 HTTP builtins every backend refuses and the 10 `db-*` builtins the\n'
-    '# AOT C runtime carries but the transpilers refuse). Both are measured by\n'
-    '# scripts/measure-prelude.sh — do not adjust them by hand. Editing one without\n'
-    '# the other fails here, which is the whole point of the check.',
+    f"# prelude size, {portable} is the portable subset (the other "
+    f"{int(total) - int(portable)}\n",
+    c,
 )
-c = c.replace(f'"561", "74", "67"', f'"561", "{total}", "{portable}"')
+# The expected-values list is the actual gate, so a replace that matches nothing
+# there is a failure rather than a no-op: it would leave check-site.py asserting
+# the OLD numbers while this script printed "updated".
+c, n_list = re.subn(
+    r'"561", "\d+", "\d+"', f'"561", "{total}", "{portable}"', c
+)
+if n_list == 0:
+    sys.exit(
+        "scripts/check-site.py: its expected-values list no longer has the "
+        '"561", "<total>", "<portable>" shape — update it by hand'
+    )
 p.write_text(c)
-print("check-site.py updated")
+print(
+    f"check-site.py updated (list={n_list}, comment={n_comment})"
+    if (n_list or n_comment)
+    else "check-site.py already correct"
+)
