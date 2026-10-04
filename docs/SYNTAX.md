@@ -1677,6 +1677,306 @@ one-`Number`-type collapse, which would have turned an AINL int into `1.0`; the
 tagged-number fix closed that, so the scoping is now purely about which
 backends support `db-*` at all.)
 
+## 3m. Tables: `db-create-table` / `db-insert` / `db-select` / `db-delete-row` / `db-all-rows`
+
+**Tables** on top of §3l's value store. A named set of rows, each row an AINL
+list, each table indexed on the row's first column by a B-tree — so a lookup is
+O(log n) and `db-all-rows` comes back in key order without sorting:
+
+```ainl
+(def h (db-open "people.ainl-db"))
+(def people (db-create-table h "people"))
+
+(db-insert h people (list "ada" 36 "math"))
+(db-insert h people (list "grace" 45 "navy"))
+(db-insert h people (list "bob" 41 "navy"))
+
+(print (db-select h people "grace"))   ; ("grace" 45 "navy")
+(print (db-select h people "nobody"))  ; nil
+(print (db-all-rows h people))
+; (("ada" 36 "math") ("bob" 41 "navy") ("grace" 45 "navy"))
+
+(print (db-delete-row h people "bob")) ; true
+(print (db-all-rows h people))
+; (("ada" 36 "math") ("grace" 45 "navy"))
+(db-close h)
+```
+
+### The rules
+
+- **`db-create-table handle name` → the name.** Idempotent: creating a table
+  that exists is not an error, so `(def t (db-create-table h "t"))` at the top
+  of a program is safe to re-run against an existing file. It returns the name
+  so one form binds it and the later calls read as `db-insert people`.
+- **`db-insert handle table row` → nil.** `row` is a non-empty list whose
+  **first element is the primary key**. Re-inserting an existing key
+  **replaces** the row — a primary key *identifies* a row, so there is never
+  more than one.
+- **`db-select handle table key` → the row, or nil.** `key` is the primary key
+  *value*, not a row: `(db-select h people "grace")`, not
+  `(db-select h people (list "grace" 45 "navy"))`. It is the same value you
+  passed as the row's first element.
+- **`db-delete-row handle table key` → true or false.** `true` if the row was
+  live. Deleting an absent row is not an error, so a cleanup pass is safe to
+  run twice — the same answer `db-del` gives, for the same reason.
+- **`db-all-rows handle table` → a list of every row, sorted by primary key.**
+- A table that does not exist is refused by name:
+  `db-insert: no table named 'nope' in this database`.
+- A row with no columns is refused: `a row needs a primary key, so it cannot be
+  empty`.
+- Every column type round-trips exactly, including the int/float distinction,
+  because the row is stored through §3l's JSON writer.
+
+### The primary key is the first column, stored as its text
+
+A row's first element is the key, and it is stored as its **JSON text**. That is
+what lets a table have an integer key, and it is why the order is *byte* order:
+
+```ainl
+(db-insert h t (list 2 "two"))
+(db-insert h t (list 10 "ten"))
+(db-insert h t (list 1 "one"))
+(print (db-all-rows h t))
+; ((1 "one") (10 "ten") (2 "two"))   -- 1, 10, 2
+```
+
+`10` comes before `2`. That is deliberate, and it is a real sharp edge: the key
+is compared as text so that **one** comparator works for every scalar type and
+both engines can agree on it with `memcmp`. A table with integer keys that a
+program wants walked *numerically* wants a different key type — a zero-padded
+string, or a second index. Both are later-tier problems, and neither is worth
+bolting on here behind an inconsistent comparison.
+
+Keys must be **scalars** — `int`, `float`, `str`, `bool` or `nil`. A list or a
+map is refused by name:
+
+```
+db-insert: primary key cannot be a list — a table is indexed on one column, and
+a composite or unordered key has no order to index by
+```
+
+because a composite key has no single byte form to order by, and an index that
+cannot be walked cannot answer `db-all-rows`. `nil` **is** a legal key — it is a
+legal AINL value, and a key is just "the first column".
+
+### `db-all-rows` order is the tree's, not a sort
+
+The order is the B-tree's own in-order walk, not a sort applied on the way out.
+That is the whole reason for the structure over a hash table: enumeration is
+O(n) and both engines produce it **without either one sorting**, so there is no
+comparison function that can disagree.
+
+The AOT C runtime carries a hand-port of the tree (`dbt_*` in `runtime.c`) with
+the same order, the same minimum fill and the same split median. There is no FFI
+in this project, so that is a second implementation, and
+`crates/ainl-cc/tests/dbtab_aot.rs` runs the same operations through both
+engines and asserts identical output. Agreement between two implementations that
+share no code is the evidence; a shared comment is not.
+
+### Why the tree is not written to the file
+
+The tree is **rebuilt** on open, not serialized. What the file holds is the log
+records the index is built from — the rows, the keys, and therefore the order —
+so a reopen reconstructs an identical tree.
+
+Writing the node structure into the file would be a second write path *and* a
+second recovery path: a half-written interior node is a hole in the middle of
+the file, which is precisely the failure the append-only log exists to make
+impossible. Deletion is a log record for the same reason §3l gives — a delete
+survives a crash through the same replay a write does.
+
+### The three layers, one file
+
+| you write | is a | primary key |
+|---|---|---|
+| `db-put` / `db-get-raw` | one string per key | — |
+| `db-set` / `db-get` | one value per key | — |
+| `db-insert` / `db-select` | a row in a named table | the row's first column |
+
+All three share one log, one handle table and one recovery path, and a program
+may keep `db-set` keys and table rows in the same file; both survive a reopen.
+That is what makes sharing the log safe rather than merely convenient: a row is
+written as a normal log record under a **reserved key** — `@t:<len>:<name><key>`,
+length-prefixed so no table name or key can make two pairs encode alike — and
+`rebuild` only ever reads keys that encoding produced.
+
+An **empty table still survives a reopen**, which is why `db-create-table`
+appends a marker record: a table with no rows would otherwise leave nothing in
+the log to rediscover it from. The marker is not a row, and `db-all-rows` does
+not return it.
+
+**Refused by the transpilers**, on the same terms and for the same reason as
+`db-*` below — a host file object has no append-only-log semantics, and a B-tree
+over one has no meaning it could keep.
+
+## 3n. Queries: `db-query` / `db-query-count`
+
+A small, deliberately defined SQL subset over §3m's tables:
+
+```ainl
+SELECT <* | col, ...> FROM <table>
+  [WHERE <col> <op> <value> [AND|OR <cond>]]
+  [ORDER BY <col> [ASC|DESC]] [LIMIT <n>]
+
+op := = | != | < | <= | > | >=
+```
+
+- **`db-query handle query` → a list of the matching rows.**
+- **`db-query-count handle query` → how many rows match, after `LIMIT`.**
+
+```ainl
+(def h (db-open "people.db"))
+(def t (db-create-table h "people"))
+(db-insert h t (list "ada" 36 "math"))
+(db-insert h t (list "bob" 41 "navy"))
+(db-insert h t (list "grace" 45 "navy"))
+
+(print (db-query h "SELECT 1 FROM people WHERE 2 > 40"))
+; (("bob") ("grace"))
+
+(print (db-query h "SELECT 1 FROM people ORDER BY 2 DESC LIMIT 1"))
+; (("grace"))
+
+(print (db-query-count h "SELECT 1 FROM people WHERE 3 = 'navy'"))
+; 2
+```
+
+### Columns are positions, and column 1 is the key
+
+A column reference is a **number**, not a name. `db-create-table` takes a name
+and nothing else, so a row has no column names to refer to; inventing a schema
+here would mean changing a builtin the previous section already shipped. Column
+1 is the primary key, which is exactly what the B-tree indexes.
+
+Using a name says so, rather than leaving a model to guess:
+
+```
+db-query: at line 1, col 28: 'name' is not a column: a row in this database is
+a list, so columns are numbered from 1 and 1 is the primary key in the query
+"SELECT 1 FROM people WHERE name = 1"
+```
+
+### The order the clauses run in
+
+`WHERE` applies, then `ORDER BY`, then `LIMIT`, and the projection happens last.
+`ORDER BY` therefore names a column the projection does not have to include:
+
+```ainl
+(db-query h "SELECT 1 FROM people ORDER BY 2")   ; sort by age, return names
+```
+
+The clause **order is enforced, not documented**. `LIMIT 1 ORDER BY 2` is
+refused, because a query written that way has two possible answers depending on
+which clause the engine applies first, and picking one silently is the failure
+this layer exists to prevent:
+
+```
+db-query: at line 1, col 30: ORDER BY comes before LIMIT in a query, so 'ORDER'
+was written too late in the query "SELECT * FROM people LIMIT 1 ORDER BY 2"
+```
+
+`AND` binds tighter than `OR` — SQL's own rule, and the only one expressible
+without parentheses, which v1 does not have. So `a OR b AND c` is `a OR (b AND c)`.
+
+### `ORDER BY` is stable, and `DESC` reverses the comparison
+
+Not the input. Two rows that compare equal keep primary-key order in **both**
+directions, so `DESC` on a duplicated value does not hand back the rows in
+reverse. Here `"navy"` sorts after `"math"`, and bob and grace both hold it, so
+`DESC` puts the two navy rows first **in primary-key order** and ada last:
+
+```ainl
+(db-query h "SELECT 1 FROM people ORDER BY 3 DESC")
+; (("bob") ("grace") ("ada"))
+```
+
+A sort that reversed ties would answer `(("grace") ("bob") ("ada"))` — which
+looks plausible enough to ship, and which `dbq_aot.rs` asserts against.
+
+The same ordering rule `sort` uses, deliberately: a query that ordered
+differently would be a second comparison in the language. `ORDER BY` on a
+column **no row is that long** is refused by name rather than sorting `nil`s,
+because `nil` orders equal to `nil` and the sort would otherwise "succeed" and
+answer in primary-key order:
+
+```
+db-query: at line 1, col 31: ORDER BY column 9 is nil in every row of 'people' —
+a row in this database is a list, and no row here is that long
+```
+
+A *projection* past the end of a row is `nil` rather than an error. The
+asymmetry is intentional: a projection inherits the out-of-range-is-`nil`
+convention `nth` already has, while `ORDER BY` is a claim about the table's
+shape and a false claim is an error.
+
+### Unsupported SQL is refused by name
+
+A clause this layer does not have is **named**, never ignored — silently
+dropping `GROUP BY` is how a query engine returns a confidently wrong answer.
+The refusal carries the supported subset, so the next query is writeable from it:
+
+```
+db-query: at line 1, col 22: 'GROUP' is not supported in v1; the supported
+subset is: SELECT <* | col, ...> FROM <table> [WHERE <col> <op> <value>
+[AND|OR <cond>]] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>] in the query
+"SELECT * FROM people GROUP BY 1"
+```
+
+Joins, `GROUP BY`, `HAVING`, `DISTINCT`, set operations, subqueries, `IN`,
+`LIKE`, `BETWEEN`, `IS`, `EXISTS`, `OFFSET`, `CASE`, aliases, `NULLS FIRST`/`LAST`,
+and every `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER` are all refused this
+way — the last group because the query layer is **read-only**: §3m's log has one
+writer and one row encoding, and a second write path would break both claims.
+
+Aggregates are refused with the builtin that does the job where there is one:
+
+```
+db-query: at line 1, col 8: COUNT is not supported in v1; the supported subset
+is: ... — use (db-query-count handle "SELECT …") to count matching rows
+```
+
+A near miss gets a suggestion, and a **transposed** pair counts as a near miss —
+`FORM` for `FROM` is two substitutions and one transposition, and plain edit
+distance only sees the first kind:
+
+```
+db-query: at line 1, col 10: unexpected 'FORM' in the query "SELECT 1 FORM people"
+— did you mean 'FROM'?
+```
+
+### `db-query-count`, and what a `WHERE` can compare
+
+`db-query-count` runs the identical parse, filter, sort and `LIMIT`, and answers
+with the number instead of building the rows. `LIMIT` is applied before the
+count, so `SELECT … LIMIT 5` counts at most five.
+
+The left side of a comparison is a column; the right is a **value** — a number,
+a quoted string, `true`, `false`, `nil` or `null`. `=` and `!=` never order, so
+comparing across types is a plain false, which is what the language's own `=`
+already does. `<`, `<=`, `>` and `>=` do need two orderable values, and say so
+with both type names rather than returning nothing:
+
+```
+db-query: at line 1, col 28: WHERE column 9 is a nil and the value compared with
+it is a int — a column that is compared with <, <=, > or >= has to hold one type
+in every row (db-query: cannot order a nil and a int)
+```
+
+### Read-only, and refused by the transpilers
+
+Both builtins only read. They are refused by the three transpilers for the same
+reason as the `db-*` below them — the parser is a function in this runtime, and
+a transpiler emitting a call to it would be emitting a call to something the
+target language does not have. The interpreter and the AOT C runtime both have
+it, so both accept.
+
+The C runtime carries a hand-port of the parser, the evaluator and the sort
+(`dbq_*` in `runtime.c`) with the same order, the same refusals and the same
+error text. There is no FFI in this project, so that is a second implementation,
+and `crates/ainl-cc/tests/dbq_aot.rs` runs the same queries and the same
+**refusals** through both engines and asserts identical output. Agreement between
+two implementations that share no code is the evidence; a shared comment is not.
+
 ## 4. Canonical examples
 
 These are one-liners to fix the shape in your head. For programs that are

@@ -138,7 +138,51 @@ impl ConsCell {
             idx += 1;
         }
     }
+
+    /// Every element, in order.
+    ///
+    /// A borrowed iterator rather than a `Vec`, so a caller that only wants to
+    /// read a list does not allocate a copy of it — and a `ConsCell` list is the
+    /// representation a table row uses, so a query reading rows reads a lot of
+    /// them.
+    pub fn iter(&self) -> ConsIter<'_> {
+        ConsIter {
+            cur: Some(self),
+            remaining: self.len,
+        }
+    }
 }
+
+/// The iterator [`ConsCell::iter`] returns.
+///
+/// A plain struct rather than a `Generator`, so it is `Send`-agnostic and adds
+/// no dependency; `remaining` is what terminates it, and trusting `tail` alone
+/// would loop forever on a malformed cell instead of stopping at the recorded
+/// length.
+pub struct ConsIter<'a> {
+    cur: Option<&'a ConsCell>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for ConsIter<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<&'a Value> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let cell = self.cur?;
+        self.remaining -= 1;
+        self.cur = cell.tail.as_deref();
+        cell.first()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ConsIter<'_> {}
 
 impl Drop for ConsCell {
     fn drop(&mut self) {
