@@ -29,8 +29,10 @@ fn the_six_builtins_map_to_their_helpers() {
              (print (ends-with "a" "a"))
              (print (index-of "a" "a")))"#);
     for (call, helper) in [
-        (r#"_substring("a", 0, 1)"#, "_substring"),
-        (r#"_char("a", 0)"#, "_char"),
+        // Int indices are BigInt literals (`0n`), so the boundary helper
+        // converts them back to a host number at the slice.
+        (r#"_substring("a", 0n, 1n)"#, "_substring"),
+        (r#"_char("a", 0n)"#, "_char"),
         (r#"_code("a")"#, "_code"),
         (r#"_starts_with("a", "a")"#, "_starts_with"),
         (r#"_ends_with("a", "a")"#, "_ends_with"),
@@ -85,10 +87,19 @@ fn the_boundary_and_index_helpers_are_pulled_in() {
         out.contains("0xC0") && out.contains("0x80"),
         "the boundary check must test for a continuation byte:\n{out}"
     );
-    // JS has ONE number type, so a float index must be refused explicitly.
+    // A float index must be refused. The test is `typeof i !== "bigint"` and
+    // NOT `Number.isInteger`: an AINL int is a BigInt here, so
+    // `Number.isInteger` would reject every VALID index while accepting a
+    // whole float — the exact opposite of the rule. (Before the BigInt switch
+    // `Number.isInteger` was the right test here, because JS had one number
+    // type; the tag/float split moved it.)
     assert!(
-        out.contains("Number.isInteger"),
+        out.contains(r#"typeof i !== "bigint""#),
         "a float index must be rejected on this target:\n{out}"
+    );
+    assert!(
+        !out.contains("Number.isInteger"),
+        "Number.isInteger cannot classify a BigInt index:\n{out}"
     );
 }
 

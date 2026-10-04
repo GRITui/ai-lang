@@ -32,8 +32,31 @@ fn function_becomes_declaration() {
 #[test]
 fn chained_comparison_expands_to_and() {
     // JS has no chained comparison — must expand.
-    assert!(js("(< 1 2 3)").contains("(1 < 2 && 2 < 3)"));
-    assert!(js("(= 2 2)").contains("(_eq(2, 2))"));
+    //
+    // Each clause goes through `_cmp` rather than the host `<`, because an
+    // AINL int is a BigInt here and native `<` would compare a float-involving
+    // pair exactly where the interpreter compares it as f64. The `n` suffixes
+    // are the BigInt int literals (see `an_int_literal_is_a_bigint`).
+    let out = js("(< 1 2 3)");
+    assert!(
+        out.contains("_cmp(1n, 2n, \"<\") && _cmp(2n, 3n, \"<\")"),
+        "got:\n{out}"
+    );
+    assert!(js("(= 2 2)").contains("(_eq(2n, 2n))"));
+}
+
+#[test]
+fn an_int_literal_is_a_bigint() {
+    // The whole point of the BigInt switch: an AINL int emits a JS `BigInt`
+    // literal, so the digits in the generated source are exact and no runtime
+    // parse is involved. `(print 42)` must not emit a bare `42`, which would be
+    // a float64 and re-introduce the rounding this target had.
+    let out = js("(print 42)");
+    assert!(out.contains("_print(42n);"), "got:\n{out}");
+    assert!(!out.contains("_print(42);"), "got:\n{out}");
+    // A float literal is still the tagged `_Float` wrapper, unchanged.
+    let f = js("(print 3.0)");
+    assert!(f.contains("_print(new _Float(3.0));"), "got:\n{f}");
 }
 
 #[test]
@@ -42,7 +65,7 @@ fn equality_uses_structural_eq_not_reference_identity() {
     // interpreter's (and Python/Ruby's) structural list equality. `=` must
     // go through the `_eq` runtime helper instead of a bare `===`.
     let out = js("(= (list 1 2) (list 1 2))");
-    assert!(out.contains("_eq([1, 2], [1, 2])"), "got:\n{out}");
+    assert!(out.contains("_eq([1n, 2n], [1n, 2n])"), "got:\n{out}");
     assert!(out.contains("function _eq("), "got:\n{out}");
 }
 
@@ -61,7 +84,7 @@ fn if_expression_is_ternary() {
     // branch — but `0 ? a : b` in JS takes `b`. This is the assertion that
     // changed when `_truthy` was introduced; the ternary shape did not.
     assert!(
-        js("(print (if (< n 2) n 0))").contains("(_truthy((n < 2)) ? n : 0)"),
+        js("(print (if (< n 2) n 0))").contains("(_truthy((_cmp(n, 2n, \"<\"))) ? n : 0n)"),
         "got:\n{}",
         js("(print (if (< n 2) n 0))")
     );
@@ -72,16 +95,18 @@ fn if_uses_ainl_truthiness_not_javascripts() {
     // The reason `if` goes through `_truthy` at all. In JS, `0` and `""` are
     // falsey; in AINL they are TRUTHY. A bare `?:`/`if` would silently make
     // every `(if 0 ...)` take the else branch on this target only.
+    // `0n` is the BigInt int literal — the truthiness rule is unchanged, only
+    // the spelling of the literal is.
     let out = js("(print (if 0 \"a\" \"b\"))");
     assert!(
-        out.contains("_truthy(0)"),
+        out.contains("_truthy(0n)"),
         "an `if` on 0 must be guarded, got:\n{out}"
     );
 }
 
 #[test]
 fn lambda_is_arrow() {
-    assert!(js("(map (fn (x) (* x 2)) xs)").contains("((x) => _mul(x, 2))"));
+    assert!(js("(map (fn (x) (* x 2)) xs)").contains("((x) => _mul(x, 2n))"));
 }
 
 #[test]
@@ -93,10 +118,10 @@ fn variadic_is_rest_param() {
 #[test]
 fn while_and_let_braces() {
     let out = js("(def f (fn (n) (let ((i 0)) (while (< i n) (def i (+ i 1))) i)))");
-    assert!(out.contains("var i = 0;"), "got:\n{out}");
-    assert!(out.contains("while ((i < n)) {"), "got:\n{out}");
+    assert!(out.contains("var i = 0n;"), "got:\n{out}");
+    assert!(out.contains("while ((_cmp(i, n, \"<\"))) {"), "got:\n{out}");
     assert!(
-        out.contains("i = _add(i, 1);") || out.contains("var i = _add(i, 1);"),
+        out.contains("i = _add(i, 1n);") || out.contains("var i = _add(i, 1n);"),
         "got:\n{out}"
     );
 }
@@ -187,12 +212,12 @@ fn an_operand_is_evaluated_once() {
     let out = js("(print (or (f 1) 2))");
     let expr = print_call(&out);
     assert_eq!(
-        expr.matches("f(1)").count(),
+        expr.matches("f(1n)").count(),
         1,
         "the operand's text appears more than once, so it runs more than once: {expr}"
     );
     assert!(
-        expr.contains("(f(1))"),
+        expr.contains("(f(1n))"),
         "the operand should appear as the bound value exactly once, got:\n{expr}"
     );
 }
@@ -221,10 +246,12 @@ fn an_all_falsy_or_ends_on_the_false_identity() {
     // And a lone TRUTHY operand still comes back unchanged — 0 is truthy in
     // AINL (§1), so a fix that read truthiness off the emitted text, or used
     // the host's, would break this.
+    // `42n` — the BigInt int literal. The truthiness rule itself is unchanged:
+    // 0 is truthy in AINL, so a lone truthy operand still comes back as itself.
     let out = js("(print (or 42))");
     let expr = print_call(&out);
     assert!(
-        expr.contains("(42))") && expr.contains(": false)"),
+        expr.contains("(42n))") && expr.contains(": false)"),
         "`(or 42)` must answer 42, got:\n{expr}"
     );
 }
@@ -252,7 +279,7 @@ fn and_or_return_an_operand_not_a_boolean() {
     // in AINL), and a boolean fold answers `true`.
     let out = js(r#"(print (or 0 ""))"#);
     assert!(
-        out.contains(r#"((_ainl_t1) => (_truthy(_ainl_t1) ? _ainl_t1 : ((_ainl_t0) => (_truthy(_ainl_t0) ? _ainl_t0 : false))("")))(0))"#),
+        out.contains(r#"((_ainl_t1) => (_truthy(_ainl_t1) ? _ainl_t1 : ((_ainl_t0) => (_truthy(_ainl_t0) ? _ainl_t0 : false))("")))(0n))"#),
         "got:\n{out}"
     );
     let expr = print_call(&out);
@@ -274,7 +301,7 @@ fn and_returns_the_falsey_operand_unchanged() {
     // bare; the two before it are bound, so each is tested once.
     let out = js("(print (and nil false 3))");
     assert!(
-        out.contains("(_ainl_t1) => (_truthy(_ainl_t1) ? ((_ainl_t0) => (_truthy(_ainl_t0) ? 3 : _ainl_t0))(false) : _ainl_t1))(null)"),
+        out.contains("(_ainl_t1) => (_truthy(_ainl_t1) ? ((_ainl_t0) => (_truthy(_ainl_t0) ? 3n : _ainl_t0))(false) : _ainl_t1))(null)"),
         "got:\n{out}"
     );
     let expr = print_call(&out);

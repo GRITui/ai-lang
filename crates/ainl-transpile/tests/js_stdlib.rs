@@ -148,9 +148,20 @@ fn math_builtins_type_check_instead_of_coercing() {
     }
     // The check is a typeof test, not a truthiness/NaN test: `typeof NaN` is
     // "number", and JS would otherwise coerce "5" and true into numbers.
-    assert!(out.contains("typeof x === \"number\""), "got:\n{out}");
-    assert!(out.contains("Math.sqrt(n)"), "got:\n{out}");
-    assert!(out.contains("Math.floor(n)"), "got:\n{out}");
+    //
+    // An AINL number is a BigInt or a `_Float`, so `_isnum` accepts both — a
+    // `typeof x === "number"` test would reject every int.
+    assert!(
+        out.contains(r#"typeof x === "bigint" || x instanceof _Float"#),
+        "got:\n{out}"
+    );
+    // `Math.*` cannot take a BigInt, so both convert at the boundary through
+    // `_num_f` — this is the "loses JS-native Math ergonomics" cost the
+    // numeric model documents, and it has to be explicit or it is a runtime
+    // TypeError rather than a build error.
+    assert!(out.contains("function _num_f("), "got:\n{out}");
+    assert!(out.contains("Math.sqrt(x)"), "got:\n{out}");
+    assert!(out.contains("Math.floor(_num_f(n))"), "got:\n{out}");
     // A negative sqrt is AINL's error, not JS's NaN.
     assert!(
         out.contains("sqrt expects a non-negative number"),
@@ -183,8 +194,15 @@ fn env_exit_and_time_map_to_node_globals() {
     // must normalize it — otherwise `(env-get "X")` is truthy in JS and falsey
     // in the interpreter.
     assert!(out.contains("v === undefined ? null : v"), "got:\n{out}");
-    assert!(out.contains("process.exit(code)"), "got:\n{out}");
-    assert!(out.contains("Date.now()"), "got:\n{out}");
+    // `process.exit` takes a 32-bit int and cannot take a BigInt, so the code
+    // is converted and clamped rather than wrapped. `now` answers an int on
+    // every backend, so it is a BigInt here too.
+    assert!(out.contains("Number(code)"), "got:\n{out}");
+    assert!(out.contains("process.exit(n >="), "got:\n{out}");
+    assert!(
+        out.contains("BigInt(Math.floor(Date.now() / 1000))"),
+        "got:\n{out}"
+    );
 }
 
 #[test]

@@ -59,6 +59,21 @@ pub(crate) trait ExprEmit {
     /// exact case the identity exists to answer.
     fn false_lit(&self) -> &'static str;
 
+    /// One relational comparison, `a op b`, in the target's own idiom.
+    ///
+    /// The default is the host operator, which is right for every target whose
+    /// numbers are the host's own. The JS backend overrides it: an AINL `int`
+    /// there is a `BigInt`, and native `<` compares BigInt against a float
+    /// *exactly* while the interpreter compares such a pair *as f64*. Those
+    /// disagree — `(= 9007199254740993 (+ 9007199254740992 0.5))` is `true` in
+    /// the interpreter and `false` under exact math — so JS has to call a
+    /// helper that picks the same rule the interpreter does. See `_cmp` in
+    /// `js.rs`.
+    fn cmp_pair(&mut self, a: &str, b: &str, op: &str) -> String {
+        let _ = self;
+        format!("{a} {op} {b}")
+    }
+
     /// The target's spelling of the `true` literal, for the same reason as
     /// [`ExprEmit::false_lit`]: `(and)` answers this, and Python spells it
     /// `True`.
@@ -263,7 +278,7 @@ pub(crate) fn cmp<E: ExprEmit>(e: &mut E, args: &[Node], op: &str) -> Result<Str
     let parts = e.expr_all(args)?;
     let clauses: Vec<String> = parts
         .windows(2)
-        .map(|w| format!("{} {op} {}", w[0], w[1]))
+        .map(|w| e.cmp_pair(&w[0], &w[1], op))
         .collect();
     Ok(format!("({})", clauses.join(" && ")))
 }

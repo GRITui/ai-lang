@@ -3,16 +3,14 @@
 **Run it:** `cargo build --release && bash scripts/numeric-divergence-demo.sh` reproduces
 the numbers below.
 
-AINL has one integer type at the *source* level, but different runtime
-representations of it: the interpreter's arbitrary-precision `BigNum`
-(exact, never overflows), Python's and Ruby's arbitrary-precision integers,
-and JavaScript's single `f64` number type. For any program whose integer
-values stay within `i64` range (roughly ±9.2×10¹⁸) and away from
-float-precision edges, all four agree byte-for-byte — that's what
-`scripts/check-transpile.sh` verifies for the example programs. **Outside that
-range the interpreter still agrees with Python and Ruby exactly, and diverges
-only from JavaScript**, whose single `f64` type cannot represent large integers
-precisely.
+AINL has one integer type at the *source* level, and **every backend now
+implements it the same way: arbitrary precision**. The interpreter and the
+bytecode VM share `BigNum`, the AOT C runtime carries its own bignum, Python
+and Ruby have native arbitrary-precision integers, and the JavaScript target
+emits a native `BigInt`. Integers never overflow and never lose precision on
+any of the five, so all five agree byte-for-byte for **any integer value AINL
+can express** — that is what `scripts/check-transpile.sh` and
+`scripts/parity5.sh` verify.
 
 ## Measured divergence
 
@@ -22,24 +20,26 @@ precisely.
 (print (fact 25))
 ```
 
-| target | `i64::MAX * 2` | `(fact 25)` |
-|---|---|---|
-| interpreter (`ainl run`) | `18446744073709551614` | `15511210043330985984000000` |
-| JS (`ainl transpile --to js`) | `18446744073709552000` | `1.5511210043330986e+25` |
-| Python (`ainl transpile --to python`) | `18446744073709551614` | `15511210043330985984000000` |
-| Ruby (`ainl transpile --to ruby`) | `18446744073709551614` | `15511210043330985984000000` |
+| target | `i64::MAX * 2` | `(fact 25)` | `(fact 100)` |
+|---|---|---|---|
+| interpreter / VM (`ainl run`) | `18446744073709551614` | `15511210043330985984000000` | 158 digits, exact |
+| AOT binary (`ainl compile`) | `18446744073709551614` | `15511210043330985984000000` | 158 digits, exact |
+| JS (`ainl transpile --to js`) | `18446744073709551614` | `15511210043330985984000000` | 158 digits, exact |
+| Python (`ainl transpile --to python`) | `18446744073709551614` | `15511210043330985984000000` | 158 digits, exact |
+| Ruby (`ainl transpile --to ruby`) | `18446744073709551614` | `15511210043330985984000000` | 158 digits, exact |
 
-Two answers from two different design choices, neither a bug in isolation:
+**All five agree.** There is no divergence left in the table.
 
 - **The interpreter** uses `BigNum` (`crates/ainl-core/src/bignum.rs`), a
   hand-written arbitrary-precision integer with an allocation-free `i64` fast
   path. Integers never overflow: an operation that leaves `i64` range widens to
-  a signed-magnitude bignum and stays exact. This matches Python and Ruby
-  exactly, and is the model the AOT C target is required to match (below).
-- **JavaScript** has exactly one number type (`f64`) for everything, so every
-  AINL integer is already a float there — it rounds at 2^53, well before
-  `i64::MAX`. There is no separate "promote on overflow" step; it is float
-  arithmetic from the first multiplication.
+  a signed-magnitude bignum and stays exact. The AOT C runtime implements the
+  same model (below).
+- **JavaScript** emits an AINL `int` as a native `BigInt` (`42n`), which is
+  arbitrary-precision and exact. Floats stay `number` (f64) wrapped in the
+  `_Float` tag from card 1. See "JavaScript uses `BigInt`" below for the
+  conversion boundaries this needs — and for the one comparison rule that is
+  *not* simply "use exact integer math".
 
 ### What changed, and why it was a semantics change
 
@@ -62,23 +62,91 @@ int/float pair still compares as `f64`, so `(= 1 1.0)` remains `true`.
 ## What this means for "lossless"
 
 "Lossless interop" and "byte-equal transpilation" (README.md,
-`scripts/check-transpile.sh`, the M4 milestone in MASTER_PLAN.md) now hold for
-**any integer value AINL can express**, not just those inside the safe range:
-the interpreter, the bytecode VM and the Python/Ruby targets all compute the
-exact mathematical value, because all three use arbitrary-precision integers.
-What is *not* covered is JavaScript, which has no integer type at all and
-rounds at 2^53 — a limit of the target language, not of the transpiler, and not
-something a transpiler can fix without abandoning `number` for `BigInt`.
+`scripts/check-transpile.sh`, the M4 milestone in MASTER_PLAN.md) hold for
+**any integer value AINL can express**, not just those inside a safe range:
+the interpreter, the bytecode VM, the AOT binary and the Python, Ruby and
+JavaScript targets all compute the exact mathematical value, because all of
+them use arbitrary-precision integers.
 
 Float behaviour is unchanged and still bounded: `/` returns a float, and float
-arithmetic remains `f64` in every backend.
+arithmetic remains `f64` in every backend. So does one float-*display* rule —
+see "the float display rule" below.
+
+## JavaScript uses `BigInt`, and what that costs
+
+The JS target's AINL `int` is a native `BigInt`. Nothing is hand-written here —
+JS already has the arbitrary-precision integer, so unlike cards 2 and 3 there is
+no bignum to port. The work is entirely in the **boundaries**, because a
+BigInt is a different host type from a `number` and every JS-native API wants
+`number`:
+
+| boundary | conversion | why it is not automatic |
+|---|---|---|
+| `Math.sqrt`, `Math.floor`, `Math.abs` | `_num_f` → `Number(x)` | `Math.*` throws `TypeError` on a BigInt |
+| `+=`, `-=`, `*=`, `%` | `_add`/`_sub`/`_mul`/`_mod` split on int-vs-float | `5n + 0.5` throws `TypeError: Cannot mix BigInt and other types` |
+| `JSON.stringify` | hand-written `_json_ser` (pre-existing) | throws `Do not know how to serialize a BigInt` |
+| array subscripts, slice bounds | `_ainl_idx` → `Number(i)` | a `bigint` index is not a valid property key |
+| `Number.isInteger`, `process.exit` | `typeof i === "bigint"`, then `Number(code)` | `Number.isInteger(5n)` is `false` |
+| `sort`, `min`/`max` | `_cmp` / `_sort_key` | see the comparison rule below |
+
+That last column is the real cost, and it is the documented price of this
+option: the emitted JS is no longer idiomatic JS arithmetic. A user who wants
+to mix AINL-generated code with hand-written JS now has a `BigInt`/`number`
+boundary to convert at, which native JS operators will not do for them.
+
+**`mod` is Euclidean, and JS's `%` is not.** JS's `%` is truncated (the
+remainder takes the dividend's sign), while the interpreter uses
+`BigNum::rem_euclid`, whose answer is always in `[0, |b|)`. So `(mod -7 3)` is
+`2` here and not `-2`. The adjustment is by `|b|` and *not* by `b`: the answer
+does not depend on b's sign, so `(mod 7 -3)` is `1` and `(mod -7 -3)` is `2`,
+and `r += b` would answer `-2` for the latter.
+
+**Comparison is where exactness is a trap, not a goal.** Two rules, matching
+`compare` in `ainl-core/src/eval.rs`:
+
+* int vs int compares **exactly** (BigInt) — two large ints that are equal as
+  f64 are not equal as ints.
+* anything involving a float compares **as f64**, because that is what the
+  interpreter does (`as_f64` on both sides).
+
+The second rule is not a detail. Measured:
+
+```lisp
+(= 9007199254740993 (+ 9007199254740992 0.5))   ; interpreter: true
+```
+
+Exact BigInt math says `false` (2^53+1 ≠ 2^53); the f64 path says `true`,
+because both sides round to 2^53. JS's native `<`/`===` on a BigInt against a
+float compares *exactly*, so simply emitting the host operator would have
+introduced a fresh divergence on precisely the values BigInt was adopted to
+fix. `_cmp` picks the interpreter's rule, and
+`numeric_divergence.rs` pins both sides of it.
+
+`json-serialize`/`json-parse` carry the same model: an int serializes as its
+exact digits, and `json-parse` reads an int-looking literal with `BigInt(t)`
+on the *digit string* — `BigInt(Number(t))` would round first, turning
+`"18446744073709551614"` into `18446744073709551616n`.
+
+## the float display rule
+
+Not new, and unchanged by any of the integer work above — recorded here because
+it is the one place two backends still print different text for the *same*
+value.
+
+For a float, `print` uses the **exact** binary expansion on the interpreter
+(`{:.1}`, so `(print 1e300)` emits 303 characters) while the transpilers print
+the **shortest** round-tripping decimal. Both read back as the same `f64`; they
+differ only in which decimal is chosen. It shows up only for large magnitudes —
+`(* big 1.5)` prints `27670116110564327424.0` on the interpreter and
+`27670116110564327000.0` on JS, which are the same f64 (the latter is the
+shortest form of it). `json-serialize` uses the shortest form everywhere *by
+design*; see "json-serialize has its own float rule" below for why.
 
 ## The AOT compiler targets the *interpreter's* model, not the transpilers'
 
-`ainl compile` (Stage 2, `crates/ainl-cc`) does **not** reproduce the C
-transpiler's wrapping behaviour described above. It is required to match the
-**AINL interpreter** exactly — arbitrary-precision integers, the same as
-Python/Ruby and *not* the same as the C/JS targets.
+`ainl compile` (Stage 2, `crates/ainl-cc`) is required to match the **AINL
+interpreter** exactly — arbitrary-precision integers, the same as Python, Ruby
+and JS.
 
 That distinction is the whole point, and it is enforced rather than asserted:
 `crates/ainl-cc/tests/aot_numeric.rs` compiles each edge case with `ainl_cc`,
@@ -122,10 +190,15 @@ The bignum port also had to keep the AOT compute loop at its pre-bignum speed:
 no allocation and only widens to the bignum path when an operand actually
 overflows `i64`, so `aot_perf.rs`'s 30×-faster-than-tree-walk gate still holds.
 
-So the transpiler divergence table above is a property of *cross-language*
-targets; within the AINL toolchain (interpreter, bytecode VM, and AOT binary)
-the numeric model is identical, and there is a test that fails if it stops being
-so.
+So the numeric model is now identical across the whole toolchain —
+interpreter, bytecode VM, AOT binary, and the Python, Ruby and JavaScript
+transpilers — and there is a test that fails if it stops being so.
+
+One known gap remains inside the AOT binary: `json-serialize` of an integer
+outside `i64` range answers `cannot serialize a int`, where the interpreter and
+the transpilers print the exact digits. It is a property of the C runtime's
+bignum support (card 3), not of this card, and it is the one place the AOT
+binary still differs on an integer.
 
 ## `json-serialize` has its own float rule
 
@@ -164,13 +237,13 @@ float distinguishable from an int in the output text. `(json-serialize 1.0)` is
 tell a float from an int at all, and `parse(serialize(v))` would stop being an
 identity on floats.
 
-This is also why the JS divergence for JSON is one-directional. JS has one
-number type, so an AINL `int` arrives as a `Number` and comes back out as
-`1.0` — but a whole *float* agrees, because `1.0` and `1` are the same JS value
-and emitting `1.0` is what every backend does anyway. The output is valid JSON
-that re-parses to an equal value in both cases;
-`crates/ainl-transpile/tests/json_parity.rs` pins both halves so neither can
-drift.
+JSON used to be a one-directional JS divergence, because JS has one number
+type and an AINL `int` arrived as a `Number`. With `int` a `BigInt`, both
+directions are exact: an int serializes as its own digits, and a whole *float*
+still agrees, because `1.0` and `1` are the same JS value and emitting `1.0` is
+what every backend does anyway. The output is valid JSON that re-parses to an
+equal value in both cases; `crates/ainl-transpile/tests/json_parity.rs` pins
+both halves so neither can drift.
 
 ## Options for what is still open (tracked here for whoever picks it up)
 
@@ -179,13 +252,27 @@ drift.
    model" above. The C runtime now carries a zero-dependency bignum with an
    `i64` fast path, and `aot_numeric.rs` / `aot_stdlib.rs` assert exact parity
    out of `i64` range.
-2. **Make JS match**, by emitting `BigInt`-based arithmetic instead of native
-   `number` for the JS target. Loses JS-native ergonomics (no mixing with
-   `Math.*`, `JSON`, etc. without explicit conversion) in exchange for integer
-   fidelity. This is the only remaining *cross-language* divergence.
-3. **Accept and scope the JS claim** (current state): the interpreter, the VM,
-   the AOT binary and the Python/Ruby targets are exact for all integers;
-   JavaScript is not, because `f64` cannot be. §"Measured divergence" above is
-   a regression fixture (`crates/ainl-transpile/tests/numeric_divergence.rs`)
-   so a future change to any target's arithmetic doesn't silently drift without
-   a test noticing.
+2. ~~**Make JS match**, by emitting `BigInt`-based arithmetic instead of native
+   `number` for the JS target.~~ **Done** — see "JavaScript uses `BigInt`"
+   above. The emitted code is exact for every integer AINL can express, and the
+   conversion boundaries are explicit. The price is real and paid: mixing the
+   generated code with hand-written JS now needs a `BigInt`/`number`
+   conversion, and the comparison rule had to be re-spelled (f64 for any
+   float-involving pair) to match the interpreter rather than use exact math.
+3. **Accept and scope the JS claim**: no longer needed for integers — all five
+   backends are exact. What remains open is the *float display* rule above
+   (exact expansion vs shortest round-trip), and three small pre-existing
+   divergences that this work measured and did not touch:
+   - `(/ 0)` answers `inf` on the interpreter and raises on the three
+     transpilers.
+   - `json-parse` of an integer literal beyond `i64` range yields a float on
+     the interpreter and AOT binary (their reader parses `i64` and falls back
+     to f64) and an exact int on Python, Ruby and JS.
+   - `(mod n -1)`, `min`/`max` and comparison of an int against a float still
+     differ between the interpreter/AOT and the Python/Ruby transpilers, whose
+     host `Integer#%`/`Comparable` apply their own rules.
+
+   §"Measured divergence" above is a regression fixture
+   (`crates/ainl-transpile/tests/numeric_divergence.rs`) so a future change to
+   any target's arithmetic doesn't silently drift without a test noticing, and
+   `scripts/parity5.sh` runs one program through all five backends and diffs.
