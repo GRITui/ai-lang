@@ -496,6 +496,51 @@ about redirects, header casing, timeouts and verification defaults — which is
 the "builds cleanly, does something subtly different" failure the four-backend
 rule exists to prevent.
 
+## 3c.1. Masked terminal read: `read-pass`
+
+| Call | Returns |
+|------|---------|
+| `(read-pass)` | the line the user types, as a string (no trailing newline) |
+
+`read-pass` is for secrets — an API key, a password. It turns the terminal's
+echo off, reads one line from the controlling terminal (`/dev/tty`), restores
+the original terminal state, and returns the line. The user presses **Enter to
+submit** (canonical mode is left on, so the read blocks until Enter). A short
+prompt, `read-pass: `, is written to **stderr** — never stdout — so the
+returned string is clean and the prompt can never leak into captured output.
+
+```lisp
+(def key (read-pass))            ; prompt "read-pass: " on stderr, input is masked
+(print (len key))                 ; => 40   (the key itself is never printed)
+```
+
+### Rules a caller has to know
+
+- **The secret is never echoed.** While the line is being typed, the terminal
+  does not echo it, so it does not appear on screen or in terminal scrollback.
+  It is also not in shell history, because it is typed into a program, not the
+  shell.
+- **The original terminal state is always restored.** Echo is back on the
+  moment the read returns, even if the read hit EOF, so a later read (or the
+  user's shell) is unaffected.
+- **No controlling terminal → plain read, no crash.** When there is no tty
+  (a pipe, CI), `/dev/tty` cannot be opened and `read-pass` falls back to a
+  plain line read from stdin (echo on). It does not crash; the value is simply
+  not masked, which is moot when nothing is on a screen.
+- **It reads the controlling terminal, not stdin.** The read goes to
+  `/dev/tty`, so it works even when stdin is redirected. The fallback (above)
+  is the only case that reads stdin.
+
+### Backend scope: the interpreter only
+
+`read-pass` works with `ainl run` and `ainl repl` — the interpreter/VM and the
+tree-walking evaluator, which share the one Rust implementation and are held to
+agreeing on it. The **AOT C backend and the three transpilers refuse** a
+program that uses it, with the same `interpreter-only` error `http-get` gives
+(§3c). A compiled binary or a transpiled host program has no AINL termios
+machinery, and shelling out to a helper would break the standalone-binary
+guarantee — the same reason that keeps `http-get` out of the AOT runtime.
+
 ## 3d. Testing: `test` and `ainl test`
 
 A test is `expr == expected`. Nothing more: no fixtures, no mocking, no async,

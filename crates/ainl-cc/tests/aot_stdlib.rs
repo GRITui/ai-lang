@@ -1266,7 +1266,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     // refusal is about the single-file path having no directory to resolve it
     // against (see `import_refusal.rs`). Listing it here would assert a binding
     // that does not exist.
-    const INTERPRETER_ONLY: &[&str] = &["http-get", "http-post"];
+    const INTERPRETER_ONLY: &[&str] = &["http-get", "http-post", "read-pass"];
     let listed: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
     for name in INTERPRETER_ONLY {
         assert!(
@@ -1286,7 +1286,7 @@ fn codegen_builtin_table_matches_the_interpreters_prelude() {
     let total = listed.len() + INTERPRETER_ONLY.len();
     assert_eq!(
         total,
-        75,
+        76,
         "the prelude has {total} builtins ({} portable + {} interpreter-only); \
          update the table and this count when the prelude changes",
         listed.len(),

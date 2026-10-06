@@ -13,3 +13,10 @@ path = "src/main.rs"
 ainl-core = { path = "../ainl-core" }
 ainl-transpile = { path = "../ainl-transpile" }
 ainl-cc = { path = "../ainl-cc" }
+
+# Test-only: the `read-pass` pty test (tests/read_pass_pty.rs) drives a real
+# pty with `forkpty`. A dev-dependency is NOT linked into the release `ainl`
+# binary, so it does not affect the `otool -L` zero-dep gate. (The `read-pass`
+# builtin itself uses inline termios FFI in ainl-core, not this crate.)
+[dev-dependencies]
+libc = "0.2"

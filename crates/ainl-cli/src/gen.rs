@@ -1464,6 +1464,7 @@ fn check_interpreter_only_for_aot(spec: &str, mode: RunMode) -> Result<(), Strin
     for (needle, why) in [
         ("http-get", "the HTTP client is interpreter-only"),
         ("http-post", "the HTTP client is interpreter-only"),
+        ("read-pass", "the masked terminal read is interpreter-only"),
         ("import", "modules are interpreter-only"),
     ] {
         if spec.contains(needle) {

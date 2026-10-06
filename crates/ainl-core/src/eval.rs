@@ -935,6 +935,13 @@ fn install_stdlib(env: &Env) {
     // names the fix rather than attempted. See http.rs and docs/HTTP_TLS.md.
     crate::http::install(env);
 
+    // Masked terminal read. Interpreter-only, like HTTP: it needs the termios
+    // ECHO-off dance, which the AOT C runtime and the three transpilers refuse
+    // to carry (see interpreter_only.rs). The tree-walk and the VM share this
+    // one implementation through the shared prelude, so their masking behaviour
+    // is identical by construction. See read_pass.rs.
+    crate::read_pass::install(env);
+
     // Storage. One file, an append-only log, replayed on open, with a CRC per
     // record so a torn tail from a crash is rejected rather than served. The
     // interpreter and the VM share this one implementation — it is installed in

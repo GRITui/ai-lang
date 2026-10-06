@@ -6,3 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Zero dependencies. The `read-pass` builtin's termios dance (tcgetattr /
+# tcsetattr / ECHO) is declared as inline FFI in src/read_pass.rs rather than
+# pulled in via the `libc` crate: on macOS the `libc` crate unconditionally
+# links `libiconv` (see libc 0.2.x src/unix/bsd/apple/mod.rs, `#[link(name =
+# "iconv")]` on the iconv extern block), which would break the hard
+# `otool -L` zero-dep gate (libSystem-only). Inline FFI emits the same
+# `tcgetattr`/`tcsetattr` symbols and links to libSystem only.

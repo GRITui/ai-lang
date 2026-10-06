@@ -92,6 +92,14 @@ pub const RESTRICTED: &[Restricted] = &[
         sym: crate::http::HTTP_POST,
         refused_by: &[Backend::Aot, Backend::Transpilers],
     },
+    // Masked terminal read. Interpreter-only, like the HTTP builtins: the AOT
+    // C runtime would have to carry the termios ECHO-off machinery and the
+    // transpilers would have to map it onto three different host termios APIs
+    // with different echo semantics. Both refuse it by name.
+    Restricted {
+        sym: crate::read_pass::READ_PASS,
+        refused_by: &[Backend::Aot, Backend::Transpilers],
+    },
     Restricted {
         sym: crate::db::DB_OPEN,
         refused_by: &[Backend::Transpilers],
@@ -238,6 +246,7 @@ pub const INTERPRETER_ONLY: &[&str] = &[
     crate::import::IMPORT_SYM,
     crate::http::HTTP_GET,
     crate::http::HTTP_POST,
+    crate::read_pass::READ_PASS,
 ];
 
 /// The byte offset of the first AOT-refused form, or `None`.

@@ -24,6 +24,7 @@ pub mod json_value;
 pub mod lexer;
 pub mod parser;
 pub mod pkg;
+pub mod read_pass;
 pub mod serialize;
 pub mod suggest;
 pub mod testing;

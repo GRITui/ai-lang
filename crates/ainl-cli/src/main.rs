@@ -43,7 +43,7 @@ fn version_line() -> String {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("run") => cmd_run(args.get(1)),
+        Some("run") => cmd_run(&args[1..]),
         Some("eval") => cmd_eval(&args[1..].join(" ")),
         Some("ast") => cmd_ast(&args[1..]),
         Some("compile") => cmd_compile(&args[1..]),
@@ -74,7 +74,7 @@ fn print_help() {
     println!(
         "ainl {VERSION} — the AI-Native Language runtime\n\n\
          USAGE:\n  \
-         ainl run <file.ainl>     evaluate a program file\n  \
+         ainl run <file.ainl>     evaluate a program file (--tree-walk for the tree-walk backend)\n  \
          ainl eval <code>         evaluate a snippet\n  \
          ainl ast <file.ainl>     print the parsed AST with source spans\n  \
          ainl ast <file> --json   emit the AST as stable JSON (with source-map loc)\n  \
@@ -110,9 +110,25 @@ fn cmd_doctor(rest: &[String]) -> ExitCode {
     doctor::run(quiet)
 }
 
-fn cmd_run(path: Option<&String>) -> ExitCode {
+fn cmd_run(rest: &[String]) -> ExitCode {
+    // `--tree-walk` runs the program through the tree-walk interpreter instead
+    // of the bytecode VM. The two backends share the same prelude (and thus the
+    // same `read-pass` builtin), so this flag exists to prove their masking
+    // behaviour is identical — the 2-backend parity gate.
+    let mut tree_walk = false;
+    let mut path: Option<&String> = None;
+    for arg in rest {
+        if arg == "--tree-walk" {
+            tree_walk = true;
+        } else if path.is_some() {
+            eprintln!("usage: ainl run <file.ainl> [--tree-walk]");
+            return ExitCode::FAILURE;
+        } else {
+            path = Some(arg);
+        }
+    }
     let Some(path) = path else {
-        eprintln!("usage: ainl run <file.ainl>");
+        eprintln!("usage: ainl run <file.ainl> [--tree-walk]");
         return ExitCode::FAILURE;
     };
     let src = match std::fs::read_to_string(path) {
@@ -122,14 +138,17 @@ fn cmd_run(path: Option<&String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // `run_named_in`, not `run_str`: a program's `import` directives resolve
-    // against the file's own directory, so `ainl run` must hand the path down
-    // or the same program behaves differently depending on the cwd.
-    match ainl_core::run_named_in(
-        &src,
-        std::path::Path::new(path),
-        &ainl_core::Env::with_prelude(),
-    ) {
+    let env = ainl_core::Env::with_prelude();
+    // `run_named_in` / `run_named_tree_walk_in`, not `run_str`: a program's
+    // `import` directives resolve against the file's own directory, so `ainl
+    // run` must hand the path down or the same program behaves differently
+    // depending on the cwd.
+    let result = if tree_walk {
+        ainl_core::run_named_tree_walk_in(&src, std::path::Path::new(path), &env)
+    } else {
+        ainl_core::run_named_in(&src, std::path::Path::new(path), &env)
+    };
+    match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
